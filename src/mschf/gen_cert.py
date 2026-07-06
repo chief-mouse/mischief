@@ -26,12 +26,16 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from datetime import datetime, timedelta
 import uuid
 
+# RSA modulus size for all generated keys (CA and user identities). 1024 is
+# considered broken; 2048 is the current floor for RSA signing keys.
+KEY_SIZE = 2048
+
 def generate_selfsigned_cert(hostname, public_ip=None, private_ip=None):
-    
+
     # Generate our key
     key = rsa.generate_private_key(
         public_exponent=65537,
-        key_size=1024,
+        key_size=KEY_SIZE,
         backend=default_backend()
     )
     
@@ -81,7 +85,7 @@ def generate_user_cert(common_name, ca_cert_pem, ca_key_pem):
     # Generate user's private key
     user_key = rsa.generate_private_key(
         public_exponent=65537,
-        key_size=1024,
+        key_size=KEY_SIZE,
         backend=default_backend()
     )
     

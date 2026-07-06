@@ -74,7 +74,7 @@ def run_rbac_test():
 
     print("\n--- Step 1: Bootstrapping Root Admin ---")
     sig = make_signed_payload("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main'], admin_key)
-    db.set_manifest_item('entry_point', 'main', sig, admin_cert)
+    db.bootstrap_admin("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main'], sig, admin_cert)
 
     cursor = db.conn.cursor()
     cursor.execute("SELECT role FROM user_roles WHERE identity = ?", (admin_id,))

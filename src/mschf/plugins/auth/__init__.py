@@ -82,13 +82,15 @@ class AuthPlugin(BasePlugin):
                     clean_name = res['identity'].replace(':', '_').replace('@', '_').replace('.', '_')
                     cert_filename = f"{clean_name}.crt"
                     key_filename = f"{clean_name}.key"
-                    
+
                     cert_path = os.path.join(app.proj_dir, cert_filename)
                     key_path = os.path.join(app.proj_dir, key_filename)
-                    
-                    # Generate the certificate signed by Root CA
+
+                    # Generate the certificate signed by Root CA. The CN must match the
+                    # sanitized filename stem so the cert, the .crt/.key files, and the
+                    # derived RBAC identity (cert:CN=clean_name) all agree.
                     from mschf.gen_cert import generate_user_cert
-                    pem_cert, pem_key = generate_user_cert(res['identity'], app.ca_cert_pem, app.ca_key_pem)
+                    pem_cert, pem_key = generate_user_cert(clean_name, app.ca_cert_pem, app.ca_key_pem)
                     
                     with open(cert_path, 'wb') as f:
                         f.write(pem_cert)

@@ -9,6 +9,7 @@ import toml
 
 from mschf.gen_cert import generate_selfsigned_cert, x509, NameOID, default_backend, serialization
 from mschf.msf import MSF
+from mschf.identity import Identity
 
 PROJ_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_TZ_NAME = 'America/New_York'
@@ -43,7 +44,7 @@ class Mschf(toga.App):
         self.main_window.info_dialog('Mschf', 'Workspace Manager for Micro-Apps')
 
     async def action_open_file_dialog(self, widget):
-        if self.user_cn == "No Access":
+        if not self.active_identity.is_valid:
             self.main_window.error_dialog(
                 "Access Denied",
                 "Cannot open application: Your active user identity is invalid or not signed by the trusted Root CA."
@@ -69,7 +70,7 @@ class Mschf(toga.App):
             self.label.text = f"Error: {e}"
 
     def open_selected_app(self, widget, row=None, **kwargs):
-        if self.user_cn == "No Access":
+        if not self.active_identity.is_valid:
             self.main_window.error_dialog(
                 "Access Denied",
                 "Cannot open application: Your active user identity is invalid or not signed by the trusted Root CA."
@@ -148,56 +149,28 @@ class Mschf(toga.App):
         if not os.path.isfile(path):
             log.error(f"Certificate file not found: {path}")
             return
-            
-        cn, cert_pem, identity_text, status_text = self.load_and_verify_user_identity(path)
-        
-        self.user_cn = cn
-        self.user_cert_pem = cert_pem
-        self.identity_label.text = identity_text
-        self.label.text = status_text
-        self.current_user_id_path = path
-        
+
+        ca_cert_path = os.path.join(PROJ_DIR, 'ca.crt')
+        self.active_identity = Identity.load(path, ca_cert_path)
+
+        self.identity_label.text = self.active_identity.identity_label
+        self.label.text = self.active_identity.status_text
+
         # Update button enabled states dynamically
-        is_valid = (cn != "No Access")
+        is_valid = self.active_identity.is_valid
         if hasattr(self, 'btn_open_selected') and self.btn_open_selected is not None:
             self.btn_open_selected.enabled = is_valid
         if hasattr(self, 'btn_open_dialog') and self.btn_open_dialog is not None:
             self.btn_open_dialog.enabled = is_valid
-            
-        log.info(f"Switched active user identity to CN={cn} via {cert_filename}")
-        
+
+        log.info(f"Switched active user identity to CN={self.active_identity.cn} via {cert_filename}")
+
         # Force redraw of all open documents to apply the new active user identity live!
         for doc in list(self.documents):
             try:
                 doc.redraw()
             except Exception as redraw_err:
                 log.warning(f"Failed to redraw document {doc}: {redraw_err}")
-
-    def load_and_verify_user_identity(self, path):
-        try:
-            with open(path, 'rb') as f:
-                pem_cert = f.read()
-            
-            cert = x509.load_pem_x509_certificate(pem_cert, default_backend())
-            try:
-                cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-            except Exception:
-                cn = "Unknown"
-
-            # Check if this certificate is signed by the Root CA (ca.crt)
-            ca_cert_path = os.path.join(PROJ_DIR, 'ca.crt')
-            if os.path.isfile(ca_cert_path):
-                with open(ca_cert_path, 'rb') as f:
-                    ca_cert_pem = f.read()
-                from mschf.gen_cert import is_cert_signed_by_ca
-                if not is_cert_signed_by_ca(pem_cert, ca_cert_pem):
-                    log.warning(f"CRITICAL: User identity certificate at {path} is not signed by Root CA.")
-                    return "No Access", "", f"Active Identity: {cn} (INVALID - NOT SIGNED BY CA)", f"Error: Identity {cn} is not signed by Root CA. Denied."
-            
-            return cn, pem_cert.decode('utf-8') if isinstance(pem_cert, bytes) else pem_cert, f"Active Identity: {cn} ({os.path.basename(path)} Loaded)", f"Switched active identity to {cn}."
-        except Exception as e:
-            log.error(f"Failed to load or verify certificate at {path}: {e}")
-            return "No Access", "", "Active Identity: None (Error Loading)", f"Error loading certificate: {e}"
 
     def action_exit(self, app, **kwargs):
         log.info("Workspace shutting down.")
@@ -216,6 +189,7 @@ class Mschf(toga.App):
         ca_cert_path = os.path.join(PROJ_DIR, 'ca.crt')
         ca_key_path = os.path.join(PROJ_DIR, 'ca.key')
         self.proj_dir = PROJ_DIR
+        self.ca_cert_path = ca_cert_path  # trust anchor handed to MSFStorage
         
         if not os.path.isfile(ca_cert_path) or not os.path.isfile(ca_key_path):
             pem_ca_cert, pem_ca_key = generate_selfsigned_cert("Bespoke Root CA")
@@ -254,8 +228,6 @@ class Mschf(toga.App):
             
         if not os.path.isabs(user_id_path):
             user_id_path = os.path.join(PROJ_DIR, user_id_path)
-            
-        self.current_user_id_path = user_id_path
 
         if not os.path.isfile(user_id_path):
             with open(ca_cert_path, 'rb') as f:
@@ -272,9 +244,9 @@ class Mschf(toga.App):
         else:
             pass
             
-        cn, cert_pem, identity_text, status_text = self.load_and_verify_user_identity(user_id_path)
-        self.user_cn = cn
-        self.user_cert_pem = cert_pem
+        self.active_identity = Identity.load(user_id_path, ca_cert_path)
+        identity_text = self.active_identity.identity_label
+        status_text = self.active_identity.status_text
 
         # Initialize Plugin System
         from mschf.plugins.manager import PluginManager
@@ -287,7 +259,7 @@ class Mschf(toga.App):
         self.identity_label = toga.Label(identity_text, style=Pack(margin=10, font_weight="bold"))
 
         # Create Identity Management UI components
-        is_valid = (cn != "No Access")
+        is_valid = self.active_identity.is_valid
 
         self.workspace = toga.Table(
             columns=['Application Name', 'Absolute Path'],

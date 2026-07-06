@@ -1,5 +1,6 @@
 import json
 import base64
+import hashlib
 import logging
 import time
 from mschf.plugins.auth.providers.base import BaseAuthenticator
@@ -22,7 +23,9 @@ class OAuth2Authenticator(BaseAuthenticator):
         }
         payload = {
             "iss": self.issuer,
-            "sub": f"oauth2|{hash(email)}",
+            # Stable subject id: builtin hash() is salted per-process, so the same
+            # email would yield a different sub on every run.
+            "sub": f"oauth2|{hashlib.sha256(email.encode('utf-8')).hexdigest()[:16]}",
             "aud": "mschf-client-app-2026",
             "email": email,
             "email_verified": True,

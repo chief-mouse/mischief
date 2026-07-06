@@ -103,7 +103,8 @@ db.conn.commit()
 payload_dict = {"query": "INSERT OR REPLACE INTO confidential_billing (id, client, amount) VALUES (?, ?, ?)", "params": [1, 'Mischief Dev LLC', 12500.00]}
 payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
 signature = sign_payload(payload_bytes, user_keys['admin'])
-db.execute_signed("INSERT OR REPLACE INTO confidential_billing (id, client, amount) VALUES (?, ?, ?)", [1, 'Mischief Dev LLC', 12500.00], signature, user_certs['admin'])
+# First write on a fresh container: explicitly claim admin (opt-in bootstrap).
+db.bootstrap_admin("INSERT OR REPLACE INTO confidential_billing (id, client, amount) VALUES (?, ?, ?)", [1, 'Mischief Dev LLC', 12500.00], signature, user_certs['admin'])
 
 # Seed support ticket with SSN signed by Admin
 payload_dict = {"query": "INSERT OR REPLACE INTO custom_tickets (id, title, customer_ssn, status) VALUES (?, ?, ?, ?)", "params": [1, 'System Reset Needed', '999-12-3456', 'open']}

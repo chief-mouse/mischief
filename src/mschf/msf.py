@@ -27,7 +27,8 @@ class MSF(toga.Document):
     def read(self) -> None:
         """Load representation of the document from self.path and populate the window."""
         if self.path and self.path.exists():
-            self.db = MSFStorage(str(self.path))
+            ca_cert_path = getattr(self.app, "ca_cert_path", None)
+            self.db = MSFStorage(str(self.path), ca_cert_path=ca_cert_path)
             self.redraw()
 
     def redraw(self) -> None:
@@ -40,9 +41,11 @@ class MSF(toga.Document):
             code_func = self.db.get_code(entry_point_id)
             if code_func:
                 workspace_path = os.path.dirname(os.path.abspath(str(self.path)))
-                user_cn = getattr(self.app, "user_cn", "Unknown")
-                user_cert_pem = getattr(self.app, "user_cert_pem", "")
-                
+                active_id = getattr(self.app, "active_identity", None)
+                user_cn = active_id.cn if active_id else "Unknown"
+                user_cert_pem = active_id.cert_pem if active_id else ""
+                user_key_path = active_id.key_path if active_id else None
+
                 # Check for database-level No Access
                 identity = self.db._get_identity(user_cert_pem)
                 if not self.db.check_permission(identity, 'database', '*', 'read'):
@@ -59,7 +62,8 @@ class MSF(toga.Document):
                     workspace_path,
                     self.db,
                     current_user_cn=user_cn,
-                    current_user_cert_pem=user_cert_pem
+                    current_user_cert_pem=user_cert_pem,
+                    key_path=user_key_path
                 )
                 
                 # Fetch cryptographic verification status

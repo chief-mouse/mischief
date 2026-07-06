@@ -10,9 +10,19 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
 
+from mschf.gen_cert import is_cert_signed_by_ca
+
+# The trusted Root CA is anchored to the host installation, never to the .msf's
+# own directory. Sourcing it from next to the (untrusted) container would let a
+# malicious app ship its own ca.crt and have its signatures "verified" against it.
+HOST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEFAULT_CA_CERT_PATH = os.path.join(HOST_ROOT, "ca.crt")
+
+
 class MSFStorage:
-    def __init__(self, filename):
+    def __init__(self, filename, ca_cert_path=None):
         self.filename = filename
+        self.ca_cert_path = ca_cert_path or DEFAULT_CA_CERT_PATH
         self.conn = sqlite3.connect(filename)
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._init_db()
@@ -183,6 +193,21 @@ class MSFStorage:
             
         return False
 
+    def _signer_is_ca_trusted(self, pub_key_pem):
+        """True only if the signer presented an X.509 cert that chains to the host Root CA.
+
+        A bare public key (no certificate) has no chain to the CA and is therefore
+        not trusted for the "verified" banner, even if its signature is valid.
+        """
+        pub_key_str = pub_key_pem.decode('utf-8') if isinstance(pub_key_pem, bytes) else pub_key_pem
+        if "-----BEGIN CERTIFICATE-----" not in pub_key_str:
+            return False
+        if not os.path.isfile(self.ca_cert_path):
+            return False
+        with open(self.ca_cert_path, 'rb') as f:
+            ca_cert_pem = f.read()
+        return is_cert_signed_by_ca(pub_key_str, ca_cert_pem)
+
     def verify_signature(self, payload, signature, pub_key_pem):
         """Verify the signature of a payload using the provided PEM public key or certificate."""
         if isinstance(pub_key_pem, str):
@@ -211,8 +236,13 @@ class MSFStorage:
             print(f"Signature verification error: {e}")
             return False
 
-    def execute_signed(self, query, params, signature, pub_key_pem):
-        """Execute a query only if the signature and RBAC checks pass."""
+    def execute_signed(self, query, params, signature, pub_key_pem, allow_bootstrap=False):
+        """Execute a query only if the signature and RBAC checks pass.
+
+        ``allow_bootstrap`` is the ONLY way the first-writer-becomes-admin
+        bootstrap can fire; callers that run untrusted code (the sandbox) must
+        never set it. Use ``bootstrap_admin`` for the deliberate authoring step.
+        """
         import base64
         def _make_json_serializable(obj):
             if isinstance(obj, bytes):
@@ -230,59 +260,40 @@ class MSFStorage:
         if not self.verify_signature(payload_bytes, signature, pub_key_pem):
             raise PermissionError("Invalid transaction signature")
             
-        # Cryptographic Chain-of-Trust Check for X.509 Certificates
+        # Cryptographic Chain-of-Trust Check for X.509 Certificates.
+        # The trust anchor is the HOST's Root CA (self.ca_cert_path) — never a
+        # ca.crt sitting next to the .msf container. Fail closed: if the trusted
+        # CA is missing we cannot verify the chain, so the transaction is rejected.
         pub_key_str = pub_key_pem.decode('utf-8') if isinstance(pub_key_pem, bytes) else pub_key_pem
         if "-----BEGIN CERTIFICATE-----" in pub_key_str:
-            # Locate ca.crt relative to database, current directory, or project root
-            # Prioritize the directory of the SQLite database container first
-            ca_paths = []
-            if self.filename:
-                db_dir = os.path.dirname(os.path.abspath(self.filename))
-                ca_paths.append(os.path.join(db_dir, 'ca.crt'))
-            ca_paths.extend([
-                'ca.crt',
-                os.path.abspath('ca.crt'),
-            ])
-            ca_cert_pem = None
-            for p in ca_paths:
-                if os.path.isfile(p):
-                    try:
-                        with open(p, 'rb') as f:
-                            ca_cert_pem = f.read()
-                        break
-                    except Exception:
-                        pass
-            
-            if ca_cert_pem:
-                from cryptography import x509
-                from cryptography.hazmat.backends import default_backend
-                try:
-                    user_cert_bytes = pub_key_str.encode('utf-8')
-                    user_cert = x509.load_pem_x509_certificate(user_cert_bytes, default_backend())
-                    ca_cert = x509.load_pem_x509_certificate(ca_cert_pem, default_backend())
-                    
-                    # If this is not the Root CA itself, check that it's issued and signed by Root CA
-                    if user_cert.signature != ca_cert.signature:
-                        from cryptography.hazmat.primitives.asymmetric import padding
-                        ca_public_key = ca_cert.public_key()
-                        ca_public_key.verify(
-                            user_cert.signature,
-                            user_cert.tbs_certificate_bytes,
-                            padding.PKCS1v15(),
-                            user_cert.signature_hash_algorithm
-                        )
-                except Exception as e:
-                    raise PermissionError(f"Cryptographic Chain Verification Failed: Identity certificate is not signed by the trusted Root CA. (Detail: {e})")
-            
+            if not os.path.isfile(self.ca_cert_path):
+                raise PermissionError(
+                    "Cryptographic Chain Verification Failed: trusted Root CA not found at "
+                    f"{self.ca_cert_path}."
+                )
+            with open(self.ca_cert_path, 'rb') as f:
+                ca_cert_pem = f.read()
+            # A self-signed Root CA verifies against itself, so signing directly
+            # with the Root CA is still accepted; anything else must be CA-issued.
+            if not is_cert_signed_by_ca(pub_key_str, ca_cert_pem):
+                raise PermissionError(
+                    "Cryptographic Chain Verification Failed: Identity certificate is not "
+                    "signed by the trusted Root CA."
+                )
+
         # Resolve identity
         identity = self._get_identity(pub_key_pem)
-        
-        # TOFU Bootstrapping: If user_roles is completely empty, assign first user to 'admin'
+
+        # Admin bootstrapping is an explicit, opt-in authoring step, never a side
+        # effect of a normal write. Otherwise anyone holding a CA-signed cert could
+        # silently become admin of a fresh container just by writing to it first.
+        # Running micro-apps go through the sandbox, which never sets allow_bootstrap.
         cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM user_roles")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute("INSERT INTO user_roles (identity, role) VALUES (?, 'admin')", (identity,))
-            self.conn.commit()
+        if allow_bootstrap:
+            cursor.execute("SELECT COUNT(*) FROM user_roles")
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("INSERT INTO user_roles (identity, role) VALUES (?, 'admin')", (identity,))
+                self.conn.commit()
 
         # Parse query for RBAC
         operation, table_name = self._parse_sql_query(query)
@@ -377,7 +388,8 @@ class MSFStorage:
                     
                     # Verify signature
                     verified = self.verify_signature(payload_bytes, signature, pub_key_pem)
-                    
+                    error = None if verified else "Signature verification failed (data was tampered with or key is invalid)"
+
                     # Cryptographic check: Ensure code blob in table matches the signed blob in transactions
                     if verified:
                         try:
@@ -389,25 +401,37 @@ class MSFStorage:
                                 signed_blob = base64.b64decode(params[1])
                                 if current_blob != signed_blob:
                                     verified = False
+                                    error = "Code blob does not match the signed transaction (tampered)"
                             else:
                                 verified = False
+                                error = "Code blob is missing from the container"
                         except Exception:
                             verified = False
-                    
+                            error = "Signature verification failed (data was tampered with or key is invalid)"
+
+                    # Trust check: a valid signature from a signer whose cert does not chain
+                    # to the host Root CA is NOT "verified" — it only proves the blob matches
+                    # whatever key is in the audit row, not that a trusted party signed it.
+                    if verified and not self._signer_is_ca_trusted(pub_key_pem):
+                        verified = False
+                        error = "Signer certificate is not signed by the trusted Root CA"
+
                     signer_cn = "Unknown"
+                    method = "RSA / SHA-256 / PKCS#1 v1.5"
                     try:
                         from cryptography import x509
                         from cryptography.x509.oid import NameOID
                         cert = x509.load_pem_x509_certificate(pub_key_pem if isinstance(pub_key_pem, bytes) else pub_key_pem.encode('utf-8'), default_backend())
                         signer_cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                        method = f"RSA-{cert.public_key().key_size} / SHA-256 / PKCS#1 v1.5"
                     except Exception:
                         signer_cn = self._get_identity(pub_key_pem)
-                        
+
                     return {
                         'verified': verified,
                         'signer': signer_cn,
-                        'method': 'RSA-1024 / SHA-256 / PKCS#1 v1.5',
-                        'error': None if verified else "Signature verification failed (data was tampered with or key is invalid)"
+                        'method': method,
+                        'error': error
                     }
             
             return {
@@ -439,6 +463,15 @@ class MSFStorage:
         """Assign a role to a cryptographic identity (Admin only)."""
         query = "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)"
         self.execute_signed(query, [target_identity, role], signature, pub_key_pem)
+
+    def bootstrap_admin(self, query, params, signature, pub_key_pem):
+        """Deliberately claim admin for a fresh container while making the first write.
+
+        This is the single opt-in authoring entry point that lets first-writer
+        bootstrapping fire. It only takes effect when ``user_roles`` is empty; on
+        an already-provisioned container it behaves exactly like ``execute_signed``.
+        """
+        return self.execute_signed(query, params, signature, pub_key_pem, allow_bootstrap=True)
 
     def close(self):
         self.conn.close()

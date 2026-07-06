@@ -3,11 +3,12 @@ import toga
 
 class HostAPI:
     """Bridge API exposed to the micro-app. Restricted to local MSF, config, and ID files."""
-    def __init__(self, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None):
+    def __init__(self, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None, key_path=None):
         self.workspace_path = os.path.abspath(workspace_path)
         self.db = db
         self.current_user_cn = current_user_cn or "Unknown"
         self.current_user_cert_pem = current_user_cert_pem or ""
+        self.key_path = key_path
         
     def _is_safe_path(self, filename):
         safe_path = os.path.abspath(os.path.join(self.workspace_path, filename))
@@ -63,17 +64,15 @@ class HostAPI:
             raise PermissionError("Database not connected to HostAPI.")
         if not self.current_user_cn or self.current_user_cn == "Unknown":
             raise PermissionError("No valid active user identity.")
-            
-        # Locate corresponding .key file on host
-        key_filename = f"{self.current_user_cn}.key"
-        if self.current_user_cn == "DESKTOP-GKSCQ7P": # support ca.crt mapping
-            key_filename = "ca.key"
-            
-        key_path = os.path.join(self.workspace_path, key_filename)
-        if not os.path.isfile(key_path):
-            raise FileNotFoundError(f"Active private key not found on Host at {key_filename}")
-            
-        with open(key_path, 'rb') as f:
+
+        # The active identity carries its own key path — never reconstruct it from the CN.
+        if not self.key_path or not os.path.isfile(self.key_path):
+            raise FileNotFoundError(
+                f"Active private key not found on host for identity '{self.current_user_cn}'"
+                + (f" (expected at {self.key_path})" if self.key_path else "")
+            )
+
+        with open(self.key_path, 'rb') as f:
             pem_key = f.read()
             
         import json
@@ -105,14 +104,14 @@ class HostAPI:
         return self.db.execute_signed(query, params, signature, self.current_user_cert_pem)
 
 
-def execute_micro_app(code_func, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None):
+def execute_micro_app(code_func, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None, key_path=None):
     """
     Executes the micro-app's main function within a restricted sandbox.
     code_func should be a callable returned by dill.loads().
     Returns the Toga widget constructed by the micro-app.
     """
     # Create the host API bridge with the active db instance and current user
-    host_api = HostAPI(workspace_path, db, current_user_cn, current_user_cert_pem)
+    host_api = HostAPI(workspace_path, db, current_user_cn, current_user_cert_pem, key_path)
     
     if callable(code_func):
         try:
