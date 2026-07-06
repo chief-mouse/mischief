@@ -221,30 +221,11 @@ class Mschf(toga.App):
                 f.write(pem_admin_key)
             log.info("Generated default Admin User identity (admin.crt/admin.key) signed by Root CA")
 
-        # 3. Determine the user identity to load (defaulting to admin.crt)
-        user_id_path = settings.get('user_id', 'admin.crt')
-        if user_id_path == 'ca.crt':
-            user_id_path = 'admin.crt' # Transition to admin user instead of CA directly
-            
-        if not os.path.isabs(user_id_path):
-            user_id_path = os.path.join(PROJ_DIR, user_id_path)
-
-        if not os.path.isfile(user_id_path):
-            with open(ca_cert_path, 'rb') as f:
-                ca_cert_pem = f.read()
-            with open(ca_key_path, 'rb') as f:
-                ca_key_pem = f.read()
-            from mschf.gen_cert import generate_user_cert
-            pem_cert, pem_key = generate_user_cert("default-user", ca_cert_pem, ca_key_pem)
-            with open(user_id_path, 'wb') as f:
-                f.write(pem_cert)
-            key_path = user_id_path.replace('.crt', '.key')
-            with open(key_path, 'wb') as f:
-                f.write(pem_key)
-        else:
-            pass
-            
-        self.active_identity = Identity.load(user_id_path, ca_cert_path)
+        # 3. Start logged-out. The admin identity file (admin.crt/key) exists on disk
+        # from step 2, but it is NOT auto-activated — opening micro-apps is gated on
+        # the user authenticating via the Auth Gateway. This stops the host from
+        # booting straight into a fully-authorized admin session.
+        self.active_identity = Identity.logged_out()
         identity_text = self.active_identity.identity_label
         status_text = self.active_identity.status_text
 

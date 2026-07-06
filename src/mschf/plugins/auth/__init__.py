@@ -5,6 +5,7 @@ from toga.style import Pack
 from toga.style.pack import COLUMN, ROW
 
 from mschf.plugins.base import BasePlugin
+from mschf.identity import Identity
 from mschf.plugins.auth.providers.password import PasswordAuthenticator
 from mschf.plugins.auth.providers.oauth import OAuth2Authenticator
 from mschf.plugins.auth.providers.passkey import PasskeyAuthenticator
@@ -53,18 +54,43 @@ class AuthPlugin(BasePlugin):
         metadata_label = toga.Label("Decoded Token / Crypto Properties: (None)", style=Pack(margin=5, font_size=9))
         
         def on_authenticate(widget):
-            # Resolve chosen provider
+            # Path 1: assume an existing, deliberately-issued identity by CN. Holding
+            # its CA-signed cert+key on the host IS the credential — this is how you
+            # log in as 'admin' (admin.crt) without the mock password minting admin.
+            typed_cn = (username_input.value or "").strip()
+            if typed_cn:
+                existing_cert = os.path.join(app.proj_dir, f"{typed_cn}.crt")
+                existing_key = os.path.join(app.proj_dir, f"{typed_cn}.key")
+                if os.path.isfile(existing_cert):
+                    probe = Identity.load(existing_cert, app.ca_cert_path)
+                    if not probe.is_valid:
+                        status_label.text = f"✖ Identity '{typed_cn}' is not signed by the trusted Root CA."
+                        metadata_label.text = ""
+                        return
+                    if not os.path.isfile(existing_key):
+                        status_label.text = f"✖ Identity '{typed_cn}' has no private key on this host; cannot sign as it."
+                        metadata_label.text = ""
+                        return
+                    app.set_active_identity(existing_cert)
+                    status_label.text = f"✔ Logged in as existing identity '{probe.cn}' ({os.path.basename(existing_cert)})."
+                    metadata_label.text = ("Cryptographic Verification:\n"
+                                           "  • source: on-host CA-signed identity file\n"
+                                           f"  • common_name: {probe.cn}")
+                    return
+
+            # Path 2: authenticate via an external protocol (mock) and provision a NEW
+            # per-user ephemeral identity. This path never yields the seeded identities.
             selected_display_name = provider_select.value
             provider = None
             for p in self.providers.values():
                 if p.display_name == selected_display_name:
                     provider = p
                     break
-            
+
             if not provider:
                 status_label.text = "Error: Provider not found."
                 return
-                
+
             username = username_input.value
             password = password_input.value
             

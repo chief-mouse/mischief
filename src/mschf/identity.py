@@ -38,6 +38,14 @@ class Identity:
         return cls(NO_ACCESS, None, None, "", False, identity_label, status_text)
 
     @classmethod
+    def logged_out(cls):
+        """The startup state: no one is authenticated yet, so nothing may open."""
+        return cls.invalid(
+            "Active Identity: None (not authenticated)",
+            "Not authenticated — log in via the Auth Gateway to open apps.",
+        )
+
+    @classmethod
     def load(cls, cert_path, ca_cert_path):
         """Load a certificate, verify it chains to the Root CA, and locate its key.
 
