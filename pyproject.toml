@@ -1,0 +1,21 @@
+[tool.briefcase]
+project_name = "Mschf"
+bundle = "com.mschf"
+version = "0.0.1"
+url = "https://github.com/pshouse/mischief"
+license = "MIT"
+license-files = ["LICENSE"]
+author = "Jane Developer"
+author_email = "jane@example.com"
+
+[tool.briefcase.app.mschf]
+formal_name = "mschf"
+description = "A little mschf"
+sources = ["src/mschf"]
+requires = [
+    "toga>=0.4.0",
+    "cryptography>=3.2",
+    "pytz",
+    "toml",
+    "dill",
+]
