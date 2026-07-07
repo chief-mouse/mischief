@@ -326,18 +326,19 @@ def my_micro_app(toga, host_api):
         except Exception:
             pass
 
-        # Return a beautiful OptionContainer containing BOTH screens for the admin
+        # Wrap each pane in a ScrollContainer so long forms scroll instead of
+        # clipping at the bottom of the window.
         option_container = toga.OptionContainer(
             content=[
-                ("Customer Dashboard", customer_dashboard_box),
-                ("Admin Control Panel", admin_panel_box)
+                ("Customer Dashboard", toga.ScrollContainer(horizontal=False, content=customer_dashboard_box, style=toga.style.Pack(flex=1))),
+                ("Admin Control Panel", toga.ScrollContainer(horizontal=False, content=admin_panel_box, style=toga.style.Pack(flex=1)))
             ],
             style=toga.style.Pack(flex=1)
         )
         return option_container
 
-    # Return only the Customer Dashboard for support users
-    return customer_dashboard_box
+    # Return only the Customer Dashboard (scrollable) for support users
+    return toga.ScrollContainer(horizontal=False, content=customer_dashboard_box, style=toga.style.Pack(flex=1))
 
 # 5. Sign and store the micro-app code using Admin credentials
 print("Signing and storing micro-app code using admin certificate...")
