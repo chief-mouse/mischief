@@ -183,16 +183,28 @@ class Mschf(toga.App):
         self.identity_label.text = self.active_identity.identity_label
         self.label.text = self.active_identity.status_text
 
-        # Update button enabled states dynamically
-        is_valid = self.active_identity.is_valid
-        if hasattr(self, 'btn_open_selected') and self.btn_open_selected is not None:
-            self.btn_open_selected.enabled = is_valid
-        if hasattr(self, 'btn_open_dialog') and self.btn_open_dialog is not None:
-            self.btn_open_dialog.enabled = is_valid
-
+        self._apply_identity_state()
         log.info(f"Switched active user identity to CN={self.active_identity.cn} via {cert_filename}")
 
-        # Force redraw of all open documents to apply the new active user identity live!
+    def log_out(self, widget=None):
+        """Drop the active identity (and its in-memory passphrase), re-locking the app."""
+        self.active_identity = Identity.logged_out()
+        self.identity_label.text = self.active_identity.identity_label
+        self.label.text = "Logged out. Authenticate via the Auth Gateway to open apps."
+        self._apply_identity_state()
+        log.info("Logged out; active identity cleared.")
+
+    def _apply_identity_state(self):
+        """Sync button enablement to the active identity and re-lock/redraw open docs."""
+        is_valid = self.active_identity.is_valid
+        for attr in ('btn_open_selected', 'btn_open_dialog'):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                btn.enabled = is_valid
+        if getattr(self, 'btn_logout', None) is not None:
+            self.btn_logout.enabled = is_valid
+
+        # Redraw open documents so they lock (logged out / no access) or refresh live.
         for doc in list(self.documents):
             try:
                 doc.redraw()
@@ -295,9 +307,11 @@ class Mschf(toga.App):
         self.btn_open_selected = toga.Button('Open Selected', on_press=self.open_selected_app, style=btn_style, enabled=is_valid)
         self.btn_open_dialog = toga.Button('Browse MSF', on_press=self.action_open_file_dialog, style=btn_style, enabled=is_valid)
         btn_refresh = toga.Button('Refresh', on_press=self.refresh_workspace, style=btn_style)
-        
+        # Log Out clears the active identity; disabled until someone is logged in.
+        self.btn_logout = toga.Button('Log Out', on_press=self.log_out, style=btn_style, enabled=is_valid)
+
         btn_box = toga.Box(
-            children=[self.btn_open_selected, self.btn_open_dialog, btn_refresh],
+            children=[self.btn_open_selected, self.btn_open_dialog, btn_refresh, self.btn_logout],
             style=Pack(direction=ROW, margin=5)
         )
 
