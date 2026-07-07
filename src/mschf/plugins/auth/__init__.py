@@ -55,6 +55,11 @@ class AuthPlugin(BasePlugin):
         metadata_label = toga.Label("Decoded Token / Crypto Properties: (None)", style=Pack(margin=5, font_size=9))
         
         def on_authenticate(widget):
+            # Capture the secret, then clear it from the widget immediately so it does
+            # not linger on screen / in the field after the attempt (success or fail).
+            secret = password_input.value or ""
+            password_input.value = ""
+
             # Path 1: assume an existing, deliberately-issued identity by CN. Holding
             # its CA-signed cert+key on the host IS the credential — this is how you
             # log in as 'admin' (admin.crt) without the mock password minting admin.
@@ -74,7 +79,7 @@ class AuthPlugin(BasePlugin):
                         return
                     # The passphrase that unlocks the private key IS the login secret:
                     # possession of the file is not enough. Verify by decrypting it.
-                    passphrase = password_input.value or ""
+                    passphrase = secret
                     from cryptography.hazmat.primitives.serialization import load_pem_private_key
                     with open(existing_key, 'rb') as f:
                         key_bytes = f.read()
@@ -112,8 +117,8 @@ class AuthPlugin(BasePlugin):
                 return
 
             username = username_input.value
-            password = password_input.value
-            
+            password = secret
+
             # Run the dynamic authenticators
             res = provider.authenticate(username=username, password=password)
             
