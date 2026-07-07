@@ -37,8 +37,11 @@ class AuthPlugin(BasePlugin):
             style=Pack(font_size=12, font_weight="bold", margin_bottom=5, color="#1e3a8a")
         ))
         
-        # Selector for authentication methods
-        provider_choices = [p.display_name for p in self.providers.values()]
+        # Selector for authentication methods. The first entry is a local mode that
+        # unlocks an existing on-host identity by its key passphrase (default); the
+        # rest are external IdP protocols that authenticate and provision a NEW identity.
+        EXISTING_IDENTITY_OPTION = "Existing Identity — Key Passphrase (local)"
+        provider_choices = [EXISTING_IDENTITY_OPTION] + [p.display_name for p in self.providers.values()]
         provider_select = toga.Selection(items=provider_choices, style=Pack(margin=5))
         
         # Form inputs
@@ -60,55 +63,63 @@ class AuthPlugin(BasePlugin):
             secret = password_input.value or ""
             password_input.value = ""
 
-            # Path 1: assume an existing, deliberately-issued identity by CN. Holding
-            # its CA-signed cert+key on the host IS the credential — this is how you
-            # log in as 'admin' (admin.crt) without the mock password minting admin.
             typed_cn = (username_input.value or "").strip()
-            if typed_cn:
+            selected = provider_select.value
+
+            # Mode 1 (default): unlock an existing, deliberately-issued on-host identity
+            # by CN, using its key passphrase as the secret — this is how you log in as
+            # 'admin' (admin.crt). The protocol dropdown is authoritative: this mode runs
+            # ONLY when selected, so picking OAuth never silently falls back to a passphrase.
+            if selected == EXISTING_IDENTITY_OPTION:
+                if not typed_cn:
+                    status_label.text = "✖ Enter the identity CN to unlock (e.g. admin)."
+                    metadata_label.text = ""
+                    return
                 existing_cert = os.path.join(app.proj_dir, f"{typed_cn}.crt")
                 existing_key = os.path.join(app.proj_dir, f"{typed_cn}.key")
-                if os.path.isfile(existing_cert):
-                    probe = Identity.load(existing_cert, app.ca_cert_path)
-                    if not probe.is_valid:
-                        status_label.text = f"✖ Identity '{typed_cn}' is not signed by the trusted Root CA."
-                        metadata_label.text = ""
-                        return
-                    if not os.path.isfile(existing_key):
-                        status_label.text = f"✖ Identity '{typed_cn}' has no private key on this host; cannot sign as it."
-                        metadata_label.text = ""
-                        return
-                    # The passphrase that unlocks the private key IS the login secret:
-                    # possession of the file is not enough. Verify by decrypting it.
-                    passphrase = secret
-                    from cryptography.hazmat.primitives.serialization import load_pem_private_key
-                    with open(existing_key, 'rb') as f:
-                        key_bytes = f.read()
-                    try:
-                        load_pem_private_key(key_bytes, password=passphrase.encode('utf-8') if passphrase else None)
-                    except TypeError:
-                        status_label.text = (f"✖ Identity '{typed_cn}' requires a passphrase."
-                                             if not passphrase else
-                                             f"✖ Identity '{typed_cn}' key is not passphrase-protected.")
-                        metadata_label.text = ""
-                        return
-                    except ValueError:
-                        status_label.text = f"✖ Incorrect passphrase for identity '{typed_cn}'."
-                        metadata_label.text = ""
-                        return
-                    app.set_active_identity(existing_cert, key_passphrase=passphrase or None)
-                    status_label.text = f"✔ Logged in as existing identity '{probe.cn}' ({os.path.basename(existing_cert)})."
-                    metadata_label.text = ("Cryptographic Verification:\n"
-                                           "  • source: on-host CA-signed identity file\n"
-                                           "  • unlocked with: passphrase\n"
-                                           f"  • common_name: {probe.cn}")
+                if not os.path.isfile(existing_cert):
+                    status_label.text = f"✖ No identity file for CN '{typed_cn}' on this host."
+                    metadata_label.text = ""
                     return
+                probe = Identity.load(existing_cert, app.ca_cert_path)
+                if not probe.is_valid:
+                    status_label.text = f"✖ Identity '{typed_cn}' is not signed by the trusted Root CA."
+                    metadata_label.text = ""
+                    return
+                if not os.path.isfile(existing_key):
+                    status_label.text = f"✖ Identity '{typed_cn}' has no private key on this host; cannot sign as it."
+                    metadata_label.text = ""
+                    return
+                # The passphrase that unlocks the private key IS the login secret:
+                # possession of the file is not enough. Verify by decrypting it.
+                from cryptography.hazmat.primitives.serialization import load_pem_private_key
+                with open(existing_key, 'rb') as f:
+                    key_bytes = f.read()
+                try:
+                    load_pem_private_key(key_bytes, password=secret.encode('utf-8') if secret else None)
+                except TypeError:
+                    status_label.text = (f"✖ Identity '{typed_cn}' requires a passphrase."
+                                         if not secret else
+                                         f"✖ Identity '{typed_cn}' key is not passphrase-protected.")
+                    metadata_label.text = ""
+                    return
+                except ValueError:
+                    status_label.text = f"✖ Incorrect passphrase for identity '{typed_cn}'."
+                    metadata_label.text = ""
+                    return
+                app.set_active_identity(existing_cert, key_passphrase=secret or None)
+                status_label.text = f"✔ Logged in as existing identity '{probe.cn}' ({os.path.basename(existing_cert)})."
+                metadata_label.text = ("Cryptographic Verification:\n"
+                                       "  • source: on-host CA-signed identity file\n"
+                                       "  • unlocked with: passphrase\n"
+                                       f"  • common_name: {probe.cn}")
+                return
 
-            # Path 2: authenticate via an external protocol (mock) and provision a NEW
-            # per-user ephemeral identity. This path never yields the seeded identities.
-            selected_display_name = provider_select.value
+            # Mode 2: authenticate via the selected external protocol (mock) and provision
+            # a NEW per-user ephemeral identity. Never yields the seeded identities.
             provider = None
             for p in self.providers.values():
-                if p.display_name == selected_display_name:
+                if p.display_name == selected:
                     provider = p
                     break
 
