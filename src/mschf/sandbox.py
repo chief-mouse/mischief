@@ -3,12 +3,13 @@ import toga
 
 class HostAPI:
     """Bridge API exposed to the micro-app. Restricted to local MSF, config, and ID files."""
-    def __init__(self, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None, key_path=None):
+    def __init__(self, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None, key_path=None, key_passphrase=None):
         self.workspace_path = os.path.abspath(workspace_path)
         self.db = db
         self.current_user_cn = current_user_cn or "Unknown"
         self.current_user_cert_pem = current_user_cert_pem or ""
         self.key_path = key_path
+        self.key_passphrase = key_passphrase
         
     def _is_safe_path(self, filename):
         safe_path = os.path.abspath(os.path.join(self.workspace_path, filename))
@@ -93,8 +94,12 @@ class HostAPI:
         params = params or []
         payload_dict = {"query": query, "params": _make_json_serializable(params)}
         payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-        
-        private_key = load_pem_private_key(pem_key, password=None)
+
+        password = self.key_passphrase.encode('utf-8') if self.key_passphrase else None
+        try:
+            private_key = load_pem_private_key(pem_key, password=password)
+        except (TypeError, ValueError) as e:
+            raise PermissionError(f"Could not unlock private key for '{self.current_user_cn}' (bad or missing passphrase): {e}")
         signature = private_key.sign(
             payload_bytes,
             padding.PKCS1v15(),
@@ -104,14 +109,14 @@ class HostAPI:
         return self.db.execute_signed(query, params, signature, self.current_user_cert_pem)
 
 
-def execute_micro_app(code_func, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None, key_path=None):
+def execute_micro_app(code_func, workspace_path, db=None, current_user_cn=None, current_user_cert_pem=None, key_path=None, key_passphrase=None):
     """
     Executes the micro-app's main function within a restricted sandbox.
     code_func should be a callable returned by dill.loads().
     Returns the Toga widget constructed by the micro-app.
     """
     # Create the host API bridge with the active db instance and current user
-    host_api = HostAPI(workspace_path, db, current_user_cn, current_user_cert_pem, key_path)
+    host_api = HostAPI(workspace_path, db, current_user_cn, current_user_cert_pem, key_path, key_passphrase)
     
     if callable(code_func):
         try:

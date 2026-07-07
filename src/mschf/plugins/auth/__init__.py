@@ -71,10 +71,29 @@ class AuthPlugin(BasePlugin):
                         status_label.text = f"✖ Identity '{typed_cn}' has no private key on this host; cannot sign as it."
                         metadata_label.text = ""
                         return
-                    app.set_active_identity(existing_cert)
+                    # The passphrase that unlocks the private key IS the login secret:
+                    # possession of the file is not enough. Verify by decrypting it.
+                    passphrase = password_input.value or ""
+                    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+                    with open(existing_key, 'rb') as f:
+                        key_bytes = f.read()
+                    try:
+                        load_pem_private_key(key_bytes, password=passphrase.encode('utf-8') if passphrase else None)
+                    except TypeError:
+                        status_label.text = (f"✖ Identity '{typed_cn}' requires a passphrase."
+                                             if not passphrase else
+                                             f"✖ Identity '{typed_cn}' key is not passphrase-protected.")
+                        metadata_label.text = ""
+                        return
+                    except ValueError:
+                        status_label.text = f"✖ Incorrect passphrase for identity '{typed_cn}'."
+                        metadata_label.text = ""
+                        return
+                    app.set_active_identity(existing_cert, key_passphrase=passphrase or None)
                     status_label.text = f"✔ Logged in as existing identity '{probe.cn}' ({os.path.basename(existing_cert)})."
                     metadata_label.text = ("Cryptographic Verification:\n"
                                            "  • source: on-host CA-signed identity file\n"
+                                           "  • unlocked with: passphrase\n"
                                            f"  • common_name: {probe.cn}")
                     return
 
@@ -114,19 +133,20 @@ class AuthPlugin(BasePlugin):
 
                     # Generate the certificate signed by Root CA. The CN must match the
                     # sanitized filename stem so the cert, the .crt/.key files, and the
-                    # derived RBAC identity (cert:CN=clean_name) all agree.
+                    # derived RBAC identity (cert:CN=clean_name) all agree. The new key is
+                    # encrypted with the login password, so future logins need that secret.
                     from mschf.gen_cert import generate_user_cert
-                    pem_cert, pem_key = generate_user_cert(clean_name, app.ca_cert_pem, app.ca_key_pem)
-                    
+                    pem_cert, pem_key = generate_user_cert(clean_name, app.ca_cert_pem, app.ca_key_pem, passphrase=(password or None))
+
                     with open(cert_path, 'wb') as f:
                         f.write(pem_cert)
                     with open(key_path, 'wb') as f:
                         f.write(pem_key)
-                        
+
                     log.info(f"Dynamically provisioned ephemeral X.509 Certificate for: {res['identity']}")
-                    
+
                     # Hot-swap and set active identity in the main App GUI
-                    app.set_active_identity(cert_filename)
+                    app.set_active_identity(cert_filename, key_passphrase=(password or None))
                     
                     status_label.text += f"\n✔ Dynamically provisioned & set active X.509 cert: {cert_filename}!"
                 except Exception as cert_err:

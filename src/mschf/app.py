@@ -144,7 +144,33 @@ class Mschf(toga.App):
                 name = name[1]
             self.label.text = f"Selected: {name}"
 
-    def set_active_identity(self, cert_filename):
+    def _ensure_key_encrypted(self, key_path, passphrase):
+        """Re-encrypt a plaintext private key in place with the given passphrase.
+
+        Preserves the keypair (so the matching cert stays valid); no-ops if the key
+        is already encrypted or missing.
+        """
+        if not passphrase or not os.path.isfile(key_path):
+            return
+        try:
+            with open(key_path, 'rb') as f:
+                data = f.read()
+            try:
+                key = serialization.load_pem_private_key(data, password=None, backend=default_backend())
+            except TypeError:
+                return  # already encrypted — nothing to do
+            enc = key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode('utf-8')),
+            )
+            with open(key_path, 'wb') as f:
+                f.write(enc)
+            log.info(f"Upgraded plaintext key to passphrase-protected: {os.path.basename(key_path)}")
+        except Exception as e:
+            log.warning(f"Could not upgrade key encryption for {key_path}: {e}")
+
+    def set_active_identity(self, cert_filename, key_passphrase=None):
         path = os.path.join(self.proj_dir, cert_filename) if not os.path.isabs(cert_filename) else cert_filename
         if not os.path.isfile(path):
             log.error(f"Certificate file not found: {path}")
@@ -152,6 +178,7 @@ class Mschf(toga.App):
 
         ca_cert_path = os.path.join(PROJ_DIR, 'ca.crt')
         self.active_identity = Identity.load(path, ca_cert_path)
+        self.active_identity.key_passphrase = key_passphrase
 
         self.identity_label.text = self.active_identity.identity_label
         self.label.text = self.active_identity.status_text
@@ -204,22 +231,29 @@ class Mschf(toga.App):
         with open(ca_key_path, 'rb') as f:
             self.ca_key_pem = f.read()
 
-        # 2. Verify/Generate default Admin User identity (admin.crt / admin.key) signed by Root CA
+        # 2. Verify/Generate default Admin User identity (admin.crt / admin.key) signed by Root CA.
+        # The admin key is passphrase-protected so logging in as admin requires a secret.
+        # The passphrase comes from MSCHF_ADMIN_PASSPHRASE (demo default "changeit").
         admin_cert_path = os.path.join(PROJ_DIR, 'admin.crt')
         admin_key_path = os.path.join(PROJ_DIR, 'admin.key')
-        
+        admin_passphrase = os.environ.get('MSCHF_ADMIN_PASSPHRASE', 'changeit')
+
         if not os.path.isfile(admin_cert_path) or not os.path.isfile(admin_key_path):
             with open(ca_cert_path, 'rb') as f:
                 ca_cert_pem = f.read()
             with open(ca_key_path, 'rb') as f:
                 ca_key_pem = f.read()
             from mschf.gen_cert import generate_user_cert
-            pem_admin_cert, pem_admin_key = generate_user_cert("admin", ca_cert_pem, ca_key_pem)
+            pem_admin_cert, pem_admin_key = generate_user_cert("admin", ca_cert_pem, ca_key_pem, passphrase=admin_passphrase)
             with open(admin_cert_path, 'wb') as f:
                 f.write(pem_admin_cert)
             with open(admin_key_path, 'wb') as f:
                 f.write(pem_admin_key)
             log.info("Generated default Admin User identity (admin.crt/admin.key) signed by Root CA")
+
+        # Upgrade a legacy plaintext admin.key in place (same keypair, now encrypted),
+        # so an existing admin identity keeps working but now requires a passphrase.
+        self._ensure_key_encrypted(admin_key_path, admin_passphrase)
 
         # 3. Start logged-out. The admin identity file (admin.crt/key) exists on disk
         # from step 2, but it is NOT auto-activated — opening micro-apps is gated on

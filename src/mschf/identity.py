@@ -26,6 +26,9 @@ class Identity:
         self.is_valid = is_valid
         self.identity_label = identity_label
         self.status_text = status_text
+        # Passphrase to decrypt key_path for signing, held in memory only after a
+        # successful login. None for plaintext keys or when not logged in.
+        self.key_passphrase = None
 
     @staticmethod
     def _sibling_key_path(cert_path):

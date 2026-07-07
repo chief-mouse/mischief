@@ -30,7 +30,19 @@ import uuid
 # considered broken; 2048 is the current floor for RSA signing keys.
 KEY_SIZE = 2048
 
-def generate_selfsigned_cert(hostname, public_ip=None, private_ip=None):
+
+def _key_encryption(passphrase):
+    """Return a key-serialization encryption algorithm for the given passphrase.
+
+    A passphrase means the private key is written encrypted (possession of the
+    file is no longer enough to use the identity); None means plaintext.
+    """
+    if passphrase:
+        pw = passphrase.encode('utf-8') if isinstance(passphrase, str) else passphrase
+        return serialization.BestAvailableEncryption(pw)
+    return serialization.NoEncryption()
+
+def generate_selfsigned_cert(hostname, public_ip=None, private_ip=None, passphrase=None):
 
     # Generate our key
     key = rsa.generate_private_key(
@@ -72,12 +84,12 @@ def generate_selfsigned_cert(hostname, public_ip=None, private_ip=None):
     key_pem = key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
+        encryption_algorithm=_key_encryption(passphrase),
     )
 
     return cert_pem, key_pem
 
-def generate_user_cert(common_name, ca_cert_pem, ca_key_pem):
+def generate_user_cert(common_name, ca_cert_pem, ca_key_pem, passphrase=None):
     # Load CA cert and key
     ca_cert = x509.load_pem_x509_certificate(ca_cert_pem, default_backend())
     ca_key = serialization.load_pem_private_key(ca_key_pem, password=None, backend=default_backend())
@@ -115,7 +127,7 @@ def generate_user_cert(common_name, ca_cert_pem, ca_key_pem):
     key_pem = user_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
+        encryption_algorithm=_key_encryption(passphrase),
     )
     return cert_pem, key_pem
 

@@ -45,6 +45,7 @@ class MSF(toga.Document):
                 user_cn = active_id.cn if active_id else "Unknown"
                 user_cert_pem = active_id.cert_pem if active_id else ""
                 user_key_path = active_id.key_path if active_id else None
+                user_key_passphrase = active_id.key_passphrase if active_id else None
 
                 # Check for database-level No Access
                 identity = self.db._get_identity(user_cert_pem)
@@ -63,7 +64,8 @@ class MSF(toga.Document):
                     self.db,
                     current_user_cn=user_cn,
                     current_user_cert_pem=user_cert_pem,
-                    key_path=user_key_path
+                    key_path=user_key_path,
+                    key_passphrase=user_key_passphrase
                 )
                 
                 # Fetch cryptographic verification status
