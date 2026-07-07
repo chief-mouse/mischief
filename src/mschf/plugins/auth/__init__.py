@@ -163,6 +163,10 @@ class AuthPlugin(BasePlugin):
                 metadata_label.text = ""
                 
         btn_auth = toga.Button("Authenticate & Verify Identity", on_press=on_authenticate, style=Pack(margin=5))
+
+        # Pressing Enter in either field submits the login, same as the button.
+        username_input.on_confirm = on_authenticate
+        password_input.on_confirm = on_authenticate
         
         # Layout organization
         plugin_box.add(toga.Label("Select Authentication Protocol:", style=Pack(margin_left=5, font_size=10)))
