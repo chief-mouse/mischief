@@ -56,30 +56,28 @@ def _make_json_serializable(obj):
         return {k: _make_json_serializable(v) for k, v in obj.items()}
     return obj
 
-# 2. Generate and save the three distinct user identities signed by the Root CA
-identities = {
-    'admin': 'admin.crt',
-    'support': 'support.crt',
-    'unregistered': 'unregistered.crt'
-}
+# 2. Generate the identities this container recognizes.
+# The admin identity is generated IN MEMORY only (used to sign the seed data below)
+# and is deliberately NOT written to disk, so it never clobbers the GUI's own
+# passphrase-protected admin.crt/admin.key. The container still grants admin to
+# cert:CN=admin, so logging into the app as 'admin' administers this container.
+# support / unregistered ARE written as GUI test logins, passphrase-encrypted
+# (default 'changeit', overridable via MSCHF_ADMIN_PASSPHRASE) to match the app.
+DEMO_PASSPHRASE = os.environ.get('MSCHF_ADMIN_PASSPHRASE', 'changeit')
 
 user_certs = {}
 user_keys = {}
 
-for cn, filename in identities.items():
-    crt_path = os.path.join(PROJ_DIR, filename)
-    key_filename = filename.replace('.crt', '.key')
-    key_path = os.path.join(PROJ_DIR, key_filename)
-    
-    # Generate fresh CA-signed certificates for clean and repeatable tests
-    print(f"Generating signed user certificate for CN={cn}...")
-    cert_pem, key_pem = generate_user_cert(cn, ca_cert_pem, ca_key_pem)
-    
-    with open(crt_path, 'wb') as f:
+print("Generating in-memory admin certificate for CN=admin (not written to disk)...")
+user_certs['admin'], user_keys['admin'] = generate_user_cert('admin', ca_cert_pem, ca_key_pem)
+
+for cn in ('support', 'unregistered'):
+    print(f"Generating signed user certificate for CN={cn} (passphrase-protected)...")
+    cert_pem, key_pem = generate_user_cert(cn, ca_cert_pem, ca_key_pem, passphrase=DEMO_PASSPHRASE)
+    with open(os.path.join(PROJ_DIR, f'{cn}.crt'), 'wb') as f:
         f.write(cert_pem)
-    with open(key_path, 'wb') as f:
+    with open(os.path.join(PROJ_DIR, f'{cn}.key'), 'wb') as f:
         f.write(key_pem)
-        
     user_certs[cn] = cert_pem
     user_keys[cn] = key_pem
 
@@ -412,7 +410,7 @@ db.add_rbac_rule('field', 'custom_tickets.customer_ssn', 'admin', 'read', signat
 
 db.close()
 print(f"\nSuccessfully generated dual-tier container at {db_path}!")
-print("Identities generated:")
-print("  - admin.crt (CN=admin, Role=admin -> BOTH DASHBOARD & ADMIN PANEL CHANNELS UNLOCKED)")
-print("  - support.crt (CN=support, Role=support -> CUSTOMER DASHBOARD CHANNEL ONLY)")
-print("  - unregistered.crt (CN=unregistered, No Role -> TOTAL GATEWAY LOCKOUT)")
+print("Identities:")
+print("  - CN=admin (Role=admin -> BOTH DASHBOARD & ADMIN PANEL) — in-memory only; log in with the app's own admin.crt")
+print(f"  - support.crt (CN=support, Role=support -> CUSTOMER DASHBOARD ONLY; passphrase '{DEMO_PASSPHRASE}')")
+print(f"  - unregistered.crt (CN=unregistered, No Role -> TOTAL LOCKOUT; passphrase '{DEMO_PASSPHRASE}')")
