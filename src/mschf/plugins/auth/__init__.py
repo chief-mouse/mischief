@@ -44,7 +44,8 @@ class AuthPlugin(BasePlugin):
         # Form inputs
         input_box = toga.Box(style=Pack(direction=ROW, margin=5))
         username_input = toga.TextInput(placeholder="Username / Identity CN / Email", style=Pack(flex=1, margin_right=5))
-        password_input = toga.TextInput(placeholder="Password / OAuth ID Token", style=Pack(flex=1)) # password_input can double as JWT input
+        # Masked: this field carries the key passphrase / password / OAuth token.
+        password_input = toga.PasswordInput(placeholder="Passphrase / Password / OAuth ID Token", style=Pack(flex=1))
         
         input_box.add(username_input)
         input_box.add(password_input)
