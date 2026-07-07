@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import toga
@@ -9,17 +10,28 @@ from mschf.identity import Identity
 from mschf.plugins.auth.providers.password import PasswordAuthenticator
 from mschf.plugins.auth.providers.oauth import OAuth2Authenticator
 from mschf.plugins.auth.providers.passkey import PasskeyAuthenticator
+from mschf.plugins.auth.providers.oidc import OIDCAuthenticator
 
 log = logging.getLogger(__name__)
 
 class AuthPlugin(BasePlugin):
     def __init__(self):
         super().__init__("authentication_gateway")
-        # Instantiate available authenticators
+        # Instantiate available authenticators. Google is a real OIDC flow (browser
+        # + PKCE + JWKS verification), configured via MSCHF_GOOGLE_CLIENT_ID /
+        # MSCHF_GOOGLE_CLIENT_SECRET. The others remain simulated and are labelled so.
         self.providers = {
             "local_password": PasswordAuthenticator(),
-            "google_oauth": OAuth2Authenticator("google_oauth", "Google OAuth 2.0 (OIDC)", "https://accounts.google.com"),
-            "microsoft_oauth": OAuth2Authenticator("microsoft_oauth", "Microsoft OAuth 2.0 (OIDC)", "https://login.microsoftonline.com"),
+            "google_oidc": OIDCAuthenticator(
+                "google_oidc", "Google OAuth 2.0 (OIDC — real sign-in)",
+                authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+                token_endpoint="https://oauth2.googleapis.com/token",
+                jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+                issuers=["https://accounts.google.com", "accounts.google.com"],
+                client_id_env="MSCHF_GOOGLE_CLIENT_ID",
+                client_secret_env="MSCHF_GOOGLE_CLIENT_SECRET",
+            ),
+            "microsoft_oauth": OAuth2Authenticator("microsoft_oauth", "Microsoft OAuth 2.0 (SIMULATED)", "https://login.microsoftonline.com"),
             "fido2_passkey": PasskeyAuthenticator()
         }
         self.active_provider_key = "local_password"
@@ -57,7 +69,7 @@ class AuthPlugin(BasePlugin):
         status_label = toga.Label("Auth Status: Waiting for input.", style=Pack(margin=5, font_style="italic"))
         metadata_label = toga.Label("Decoded Token / Crypto Properties: (None)", style=Pack(margin=5, font_size=9))
         
-        def on_authenticate(widget):
+        async def on_authenticate(widget):
             # Capture the secret, then clear it from the widget immediately so it does
             # not linger on screen / in the field after the attempt (success or fail).
             secret = password_input.value or ""
@@ -130,8 +142,17 @@ class AuthPlugin(BasePlugin):
             username = username_input.value
             password = secret
 
-            # Run the dynamic authenticators
-            res = provider.authenticate(username=username, password=password)
+            # Interactive providers (real OIDC) open a browser and block; run them off
+            # the UI thread so the app stays responsive, and show progress meanwhile.
+            if getattr(provider, 'interactive', False):
+                status_label.text = f"Opening browser for {provider.display_name} — complete the sign-in…"
+                metadata_label.text = ""
+                loop = asyncio.get_event_loop()
+                res = await loop.run_in_executor(
+                    None, lambda: provider.authenticate(username=username, password=password)
+                )
+            else:
+                res = provider.authenticate(username=username, password=password)
             
             if res['success']:
                 # Authentication succeeded!

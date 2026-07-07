@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 class PasskeyAuthenticator(BaseAuthenticator):
     def __init__(self):
-        super().__init__("fido2_passkey", "FIDO2 / WebAuthn Hardware Passkey")
+        super().__init__("fido2_passkey", "FIDO2 / WebAuthn Passkey (SIMULATED)")
         # In-memory "secure enclave" database storing registered public keys for each passkey user
         self.registered_credentials = {}
 

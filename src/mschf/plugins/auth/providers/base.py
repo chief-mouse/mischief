@@ -1,4 +1,8 @@
 class BaseAuthenticator:
+    # Interactive providers (e.g. real OIDC) open a browser and block; the UI must
+    # run their authenticate() off the main thread. Mock providers are instant.
+    interactive = False
+
     def __init__(self, name, display_name):
         self.name = name
         self.display_name = display_name
