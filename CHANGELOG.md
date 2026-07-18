@@ -11,6 +11,14 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- GitHub Actions workflow (`ci-package.yml`): storage-layer integration tests
+  (RBAC, authorizer, reactive redraw, container generation) plus a
+  version-sources-agree check run on every push/PR to master; version tags and
+  manual dispatch additionally build the Windows MSI via Briefcase and attach
+  it to the GitHub Release.
+
 ## [0.2.0] - 2026-07-18
 
 ### Added
