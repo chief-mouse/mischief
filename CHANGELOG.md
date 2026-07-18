@@ -11,6 +11,14 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- Runtime log with liveness heartbeat: a rotating `mschf-runtime.log` in the
+  user data dir records a heartbeat every 30s (open-doc count, active identity,
+  and GDI/USER handle counts). If the app freezes — e.g. the WinForms/pythonnet
+  stack wedging across a screen lock — the last heartbeat pins when it happened
+  and whether the poll loop was still ticking and resources were climbing.
+
 ## [0.4.1] - 2026-07-18
 
 ### Fixed
