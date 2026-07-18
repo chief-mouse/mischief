@@ -235,12 +235,18 @@ class Mschf(toga.App):
         self._apply_identity_state()
         log.info("Logged out; active identity cleared.")
 
-    def _update_onboarding(self, app_count=None):
-        """Contextual first-run guidance: always show the user their NEXT step.
+    def register_auth_panel(self, panel):
+        """Called by the auth plugin: the app owns WHERE (and whether) the
+        panel appears — it is only composed into the window while logged out."""
+        self.auth_panel = panel
 
-        Logged out -> how to sign in (with the admin passphrase hint);
-        signed in with an empty workspace -> where apps live + starter creation;
-        otherwise the banner disappears.
+    def _update_onboarding(self, app_count=None):
+        """Contextual first-run guidance + progressive disclosure.
+
+        The window shows only what matters for the current state:
+        logged out            -> onboarding banner + Auth Gateway, nothing else;
+        logged in, no apps    -> banner (with starter creation) + workspace;
+        logged in, apps exist -> just the workspace.
         """
         if not hasattr(self, 'onboarding_label'):
             return
@@ -255,11 +261,9 @@ class Mschf(toga.App):
                 else "your MSCHF_ADMIN_PASSPHRASE passphrase"
             )
             self.onboarding_label.text = (
-                "Getting started — 1) Sign in below via the Auth Gateway: identity 'admin' with "
-                f"{pw_hint}.  2) Then open a micro-app, or create the starter app."
+                "Welcome to Mischief. Sign in below to unlock the workspace —\n"
+                f"this machine's built-in identity is 'admin', with {pw_hint}."
             )
-            self.onboarding_box.style.display = 'pack'
-            self.btn_create_starter.style.display = 'none'
         elif app_count == 0:
             self.onboarding_label.text = (
                 "You're signed in, but no micro-apps (.msf) were found.\n"
@@ -267,10 +271,44 @@ class Mschf(toga.App):
                 "Create the starter app to see the platform in action, or use Browse MSF "
                 "to open an existing container."
             )
-            self.onboarding_box.style.display = 'pack'
-            self.btn_create_starter.style.display = 'pack'
+        self._recompose_layout()
+
+    def _recompose_layout(self):
+        """Rebuild the main window's children for the current state.
+
+        Widgets are added/removed from the layout rather than css-hidden:
+        Pack display toggling proved unreliable on WinForms, and removal also
+        reclaims the space (no dead zones from invisible widgets).
+        """
+        if not hasattr(self, 'outer_box'):
+            return
+        logged_in = self.active_identity.is_valid
+        app_count = getattr(self, '_app_count', 0)
+
+        # The starter button lives in the banner only when it is actionable.
+        want_starter = logged_in and app_count == 0
+        have_starter = self.btn_create_starter in list(self.onboarding_box.children)
+        if want_starter and not have_starter:
+            self.onboarding_box.add(self.btn_create_starter)
+        elif not want_starter and have_starter:
+            self.onboarding_box.remove(self.btn_create_starter)
+
+        if not logged_in:
+            desired = [self.onboarding_box]
+            if getattr(self, 'auth_panel', None) is not None:
+                desired.append(self.auth_panel)
+        elif app_count == 0:
+            desired = [self.onboarding_box, self.identity_label, self.btn_box,
+                       self.workspace, self.label]
         else:
-            self.onboarding_box.style.display = 'none'
+            desired = [self.identity_label, self.btn_box, self.workspace, self.label]
+
+        current = list(self.outer_box.children)
+        if current != desired:
+            for child in current:
+                self.outer_box.remove(child)
+            for child in desired:
+                self.outer_box.add(child)
 
     def create_starter_app(self, widget=None):
         """Author the signed 'Getting Started' micro-app in the user's workspace."""
@@ -390,7 +428,7 @@ class Mschf(toga.App):
         self.plugin_manager = PluginManager(self)
         self.plugin_manager.load_all()
 
-        self.main_window = toga.MainWindow(title=self.formal_name)
+        self.main_window = toga.MainWindow(title=self.formal_name, size=(760, 640))
         self.label = toga.Label(status_text, style=Pack(margin=10))
 
         self.identity_label = toga.Label(identity_text, style=Pack(margin=10, font_weight="bold"))
@@ -420,37 +458,39 @@ class Mschf(toga.App):
         # Log Out clears the active identity; disabled until someone is logged in.
         self.btn_logout = toga.Button('Log Out', on_press=self.log_out, style=btn_style, enabled=is_valid)
 
-        btn_box = toga.Box(
+        self.btn_box = toga.Box(
             children=[self.btn_open_selected, self.btn_open_dialog, btn_refresh, self.btn_logout],
             style=Pack(direction=ROW, margin=5)
         )
 
         # First-run onboarding banner: contextual next-step guidance, populated
-        # by _update_onboarding() from the auth/workspace state.
+        # by _update_onboarding(). The starter button is composed in only when
+        # actionable (signed in + empty workspace).
         self.onboarding_label = toga.Label("", style=Pack(margin=8, font_size=10))
         self.btn_create_starter = toga.Button(
             'Create Starter App', on_press=self.create_starter_app,
             style=Pack(margin=8, margin_top=0), enabled=is_valid,
         )
         self.onboarding_box = toga.Box(
-            children=[self.onboarding_label, self.btn_create_starter],
+            children=[self.onboarding_label],
             style=Pack(direction=COLUMN, background_color='#fff7ed', margin_bottom=5),
         )
 
-        outer_box = toga.Box(
-            children=[self.onboarding_box, self.identity_label, btn_box, self.workspace, self.label],
-            style=Pack(direction=COLUMN, margin=10)
-        )
+        # Root container starts empty; _recompose_layout() fills it with only
+        # the widgets relevant to the current auth/workspace state.
+        self.auth_panel = None
+        self.outer_box = toga.Box(children=[], style=Pack(direction=COLUMN, margin=10))
 
-        # Let plugins extend the main UI
+        # Let plugins extend the main UI (the auth plugin registers its panel
+        # via register_auth_panel; the composition owns its placement).
         for p_name, plugin in self.plugin_manager.plugins.items():
             if hasattr(plugin, 'extend_ui'):
                 try:
-                    plugin.extend_ui(self, outer_box)
+                    plugin.extend_ui(self, self.outer_box)
                 except Exception as extend_err:
                     log.error(f"Plugin {p_name} failed to extend UI: {extend_err}", exc_info=True)
 
-        self.main_window.content = outer_box
+        self.main_window.content = self.outer_box
         self.refresh_workspace()
         self.main_window.show()
 

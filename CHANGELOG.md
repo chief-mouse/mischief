@@ -11,6 +11,19 @@ entry here.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-18
+
+### Fixed
+
+- Progressive disclosure in the Workspace Manager: the window now shows only
+  what the current state needs. Logged out — onboarding banner + Auth Gateway
+  (no disabled workspace buttons, no empty table); signed in with an empty
+  workspace — banner with starter creation + workspace; signed in with apps —
+  just the workspace. Widgets are composed in/out of the layout rather than
+  css-hidden (Pack display toggling proved unreliable on WinForms — the
+  disabled starter button leaked through in 0.4.0). Default window size is
+  narrower (760×640).
+
 ## [0.4.0] - 2026-07-18
 
 ### Added
