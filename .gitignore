@@ -1,6 +1,12 @@
 *.crt
 *.key
 
+# Generated runtime artifacts (see CLAUDE.md Notes)
+*.msf
+logs/
+.briefcase/
+settings.toml
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
