@@ -1,16 +1,16 @@
 [tool.briefcase]
 project_name = "Mschf"
 bundle = "com.mschf"
-version = "0.0.1"
+version = "0.1.0"
 url = "https://github.com/pshouse/mischief"
 license = "MIT"
 license-files = ["LICENSE"]
-author = "Jane Developer"
-author_email = "jane@example.com"
+author = "Chief Mouse"
+author_email = "mouse.cheif@gmail.com"
 
 [tool.briefcase.app.mschf]
-formal_name = "mschf"
-description = "A little mschf"
+formal_name = "Mischief Workspace Manager"
+description = "Workspace Manager for cryptographically signed micro-apps (.msf): X.509 identities, RBAC, and a signed transaction ledger over SQLite"
 sources = ["src/mschf"]
 requires = [
     "toga>=0.4.0",

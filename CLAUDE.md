@@ -44,6 +44,7 @@ RBAC identities are derived from the cert/key, not usernames: `cert:CN=<common_n
 
 ## Notes
 
+- **Versioning is semver**, maintained in three places that must move together: `pyproject.toml` (`[tool.briefcase] version`), `src/mschf/__init__.py` (`__version__`, the value the About dialog shows via `app.py:main()`), and a `CHANGELOG.md` entry. Pre-1.0: bump MINOR for features, PATCH for fixes.
 - Windows is the primary target (WinForms-specific tweaks in `app.py` guarded by try/except); keep changes platform-tolerant.
 - Runtime artifacts in the project root are generated, not source: `ca.crt`/`ca.key`, `admin.crt`/`admin.key`, provisioned `*.crt`/`*.key`, `*.msf` files, `settings.toml` (auto-created), `logs/`.
 - `docs/ADMIN_GUIDE.md` (key generation, role assignment, signed transactions) and `docs/USER_GUIDE.md` (micro-app entry points, HostAPI usage) document the platform APIs — update them when changing those surfaces.

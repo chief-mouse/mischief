@@ -333,7 +333,19 @@ class Mschf(toga.App):
         self.main_window.show()
 
 def main():
-    return Mschf('mschf', 'com.mschf.mschf', document_types=[MSF])
+    # Pass metadata explicitly: `briefcase dev` can leave a stale .dist-info in
+    # the venv, and the About dialog reads whatever the App carries. Version is
+    # sourced from the canonical __version__ (kept in sync with pyproject.toml).
+    from mschf import __version__
+    return Mschf(
+        'Mischief Workspace Manager',
+        'com.mschf.mschf',
+        author='Chief Mouse',
+        version=__version__,
+        description='Workspace Manager for cryptographically signed micro-apps (.msf)',
+        home_page='https://github.com/chief-mouse/mischief',
+        document_types=[MSF],
+    )
 
 if __name__ == '__main__':
     main().main_loop()
