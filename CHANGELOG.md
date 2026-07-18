@@ -11,6 +11,17 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed the committed `src/mschf.dist-info/` (generated Briefcase metadata —
+  the source of the stale "Jane Developer 0.0.1" About data) and untracked the
+  auto-created `settings.toml`; both are now gitignored.
+
+### Changed
+
+- Packaging `url` points at the canonical development repo
+  (`chief-mouse/mischief`), matching the in-app homepage.
+
 ## [0.1.0] - 2026-07-18
 
 First curated version — everything to date, replacing the template's 0.0.1.
