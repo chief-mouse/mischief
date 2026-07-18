@@ -43,4 +43,9 @@ First curated version — everything to date, replacing the template's 0.0.1.
 ### Changed
 
 - Real project metadata (name, author, description, version) shown in the
-  About dialog, replacing Briefcase template placeholders.
+  About dialog, replacing Briefcase template placeholders; Help > Visit
+  homepage opens the development fork.
+- Mischief logo replaces the Toga/Briefcase template icons — app icon
+  (title bar, taskbar, About) and per-row icons in the workspace file list —
+  with `scripts/make_icons.py` regenerating the multi-size icon set from the
+  brand asset.
