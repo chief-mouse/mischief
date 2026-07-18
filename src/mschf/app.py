@@ -357,6 +357,20 @@ class Mschf(toga.App):
         log.info(f"Current working directory: {os.path.abspath(os.getcwd())}")
         load_settings()
 
+        # Prune the stock document commands that don't fit the .msf model. A
+        # container is never "saved" — every change is a signed transaction
+        # committed immediately — so Save / Save As / Save All are no-ops, and
+        # micro-apps are authored (starter button, dev_tracker.py), not created
+        # as blank documents, so New opens a meaningless empty window. Keep Open
+        # (browse for an .msf) and Exit. Toga installs these before startup()
+        # precisely so we can remove them here.
+        for cmd_id in (toga.Command.NEW, toga.Command.SAVE,
+                       toga.Command.SAVE_AS, toga.Command.SAVE_ALL):
+            try:
+                del self.commands[cmd_id]
+            except KeyError:
+                pass
+
         tzinfo = pytz.timezone(settings['tz_name'])
         log.info(f"Time zone is {tzinfo}")
         

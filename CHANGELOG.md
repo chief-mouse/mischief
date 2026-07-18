@@ -11,6 +11,13 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- File menu no longer offers commands that don't fit the `.msf` model: New
+  (opened a meaningless empty document window), Save, Save As, and Save All
+  (no-ops — containers are never "saved"; every change is a signed transaction
+  committed immediately) are removed. Open and Exit remain.
+
 ## [0.4.1] - 2026-07-18
 
 ### Fixed
