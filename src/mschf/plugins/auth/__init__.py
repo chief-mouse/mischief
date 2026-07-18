@@ -227,6 +227,9 @@ class AuthPlugin(BasePlugin):
         plugin_box.add(status_label)
         plugin_box.add(metadata_label)
         
-        # Insert plugin panel right under the main workspace actions but above the file table
-        # We can append it to the outer layout container
-        outer_box.add(plugin_box)
+        # Hand the panel to the app: the workspace composes it in only while
+        # logged out (progressive disclosure). Fallback: append directly.
+        if hasattr(app, 'register_auth_panel'):
+            app.register_auth_panel(plugin_box)
+        else:
+            outer_box.add(plugin_box)
