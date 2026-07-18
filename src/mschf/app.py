@@ -130,7 +130,7 @@ class Mschf(toga.App):
         data = []
         for path in msf_files:
             data.append({
-                'application_name': (toga.Icon.DEFAULT_ICON, os.path.basename(path)),
+                'application_name': (toga.Icon.APP_ICON, os.path.basename(path)),
                 'absolute_path': path
             })
         self.workspace.data = data
