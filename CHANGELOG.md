@@ -11,8 +11,21 @@ entry here.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-18
+
 ### Added
 
+- **Ledger replay audit** (`src/mschf/audit.py`, `dev_tracker.py audit`):
+  rebuilds a shadow database by replaying the signed `transactions` ledger and
+  diffs it against the live tables, detecting any write that bypassed
+  `execute_signed` (e.g. a raw sqlite3 edit). Re-verifies every ledger
+  signature and CA-trust chain, replays recorded timestamps so time-stamped
+  columns/triggers reproduce, replays trigger DDL from the ledger (rather than
+  pre-seeding it) so guards fire only where they historically existed, and
+  folds in per-blob code verification for `source_code`. `test_ledger_audit.py`
+  proves a clean pass plus detection of doctored rows, injected rows, deleted
+  rows, edited ledger entries (broken signature), and the trigger shield that
+  blocks raw writes to guarded tables outright.
 - GitHub Actions workflow (`ci-package.yml`): storage-layer integration tests
   (RBAC, authorizer, reactive redraw, container generation) plus a
   version-sources-agree check run on every push/PR to master; version tags and

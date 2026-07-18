@@ -13,6 +13,7 @@ Usage:
   python dev_tracker.py status <id> <backlog|in_progress|done>
   python dev_tracker.py update-app               # hot-deploy the current UI code (keeps task data)
   python dev_tracker.py verify                   # load the .msf and run it through the sandbox
+  python dev_tracker.py audit                    # replay the signed ledger; flag out-of-band writes
 """
 import sys
 import os
@@ -376,26 +377,25 @@ def cmd_init():
         "created_at TEXT DEFAULT (datetime('now')), created_by TEXT, "
         "updated_at TEXT DEFAULT (datetime('now')), updated_by TEXT)"
     )
-    # Audit triggers are part of the authored schema (attribution comes from
-    # current_signer(), so the seed inserts below get stamped by the engine).
-    for ddl in AUDIT_TRIGGERS:
-        db.conn.execute(ddl)
-    db.conn.commit()
+    # First signed write deliberately claims admin for cert:CN=admin (opt-in
+    # bootstrap). Everything after — including trigger DDL — is a signed,
+    # ledgered transaction so a replay audit can reconstruct history exactly.
+    sig = sign_payload(private_key, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main_app'])
+    db.bootstrap_admin("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main_app'], sig, cert_pem)
 
-    # First signed write deliberately claims admin for cert:CN=admin (opt-in bootstrap).
-    first, *rest = SEED_TASKS
+    # Audit triggers via SIGNED DDL, before any task rows exist: replay sees
+    # them at the same point in history, and every seed insert gets stamped.
+    for ddl in AUDIT_TRIGGERS:
+        signed_exec(db, cert_pem, private_key, ddl, [])
+
     q = "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, ?)"
-    signed_exec(db, cert_pem, private_key, q, list(first), bootstrap=True)
-    for task in rest:
+    for task in SEED_TASKS:
         signed_exec(db, cert_pem, private_key, q, list(task))
 
-    # Micro-app code + manifest, signed like any other transaction.
+    # Micro-app code, signed like any other transaction.
     pickled = dill.dumps(dev_tracker_app)
     sig = sign_payload(private_key, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", ['main_app', pickled])
     db.store_code('main_app', dev_tracker_app, sig, cert_pem)
-
-    sig = sign_payload(private_key, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main_app'])
-    db.set_manifest_item('entry_point', 'main_app', sig, cert_pem)
     for key, value in (('name', 'Mischief Dev Tracker'), ('version', '1.0'),
                        ('description', 'Dogfood tracker for the mschf hardening backlog.')):
         sig = sign_payload(private_key, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", [key, value])
@@ -506,6 +506,16 @@ def cmd_update_app():
     print("Reopen the document in the GUI to load the new UI.")
 
 
+def cmd_audit():
+    """Replay the signed ledger into a shadow DB and diff against live tables."""
+    from mschf.audit import replay_audit, format_report
+    db, cert_pem, private_key = _open_for_cli()
+    report = replay_audit(db)
+    print(format_report(report))
+    db.close()
+    sys.exit(0 if report['ok'] else 1)
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -522,6 +532,8 @@ def main():
         cmd_status(args[1], args[2])
     elif cmd == 'update-app':
         cmd_update_app()
+    elif cmd == 'audit':
+        cmd_audit()
     elif cmd == 'verify':
         cmd_verify()
     else:
