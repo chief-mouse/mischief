@@ -11,6 +11,8 @@ entry here.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-18
+
 ### Added
 
 - Runtime log with liveness heartbeat: a rotating `mschf-runtime.log` in the
@@ -21,6 +23,10 @@ entry here.
 
 ### Fixed
 
+- File menu no longer offers commands that don't fit the `.msf` model: New
+  (opened a meaningless empty document window), Save, Save As, and Save All
+  (no-ops — containers are never "saved"; every change is a signed transaction
+  committed immediately) are removed. Open and Exit remain.
 - Starter-app intro copy referred to a "'by' column"; the notes list shows the
   signer on an attribution line beneath each note, and the text now says so.
 
