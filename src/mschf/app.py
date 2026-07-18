@@ -1,8 +1,10 @@
 import asyncio
+import time
 import toga
 from toga.style import Pack
 from toga.style.pack import COLUMN, ROW
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import os
 import pytz
@@ -45,6 +47,11 @@ class Mschf(toga.App):
     # connections (CLI tools, other processes). In-process changes don't wait
     # for this — they broadcast immediately via MSFStorage.on_commit.
     WATCH_INTERVAL_SECONDS = 2
+    # Emit a liveness heartbeat to the runtime log this often. If the app
+    # freezes (e.g. the WinForms/pythonnet stack wedging across a screen lock),
+    # the last heartbeat's timestamp pins WHEN, and whether the poll loop was
+    # still ticking — plus a GDI/USER handle trend to spot resource exhaustion.
+    HEARTBEAT_SECONDS = 30
 
     def notify_msf_commit(self, origin_doc):
         """A mutating signed transaction committed on origin_doc's connection:
@@ -64,7 +71,11 @@ class Mschf(toga.App):
 
     async def on_running(self):
         """Poll open documents for external changes (data_version moves only
-        when another connection wrote the file; see MSF.check_external_change)."""
+        when another connection wrote the file; see MSF.check_external_change),
+        and emit a periodic liveness heartbeat to the runtime log."""
+        seq = 0
+        last_heartbeat = 0.0
+        log.info("Runtime monitor started (heartbeat every %ss).", self.HEARTBEAT_SECONDS)
         while True:
             await asyncio.sleep(self.WATCH_INTERVAL_SECONDS)
             for doc in list(self.documents):
@@ -73,6 +84,33 @@ class Mschf(toga.App):
                         doc.check_external_change()
                     except Exception as e:
                         log.error(f"External-change check failed for {doc.path}: {e}", exc_info=True)
+
+            now = time.monotonic()
+            if now - last_heartbeat >= self.HEARTBEAT_SECONDS:
+                last_heartbeat = now
+                seq += 1
+                gdi, user = self._gui_resource_counts()
+                log.info(
+                    "heartbeat #%d - docs=%d identity=%s gdi=%s user=%s",
+                    seq, len(list(self.documents)),
+                    getattr(self.active_identity, 'cn', '?') if self.active_identity.is_valid else 'none',
+                    gdi, user,
+                )
+
+    @staticmethod
+    def _gui_resource_counts():
+        """(GDI, USER) handle counts for this process on Windows; (None, None)
+        elsewhere or on failure. A climbing trend before a freeze indicates
+        handle exhaustion (widgets recreated without disposal)."""
+        try:
+            import ctypes
+            GR_GDIOBJECTS, GR_USEROBJECTS = 0, 1
+            proc = ctypes.windll.kernel32.GetCurrentProcess()
+            user32 = ctypes.windll.user32
+            return (user32.GetGuiResources(proc, GR_GDIOBJECTS),
+                    user32.GetGuiResources(proc, GR_USEROBJECTS))
+        except Exception:
+            return (None, None)
 
     def action_info_dialog(self, widget):
         self.main_window.info_dialog('Mschf', 'Workspace Manager for Micro-Apps')
@@ -235,6 +273,20 @@ class Mschf(toga.App):
         self._apply_identity_state()
         log.info("Logged out; active identity cleared.")
 
+    def _setup_runtime_log(self):
+        """Attach a rotating file log in the user data dir. Survives across runs
+        and captures the heartbeat trail, so a freeze leaves durable evidence
+        (unlike the stdout log, which vanishes with the dev console)."""
+        try:
+            log_path = os.path.join(self.data_dir, 'mschf-runtime.log')
+            handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding='utf-8')
+            handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+            handler.setLevel(logging.INFO)
+            log.addHandler(handler)
+            log.info("Runtime log opened at %s", log_path)
+        except Exception as e:
+            log.warning(f"Could not open runtime log file: {e}")
+
     def register_auth_panel(self, panel):
         """Called by the auth plugin: the app owns WHERE (and whether) the
         panel appears — it is only composed into the window while logged out."""
@@ -357,6 +409,20 @@ class Mschf(toga.App):
         log.info(f"Current working directory: {os.path.abspath(os.getcwd())}")
         load_settings()
 
+        # Prune the stock document commands that don't fit the .msf model. A
+        # container is never "saved" — every change is a signed transaction
+        # committed immediately — so Save / Save As / Save All are no-ops, and
+        # micro-apps are authored (starter button, dev_tracker.py), not created
+        # as blank documents, so New opens a meaningless empty window. Keep Open
+        # (browse for an .msf) and Exit. Toga installs these before startup()
+        # precisely so we can remove them here.
+        for cmd_id in (toga.Command.NEW, toga.Command.SAVE,
+                       toga.Command.SAVE_AS, toga.Command.SAVE_ALL):
+            try:
+                del self.commands[cmd_id]
+            except KeyError:
+                pass
+
         tzinfo = pytz.timezone(settings['tz_name'])
         log.info(f"Time zone is {tzinfo}")
         
@@ -397,6 +463,8 @@ class Mschf(toga.App):
         except Exception as data_dir_err:
             log.warning(f"Could not prepare user data dir: {data_dir_err}")
             self.data_dir = PROJ_DIR
+
+        self._setup_runtime_log()
 
         if not os.path.isfile(admin_cert_path) or not os.path.isfile(admin_key_path):
             with open(ca_cert_path, 'rb') as f:

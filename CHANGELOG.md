@@ -11,6 +11,25 @@ entry here.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-18
+
+### Added
+
+- Runtime log with liveness heartbeat: a rotating `mschf-runtime.log` in the
+  user data dir records a heartbeat every 30s (open-doc count, active identity,
+  and GDI/USER handle counts). If the app freezes — e.g. the WinForms/pythonnet
+  stack wedging across a screen lock — the last heartbeat pins when it happened
+  and whether the poll loop was still ticking and resources were climbing.
+
+### Fixed
+
+- File menu no longer offers commands that don't fit the `.msf` model: New
+  (opened a meaningless empty document window), Save, Save As, and Save All
+  (no-ops — containers are never "saved"; every change is a signed transaction
+  committed immediately) are removed. Open and Exit remain.
+- Starter-app intro copy referred to a "'by' column"; the notes list shows the
+  signer on an attribution line beneath each note, and the text now says so.
+
 ## [0.4.1] - 2026-07-18
 
 ### Fixed
