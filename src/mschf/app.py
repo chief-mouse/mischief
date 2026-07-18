@@ -1,3 +1,4 @@
+import asyncio
 import toga
 from toga.style import Pack
 from toga.style.pack import COLUMN, ROW
@@ -40,6 +41,39 @@ def load_settings():
         settings.update(loaded)
 
 class Mschf(toga.App):
+    # How often open documents are checked for changes made by OTHER
+    # connections (CLI tools, other processes). In-process changes don't wait
+    # for this — they broadcast immediately via MSFStorage.on_commit.
+    WATCH_INTERVAL_SECONDS = 2
+
+    def notify_msf_commit(self, origin_doc):
+        """A mutating signed transaction committed on origin_doc's connection:
+        live-refresh every other open document showing the same file."""
+        try:
+            origin_path = os.path.abspath(str(origin_doc.path))
+        except Exception:
+            return
+        for doc in list(self.documents):
+            if doc is origin_doc or not isinstance(doc, MSF) or not doc.db:
+                continue
+            try:
+                if os.path.abspath(str(doc.path)) == origin_path:
+                    doc.redraw()
+            except Exception as e:
+                log.error(f"Reactive redraw failed for {doc.path}: {e}", exc_info=True)
+
+    async def on_running(self):
+        """Poll open documents for external changes (data_version moves only
+        when another connection wrote the file; see MSF.check_external_change)."""
+        while True:
+            await asyncio.sleep(self.WATCH_INTERVAL_SECONDS)
+            for doc in list(self.documents):
+                if isinstance(doc, MSF):
+                    try:
+                        doc.check_external_change()
+                    except Exception as e:
+                        log.error(f"External-change check failed for {doc.path}: {e}", exc_info=True)
+
     def action_info_dialog(self, widget):
         self.main_window.info_dialog('Mschf', 'Workspace Manager for Micro-Apps')
 
