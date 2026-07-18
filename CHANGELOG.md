@@ -11,6 +11,17 @@ entry here.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-18
+
+### Fixed
+
+- Installer Welcome/Exit dialog text was unreadable — the branded `dialog.bmp`
+  filled the whole panel with navy, but WiX renders its title/body in dark ink
+  over the right two-thirds. The bitmaps now keep the text areas white (WiX
+  convention) with the Mischief mark confined to a navy left panel on the
+  dialog and the right of the banner; the glyph is extracted with a real alpha
+  channel so it composites cleanly onto either background.
+
 ## [0.3.0] - 2026-07-18
 
 ### Fixed
