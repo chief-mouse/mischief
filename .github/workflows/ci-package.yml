@@ -63,6 +63,9 @@ jobs:
       - name: Create app scaffold
         run: briefcase create windows app
 
+      - name: Brand installer (WiX banner/dialog bitmaps)
+        run: python scripts/brand_installer.py
+
       - name: Build app
         run: briefcase build windows app
 

@@ -18,6 +18,11 @@ entry here.
 - `LICENSE` now attributes copyright to Mischief Dev LLC (2026), replacing the
   Briefcase template's "Jane Developer, 2019" — this is the text shown as the
   EULA in the Windows installer.
+- Windows installer is branded with Mischief bitmaps (WiX banner + dialog),
+  replacing WiX's default red artwork. `installer/{banner,dialog}.bmp` are
+  committed (regenerable from the logo via `scripts/make_installer_art.py`),
+  and `scripts/brand_installer.py` injects the `WixUIBannerBmp`/`WixUIDialogBmp`
+  variables into the generated scaffold — wired into the CI package job.
 
 ### Added
 
