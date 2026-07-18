@@ -20,11 +20,22 @@ DEFAULT_CA_CERT_PATH = os.path.join(HOST_ROOT, "ca.crt")
 
 
 class MSFStorage:
+    # Tables owned by the platform itself; writable only by admin identities.
+    SYSTEM_TABLES = frozenset({'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles'})
+
     def __init__(self, filename, ca_cert_path=None):
         self.filename = filename
         self.ca_cert_path = ca_cert_path or DEFAULT_CA_CERT_PATH
         self.conn = sqlite3.connect(filename)
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # current_signer(): SQL function returning the verified identity string
+        # (e.g. 'cert:CN=admin') of the signed transaction currently executing,
+        # or NULL outside one. Container triggers use it to stamp audit fields
+        # from the cryptographic identity instead of trusting app-supplied
+        # values. Note it also means out-of-band writes with a raw sqlite3
+        # client fail on such triggers ("no such function") — a feature.
+        self._active_signer = None
+        self.conn.create_function('current_signer', 0, lambda: self._active_signer)
         self._init_db()
 
     def _init_db(self):
@@ -141,6 +152,107 @@ class MSFStorage:
             return 'read', m.group(1).lower()
             
         return 'unknown', '*'
+
+    def _rbac_snapshot(self, identity):
+        """Resolve the identity's role and object-level rules up front.
+
+        The authorizer callback fires while the engine is compiling the user's
+        statement, so it must not issue queries on this connection re-entrantly;
+        everything it needs is captured here first.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT role FROM user_roles WHERE identity = ?", (identity,))
+        row = cursor.fetchone()
+        role = row[0] if row else 'guest'
+        cursor.execute("SELECT target, permission FROM rbac_rules WHERE level = 'object' AND role = ?", (role,))
+        return role, cursor.fetchall()
+
+    def _make_authorizer(self, identity, role, object_rules, denials):
+        """Build a sqlite3 authorizer enforcing RBAC on every table the compiled
+        statement actually touches.
+
+        Unlike the regex pre-check (which only sees the first table named in the
+        SQL text), SQLite consults this callback at prepare time for each
+        table/column access the program will perform — including those reached
+        through joins, subqueries, CTEs, views, and triggers — and for
+        side-channel statements (PRAGMA, ATTACH) that the regex classifies as
+        'unknown'. Denial reasons are appended to ``denials`` so the caller can
+        raise a meaningful PermissionError.
+        """
+        def table_allowed(table, perm):
+            if not table:
+                return True
+            t = table.lower()
+            # Engine-internal schema bookkeeping (sqlite_master etc.). Direct
+            # user writes to these are separately refused by SQLite itself
+            # unless writable_schema is enabled — and PRAGMA is denied below.
+            if t.startswith('sqlite_'):
+                return True
+            if role == 'admin':
+                return True
+            if t in self.SYSTEM_TABLES:
+                # System tables are admin-only for every operation, matching
+                # the pre-check (which denies non-admin reads too).
+                return False
+            for target, p in object_rules:
+                if target and target.lower() in (t, '*') and p in (perm, '*'):
+                    return True
+            return False
+
+        A = lambda name: getattr(sqlite3, name, None)
+
+        always_allowed = {a for a in (
+            A('SQLITE_SELECT'), A('SQLITE_TRANSACTION'), A('SQLITE_SAVEPOINT'),
+            A('SQLITE_FUNCTION'), A('SQLITE_RECURSIVE'),
+        ) if a is not None}
+        always_denied = {a for a in (
+            A('SQLITE_PRAGMA'), A('SQLITE_ATTACH'), A('SQLITE_DETACH'),
+            A('SQLITE_CREATE_VTABLE'), A('SQLITE_DROP_VTABLE'),
+        ) if a is not None}
+        # action -> (permission, which arg carries the table name)
+        table_actions = {a: v for a, v in {
+            A('SQLITE_READ'): ('read', 1),
+            A('SQLITE_INSERT'): ('write', 1),
+            A('SQLITE_UPDATE'): ('write', 1),
+            A('SQLITE_DELETE'): ('write', 1),
+            A('SQLITE_CREATE_TABLE'): ('create', 1),
+            A('SQLITE_CREATE_TEMP_TABLE'): ('create', 1),
+            A('SQLITE_CREATE_VIEW'): ('create', 1),
+            A('SQLITE_CREATE_TEMP_VIEW'): ('create', 1),
+            A('SQLITE_CREATE_INDEX'): ('create', 2),
+            A('SQLITE_CREATE_TEMP_INDEX'): ('create', 2),
+            A('SQLITE_CREATE_TRIGGER'): ('create', 2),
+            A('SQLITE_CREATE_TEMP_TRIGGER'): ('create', 2),
+            A('SQLITE_ALTER_TABLE'): ('create', 2),
+            A('SQLITE_REINDEX'): ('create', 1),
+            A('SQLITE_ANALYZE'): ('create', 1),
+            A('SQLITE_DROP_TABLE'): ('delete', 1),
+            A('SQLITE_DROP_TEMP_TABLE'): ('delete', 1),
+            A('SQLITE_DROP_VIEW'): ('delete', 1),
+            A('SQLITE_DROP_TEMP_VIEW'): ('delete', 1),
+            A('SQLITE_DROP_INDEX'): ('delete', 2),
+            A('SQLITE_DROP_TEMP_INDEX'): ('delete', 2),
+            A('SQLITE_DROP_TRIGGER'): ('delete', 2),
+            A('SQLITE_DROP_TEMP_TRIGGER'): ('delete', 2),
+        }.items() if a is not None}
+
+        def authorize(action, arg1, arg2, db_name, source):
+            if action in always_allowed:
+                return sqlite3.SQLITE_OK
+            if action in always_denied:
+                denials.append(f"statement class (action {action}) is not permitted in signed transactions")
+                return sqlite3.SQLITE_DENY
+            if action in table_actions:
+                perm, table_arg = table_actions[action]
+                table = arg1 if table_arg == 1 else arg2
+                if table_allowed(table, perm):
+                    return sqlite3.SQLITE_OK
+                denials.append(f"'{perm}' on table '{table}' denied for identity '{identity}'")
+                return sqlite3.SQLITE_DENY
+            denials.append(f"unrecognized action {action} denied")
+            return sqlite3.SQLITE_DENY
+
+        return authorize
 
     def check_permission(self, identity, level, target, permission):
         """
@@ -305,8 +417,7 @@ class MSFStorage:
 
         # Enforce object level permission
         if table_name != '*':
-            system_tables = {'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles'}
-            if table_name in system_tables:
+            if table_name in self.SYSTEM_TABLES:
                 # System tables are strictly admin-only for schema modifications or data writes
                 cursor.execute("SELECT role FROM user_roles WHERE identity = ?", (identity,))
                 row = cursor.fetchone()
@@ -318,12 +429,32 @@ class MSFStorage:
                 if not self.check_permission(identity, 'object', table_name, operation):
                     raise PermissionError(f"Access denied: Identity '{identity}' does not have '{operation}' permission on table '{table_name}'.")
 
-        # Execute query
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
-            
+        # Execute under the SQLite authorizer. The regex checks above are a
+        # first, coarse gate kept for their clear error messages; the authorizer
+        # is the authoritative enforcement — the engine consults it at prepare
+        # time for every table/column the compiled statement touches, so access
+        # smuggled past the regex (joins, subqueries, CTEs, views, triggers,
+        # PRAGMA, ATTACH) is denied here. Installing/clearing the authorizer
+        # also expires SQLite's prepared-statement cache, so every signed query
+        # is freshly compiled with enforcement active.
+        role, object_rules = self._rbac_snapshot(identity)
+        denials = []
+        self._active_signer = identity
+        self.conn.set_authorizer(self._make_authorizer(identity, role, object_rules, denials))
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+        except sqlite3.DatabaseError as e:
+            if denials:
+                raise PermissionError(f"Access denied: {denials[0]}") from e
+            raise
+        finally:
+            self.conn.set_authorizer(None)
+            self._active_signer = None
+
+
         # Log the transaction using a separate cursor so we do not clobber the main query's results
         audit_cursor = self.conn.cursor()
         audit_cursor.execute('''

@@ -176,6 +176,21 @@ add_rule('field', 'tickets.title', 'support', 'read')
 add_rule('field', 'tickets.*', 'support', 'read')
 ```
 
+### How rules are enforced
+
+Every signed statement is executed under a SQLite **authorizer callback**: while compiling the statement, the engine asks the platform for a verdict on *each* table and column the program will actually touch — including tables reached through `JOIN`s, subqueries, CTEs, views, and triggers. A statement that references even one unauthorized table is rejected before it executes, is not appended to the `transactions` audit log, and leaves no side effects.
+
+Consequences to be aware of:
+
+- Reading a permitted table via a query that *also* touches a forbidden table (e.g. `SELECT t.title FROM tickets t JOIN secrets s`) is denied outright.
+- System tables (`manifest`, `source_code`, `transactions`, `rbac_rules`, `user_roles`) are admin-only for **all** operations.
+- `PRAGMA`, `ATTACH`, `DETACH`, and virtual-table DDL are never permitted inside signed transactions, for any role — including admin.
+- DDL maps to the `create` permission (`CREATE TABLE`, `CREATE INDEX/TRIGGER/VIEW`, `ALTER TABLE`) and `delete` permission (`DROP ...`).
+
+### Engine-enforced attribution (`current_signer()`)
+
+Every `MSFStorage` connection registers a `current_signer()` SQL function that returns the verified identity string (e.g. `cert:CN=admin`) of the signed transaction currently executing, and `NULL` outside one. Use it in container triggers to stamp `created_by` / `updated_by`-style audit columns: the value comes from the verified signature, so micro-app code can neither spoof nor forget attribution, and out-of-band writes with a raw sqlite3 client fail on such triggers with "no such function". See `dev_tracker.py`'s `AUDIT_TRIGGERS` for the canonical pattern (insert/update stamping plus a `RAISE(ABORT)` immutability guard on the created-fields).
+
 ---
 
 ## 5. Deploying and Modifying Micro-App Code
