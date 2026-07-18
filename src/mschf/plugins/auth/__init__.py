@@ -64,7 +64,24 @@ class AuthPlugin(BasePlugin):
         
         input_box.add(username_input)
         input_box.add(password_input)
-        
+
+        # First-run affordance: the host seeds an 'admin' identity on this
+        # machine — prefill its CN and say how to unlock it. The DEFAULT
+        # passphrase may be shown; a custom env-provided one never is.
+        admin_cert_path = os.path.join(app.proj_dir, 'admin.crt')
+        if os.path.isfile(admin_cert_path):
+            if not app.active_identity.is_valid and not username_input.value:
+                username_input.value = 'admin'
+            if 'MSCHF_ADMIN_PASSPHRASE' in os.environ:
+                hint_text = ("Tip: this machine's built-in identity is 'admin' — "
+                             "unlock it with your MSCHF_ADMIN_PASSPHRASE passphrase.")
+            else:
+                hint_text = ("Tip: this machine's built-in identity is 'admin' — default "
+                             "passphrase 'changeit' (set MSCHF_ADMIN_PASSPHRASE to change it).")
+            input_hint = toga.Label(hint_text, style=Pack(margin_left=5, font_size=9, font_style="italic", color="#666666"))
+        else:
+            input_hint = None
+
         # Labels for status and metadata display
         status_label = toga.Label("Auth Status: Waiting for input.", style=Pack(margin=5, font_style="italic"))
         metadata_label = toga.Label("Decoded Token / Crypto Properties: (None)", style=Pack(margin=5, font_size=9))
@@ -204,6 +221,8 @@ class AuthPlugin(BasePlugin):
         plugin_box.add(toga.Label("Select Authentication Protocol:", style=Pack(margin_left=5, font_size=10)))
         plugin_box.add(provider_select)
         plugin_box.add(input_box)
+        if input_hint is not None:
+            plugin_box.add(input_hint)
         plugin_box.add(btn_auth)
         plugin_box.add(status_label)
         plugin_box.add(metadata_label)
