@@ -1,9 +1,0 @@
-dill
-cryptography>=3.2
-twisted
-pytz
-toml
-git+https://github.com/pshouse/durus.git
-#git+https://github.com/pshouse/toga.git
-git+https://github.com/pshouse/toga.git#egg=toga-core&subdirectory=src/core
-git+https://github.com/pshouse/toga.git#egg=toga-cocoa&subdirectory=src/cocoa

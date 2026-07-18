@@ -1,0 +1,22 @@
+[tool.briefcase]
+project_name = "Mschf"
+bundle = "com.mschf"
+version = "0.1.0"
+url = "https://github.com/pshouse/mischief"
+license = "MIT"
+license-files = ["LICENSE"]
+author = "Chief Mouse"
+author_email = "mouse.cheif@gmail.com"
+
+[tool.briefcase.app.mschf]
+formal_name = "Mischief Workspace Manager"
+description = "Workspace Manager for cryptographically signed micro-apps (.msf): X.509 identities, RBAC, and a signed transaction ledger over SQLite"
+icon = "src/mschf/resources/mschf"
+sources = ["src/mschf"]
+requires = [
+    "toga>=0.4.0",
+    "cryptography>=3.2",
+    "pytz",
+    "toml",
+    "dill",
+]

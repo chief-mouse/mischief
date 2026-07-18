@@ -1,0 +1,213 @@
+import asyncio
+import logging
+import os
+import toga
+from toga.style import Pack
+from toga.style.pack import COLUMN, ROW
+
+from mschf.plugins.base import BasePlugin
+from mschf.identity import Identity
+from mschf.plugins.auth.providers.password import PasswordAuthenticator
+from mschf.plugins.auth.providers.oauth import OAuth2Authenticator
+from mschf.plugins.auth.providers.passkey import PasskeyAuthenticator
+from mschf.plugins.auth.providers.oidc import OIDCAuthenticator
+
+log = logging.getLogger(__name__)
+
+class AuthPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__("authentication_gateway")
+        # Instantiate available authenticators. Google is a real OIDC flow (browser
+        # + PKCE + JWKS verification), configured via MSCHF_GOOGLE_CLIENT_ID /
+        # MSCHF_GOOGLE_CLIENT_SECRET. The others remain simulated and are labelled so.
+        self.providers = {
+            "local_password": PasswordAuthenticator(),
+            "google_oidc": OIDCAuthenticator(
+                "google_oidc", "Google OAuth 2.0 (OIDC — real sign-in)",
+                authorization_endpoint="https://accounts.google.com/o/oauth2/v2/auth",
+                token_endpoint="https://oauth2.googleapis.com/token",
+                jwks_uri="https://www.googleapis.com/oauth2/v3/certs",
+                issuers=["https://accounts.google.com", "accounts.google.com"],
+                client_id_env="MSCHF_GOOGLE_CLIENT_ID",
+                client_secret_env="MSCHF_GOOGLE_CLIENT_SECRET",
+            ),
+            "microsoft_oauth": OAuth2Authenticator("microsoft_oauth", "Microsoft OAuth 2.0 (SIMULATED)", "https://login.microsoftonline.com"),
+            "fido2_passkey": PasskeyAuthenticator()
+        }
+        self.active_provider_key = "local_password"
+
+    def on_load(self, app):
+        log.info("AuthPlugin loaded successfully.")
+
+    def extend_ui(self, app, outer_box):
+        """Inject the interactive Authentication Gateway panel into the workspace manager GUI."""
+        plugin_box = toga.Box(style=Pack(direction=COLUMN, margin_top=15, margin_bottom=10))
+        
+        # Section Title
+        plugin_box.add(toga.Label(
+            "🔌 Plugin: Cryptographic Identity & Auth Gateways",
+            style=Pack(font_size=12, font_weight="bold", margin_bottom=5, color="#1e3a8a")
+        ))
+        
+        # Selector for authentication methods. The first entry is a local mode that
+        # unlocks an existing on-host identity by its key passphrase (default); the
+        # rest are external IdP protocols that authenticate and provision a NEW identity.
+        EXISTING_IDENTITY_OPTION = "Existing Identity — Key Passphrase (local)"
+        provider_choices = [EXISTING_IDENTITY_OPTION] + [p.display_name for p in self.providers.values()]
+        provider_select = toga.Selection(items=provider_choices, style=Pack(margin=5))
+        
+        # Form inputs
+        input_box = toga.Box(style=Pack(direction=ROW, margin=5))
+        username_input = toga.TextInput(placeholder="Username / Identity CN / Email", style=Pack(flex=1, margin_right=5))
+        # Masked: this field carries the key passphrase / password / OAuth token.
+        password_input = toga.PasswordInput(placeholder="Passphrase / Password / OAuth ID Token", style=Pack(flex=1))
+        
+        input_box.add(username_input)
+        input_box.add(password_input)
+        
+        # Labels for status and metadata display
+        status_label = toga.Label("Auth Status: Waiting for input.", style=Pack(margin=5, font_style="italic"))
+        metadata_label = toga.Label("Decoded Token / Crypto Properties: (None)", style=Pack(margin=5, font_size=9))
+        
+        async def on_authenticate(widget):
+            # Capture the secret, then clear it from the widget immediately so it does
+            # not linger on screen / in the field after the attempt (success or fail).
+            secret = password_input.value or ""
+            password_input.value = ""
+
+            typed_cn = (username_input.value or "").strip()
+            selected = provider_select.value
+
+            # Mode 1 (default): unlock an existing, deliberately-issued on-host identity
+            # by CN, using its key passphrase as the secret — this is how you log in as
+            # 'admin' (admin.crt). The protocol dropdown is authoritative: this mode runs
+            # ONLY when selected, so picking OAuth never silently falls back to a passphrase.
+            if selected == EXISTING_IDENTITY_OPTION:
+                if not typed_cn:
+                    status_label.text = "✖ Enter the identity CN to unlock (e.g. admin)."
+                    metadata_label.text = ""
+                    return
+                existing_cert = os.path.join(app.proj_dir, f"{typed_cn}.crt")
+                existing_key = os.path.join(app.proj_dir, f"{typed_cn}.key")
+                if not os.path.isfile(existing_cert):
+                    status_label.text = f"✖ No identity file for CN '{typed_cn}' on this host."
+                    metadata_label.text = ""
+                    return
+                probe = Identity.load(existing_cert, app.ca_cert_path)
+                if not probe.is_valid:
+                    status_label.text = f"✖ Identity '{typed_cn}' is not signed by the trusted Root CA."
+                    metadata_label.text = ""
+                    return
+                if not os.path.isfile(existing_key):
+                    status_label.text = f"✖ Identity '{typed_cn}' has no private key on this host; cannot sign as it."
+                    metadata_label.text = ""
+                    return
+                # The passphrase that unlocks the private key IS the login secret:
+                # possession of the file is not enough. Verify by decrypting it.
+                from cryptography.hazmat.primitives.serialization import load_pem_private_key
+                with open(existing_key, 'rb') as f:
+                    key_bytes = f.read()
+                try:
+                    load_pem_private_key(key_bytes, password=secret.encode('utf-8') if secret else None)
+                except TypeError:
+                    status_label.text = (f"✖ Identity '{typed_cn}' requires a passphrase."
+                                         if not secret else
+                                         f"✖ Identity '{typed_cn}' key is not passphrase-protected.")
+                    metadata_label.text = ""
+                    return
+                except ValueError:
+                    status_label.text = f"✖ Incorrect passphrase for identity '{typed_cn}'."
+                    metadata_label.text = ""
+                    return
+                app.set_active_identity(existing_cert, key_passphrase=secret or None)
+                status_label.text = f"✔ Logged in as existing identity '{probe.cn}' ({os.path.basename(existing_cert)})."
+                metadata_label.text = ("Cryptographic Verification:\n"
+                                       "  • source: on-host CA-signed identity file\n"
+                                       "  • unlocked with: passphrase\n"
+                                       f"  • common_name: {probe.cn}")
+                return
+
+            # Mode 2: authenticate via the selected external protocol (mock) and provision
+            # a NEW per-user ephemeral identity. Never yields the seeded identities.
+            provider = None
+            for p in self.providers.values():
+                if p.display_name == selected:
+                    provider = p
+                    break
+
+            if not provider:
+                status_label.text = "Error: Provider not found."
+                return
+
+            username = username_input.value
+            password = secret
+
+            # Interactive providers (real OIDC) open a browser and block; run them off
+            # the UI thread so the app stays responsive, and show progress meanwhile.
+            if getattr(provider, 'interactive', False):
+                status_label.text = f"Opening browser for {provider.display_name} — complete the sign-in…"
+                metadata_label.text = ""
+                loop = asyncio.get_event_loop()
+                res = await loop.run_in_executor(
+                    None, lambda: provider.authenticate(username=username, password=password)
+                )
+            else:
+                res = provider.authenticate(username=username, password=password)
+            
+            if res['success']:
+                # Authentication succeeded!
+                status_label.text = f"✔ Authenticated successfully as '{res['identity']}'!"
+                meta_str = "\n".join([f"  • {k}: {v}" for k, v in res['metadata'].items()])
+                metadata_label.text = f"Cryptographic Verification:\n{meta_str}"
+                
+                # Dynamic Ephemeral Certificate Provisioning
+                try:
+                    clean_name = res['identity'].replace(':', '_').replace('@', '_').replace('.', '_')
+                    cert_filename = f"{clean_name}.crt"
+                    key_filename = f"{clean_name}.key"
+
+                    cert_path = os.path.join(app.proj_dir, cert_filename)
+                    key_path = os.path.join(app.proj_dir, key_filename)
+
+                    # Generate the certificate signed by Root CA. The CN must match the
+                    # sanitized filename stem so the cert, the .crt/.key files, and the
+                    # derived RBAC identity (cert:CN=clean_name) all agree. The new key is
+                    # encrypted with the login password, so future logins need that secret.
+                    from mschf.gen_cert import generate_user_cert
+                    pem_cert, pem_key = generate_user_cert(clean_name, app.ca_cert_pem, app.ca_key_pem, passphrase=(password or None))
+
+                    with open(cert_path, 'wb') as f:
+                        f.write(pem_cert)
+                    with open(key_path, 'wb') as f:
+                        f.write(pem_key)
+
+                    log.info(f"Dynamically provisioned ephemeral X.509 Certificate for: {res['identity']}")
+
+                    # Hot-swap and set active identity in the main App GUI
+                    app.set_active_identity(cert_filename, key_passphrase=(password or None))
+                    
+                    status_label.text += f"\n✔ Dynamically provisioned & set active X.509 cert: {cert_filename}!"
+                except Exception as cert_err:
+                    log.error(f"Failed to dynamically provision certificate: {cert_err}", exc_info=True)
+                    status_label.text += f"\n⚠ Could not provision X.509 certificate: {cert_err}"
+            else:
+                status_label.text = f"✖ Authentication Failed: {res['error']}"
+                metadata_label.text = ""
+                
+        btn_auth = toga.Button("Authenticate & Verify Identity", on_press=on_authenticate, style=Pack(margin=5))
+
+        # Pressing Enter in either field submits the login, same as the button.
+        username_input.on_confirm = on_authenticate
+        password_input.on_confirm = on_authenticate
+        
+        # Layout organization
+        plugin_box.add(toga.Label("Select Authentication Protocol:", style=Pack(margin_left=5, font_size=10)))
+        plugin_box.add(provider_select)
+        plugin_box.add(input_box)
+        plugin_box.add(btn_auth)
+        plugin_box.add(status_label)
+        plugin_box.add(metadata_label)
+        
+        # Insert plugin panel right under the main workspace actions but above the file table
+        # We can append it to the outer layout container
+        outer_box.add(plugin_box)
