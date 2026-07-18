@@ -13,6 +13,12 @@ entry here.
 
 ## [0.3.0] - 2026-07-18
 
+### Fixed
+
+- `LICENSE` now attributes copyright to Mischief Dev LLC (2026), replacing the
+  Briefcase template's "Jane Developer, 2019" — this is the text shown as the
+  EULA in the Windows installer.
+
 ### Added
 
 - **Ledger replay audit** (`src/mschf/audit.py`, `dev_tracker.py audit`):
