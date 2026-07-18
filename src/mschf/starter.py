@@ -43,9 +43,9 @@ def starter_app(toga, host_api):
         "file holding this app's code, its data, its access rules, and a ledger of "
         "cryptographically signed transactions.\\n\\n"
         "Everything you do here is signed with your identity's private key and "
-        "recorded in the ledger. The note you add below becomes a signed transaction; "
-        "the 'by' column is stamped by the database engine from your verified "
-        "certificate - the app cannot forge it."
+        "recorded in the ledger. The note you add below becomes a signed transaction, "
+        "and the signer shown beneath each note is stamped by the database engine "
+        "from your verified certificate - the app cannot forge it."
     )
     board.add(intro)
 

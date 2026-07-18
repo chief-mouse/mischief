@@ -11,6 +11,11 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Starter-app intro copy referred to a "'by' column"; the notes list shows the
+  signer on an attribution line beneath each note, and the text now says so.
+
 ## [0.4.1] - 2026-07-18
 
 ### Fixed
