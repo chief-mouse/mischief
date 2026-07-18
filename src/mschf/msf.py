@@ -23,18 +23,69 @@ class MSF(toga.Document):
         self.main_box = toga.Box(style=Pack(direction='column', margin=10))
         self.main_window.content = self.main_box
         self.db = None
+        self._change_baseline = None
 
     def read(self) -> None:
         """Load representation of the document from self.path and populate the window."""
         if self.path and self.path.exists():
             ca_cert_path = getattr(self.app, "ca_cert_path", None)
             self.db = MSFStorage(str(self.path), ca_cert_path=ca_cert_path)
+            # In-process reactive redraw: a mutating signed transaction on this
+            # document's connection (e.g. from its sandboxed micro-app) tells
+            # the app to refresh other open documents on the same file.
+            self.db.on_commit = self._on_db_commit
+            self._change_baseline = None
             self.redraw()
+
+    def _on_db_commit(self, storage) -> None:
+        notify = getattr(self.app, "notify_msf_commit", None)
+        if notify:
+            notify(self)
+
+    def _current_change_marker(self):
+        """(data_version, last mutating ledger id) for external-change detection.
+
+        PRAGMA data_version only moves when *another* connection changed the
+        file — but signed reads append audit rows, so data_version alone would
+        make co-open documents refresh each other forever. The ledger high-water
+        mark of non-SELECT transactions pins redraws to actual mutations.
+        """
+        try:
+            dv = self.db.conn.execute("PRAGMA data_version").fetchone()[0]
+            wid = self.db.conn.execute(
+                "SELECT IFNULL(MAX(id), 0) FROM transactions WHERE query NOT LIKE 'SELECT%'"
+            ).fetchone()[0]
+            return (dv, wid)
+        except Exception:
+            return None
+
+    def check_external_change(self) -> None:
+        """Redraw if another connection (CLI, second window) mutated the file."""
+        if not self.db:
+            return
+        marker = self._current_change_marker()
+        if marker is None or self._change_baseline is None:
+            self._change_baseline = marker
+            return
+        if marker[0] == self._change_baseline[0]:
+            return  # nothing changed on other connections
+        if marker[1] == self._change_baseline[1]:
+            # Other-connection activity was only audit rows from signed reads;
+            # advance the baseline without a redraw.
+            self._change_baseline = marker
+            return
+        self.redraw()
 
     def redraw(self) -> None:
         if not self.db:
             return
-            
+        try:
+            self._draw_content()
+        finally:
+            self._change_baseline = self._current_change_marker()
+
+    def _draw_content(self) -> None:
+
         entry_point_id = self.db.get_manifest_item('entry_point')
         
         if entry_point_id:

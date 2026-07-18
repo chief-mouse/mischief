@@ -36,6 +36,10 @@ class MSFStorage:
         # client fail on such triggers ("no such function") — a feature.
         self._active_signer = None
         self.conn.create_function('current_signer', 0, lambda: self._active_signer)
+        # Optional host callback fired after a *mutating* signed transaction
+        # commits (called with this storage). The GUI uses it to live-refresh
+        # other open documents showing the same container.
+        self.on_commit = None
         self._init_db()
 
     def _init_db(self):
@@ -463,6 +467,16 @@ class MSFStorage:
         ''', (query, json.dumps(_make_json_serializable(params)), signature, pub_key_pem))
         
         self.conn.commit()
+
+        # Reactive redraw: notify the host after mutating transactions only.
+        # Signed reads also commit (they append an audit row), so notifying on
+        # 'read' would let two open documents redraw each other forever.
+        if operation != 'read' and self.on_commit:
+            try:
+                self.on_commit(self)
+            except Exception as e:
+                print(f"on_commit notification failed: {e}")
+
         return cursor
 
     def set_manifest_item(self, key, value, signature, pub_key_pem):

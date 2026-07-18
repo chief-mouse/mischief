@@ -11,6 +11,19 @@ entry here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-18
+
+### Added
+
+- **Reactive redraw**: open documents live-refresh when their container
+  changes. Mutating signed transactions broadcast in-process via
+  `MSFStorage.on_commit` (a document's micro-app writes → other windows on the
+  same file redraw immediately); external writers (e.g. the `dev_tracker.py`
+  CLI) are detected within ~2s by polling `PRAGMA data_version`, gated on the
+  ledger's non-SELECT high-water mark so audit rows from signed *reads* never
+  trigger redraws (which would otherwise loop between two open documents).
+  Covered by `test_reactive.py`.
+
 ### Fixed
 
 - Removed the committed `src/mschf.dist-info/` (generated Briefcase metadata —

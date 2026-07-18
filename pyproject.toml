@@ -1,7 +1,7 @@
 [tool.briefcase]
 project_name = "Mschf"
 bundle = "com.mschf"
-version = "0.1.0"
+version = "0.2.0"
 url = "https://github.com/chief-mouse/mischief"
 license = "MIT"
 license-files = ["LICENSE"]
