@@ -40,6 +40,9 @@ jobs:
       - name: Ledger replay audit
         run: python test_ledger_audit.py
 
+      - name: Starter-app authoring
+        run: python test_starter.py
+
       - name: Container generation (signed code deployment)
         run: python test_microapp.py
 

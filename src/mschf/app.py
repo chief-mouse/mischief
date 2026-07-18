@@ -151,6 +151,12 @@ class Mschf(toga.App):
         except Exception:
             pass
 
+        # 3. Scan the per-user data dir — the workspace that makes sense for an
+        # installed app, where cwd/install dir are not user-writable places.
+        data_dir = getattr(self, 'data_dir', None)
+        if data_dir and os.path.isdir(data_dir):
+            msf_patterns.append(os.path.join(data_dir, f"*{FILE_EXT}"))
+
         # Collect and deduplicate absolute paths
         seen_paths = set()
         msf_files = []
@@ -169,6 +175,7 @@ class Mschf(toga.App):
             })
         self.workspace.data = data
         self.label.text = f"Found {len(msf_files)} local apps."
+        self._update_onboarding(len(msf_files))
 
     def on_select_app(self, widget):
         selection = widget.selection
@@ -228,6 +235,60 @@ class Mschf(toga.App):
         self._apply_identity_state()
         log.info("Logged out; active identity cleared.")
 
+    def _update_onboarding(self, app_count=None):
+        """Contextual first-run guidance: always show the user their NEXT step.
+
+        Logged out -> how to sign in (with the admin passphrase hint);
+        signed in with an empty workspace -> where apps live + starter creation;
+        otherwise the banner disappears.
+        """
+        if not hasattr(self, 'onboarding_label'):
+            return
+        if app_count is None:
+            app_count = getattr(self, '_app_count', 0)
+        self._app_count = app_count
+
+        if not self.active_identity.is_valid:
+            pw_hint = (
+                "the default passphrase 'changeit' (set MSCHF_ADMIN_PASSPHRASE to change it)"
+                if getattr(self, '_admin_passphrase_is_default', True)
+                else "your MSCHF_ADMIN_PASSPHRASE passphrase"
+            )
+            self.onboarding_label.text = (
+                "Getting started — 1) Sign in below via the Auth Gateway: identity 'admin' with "
+                f"{pw_hint}.  2) Then open a micro-app, or create the starter app."
+            )
+            self.onboarding_box.style.display = 'pack'
+            self.btn_create_starter.style.display = 'none'
+        elif app_count == 0:
+            self.onboarding_label.text = (
+                "You're signed in, but no micro-apps (.msf) were found.\n"
+                f"Workspace folder: {self.data_dir}\n"
+                "Create the starter app to see the platform in action, or use Browse MSF "
+                "to open an existing container."
+            )
+            self.onboarding_box.style.display = 'pack'
+            self.btn_create_starter.style.display = 'pack'
+        else:
+            self.onboarding_box.style.display = 'none'
+
+    def create_starter_app(self, widget=None):
+        """Author the signed 'Getting Started' micro-app in the user's workspace."""
+        if not self.active_identity.is_valid:
+            return
+        from mschf.starter import create_starter_container
+        dest = os.path.join(self.data_dir, 'getting_started.msf')
+        try:
+            create_starter_container(dest, self.active_identity, self.ca_cert_path)
+            self.label.text = "Starter app created — double-click it in the list to open it."
+            log.info(f"Created starter container at {dest} signed by CN={self.active_identity.cn}")
+        except FileExistsError:
+            self.label.text = "Starter app already exists — double-click it in the list to open it."
+        except Exception as e:
+            log.error(f"Failed to create starter app: {e}", exc_info=True)
+            self.label.text = f"Could not create starter app: {e}"
+        self.refresh_workspace()
+
     def _apply_identity_state(self):
         """Sync button enablement to the active identity and re-lock/redraw open docs."""
         is_valid = self.active_identity.is_valid
@@ -237,6 +298,9 @@ class Mschf(toga.App):
                 btn.enabled = is_valid
         if getattr(self, 'btn_logout', None) is not None:
             self.btn_logout.enabled = is_valid
+        if getattr(self, 'btn_create_starter', None) is not None:
+            self.btn_create_starter.enabled = is_valid
+        self._update_onboarding()
 
         # Redraw open documents so they lock (logged out / no access) or refresh live.
         for doc in list(self.documents):
@@ -283,6 +347,18 @@ class Mschf(toga.App):
         admin_cert_path = os.path.join(PROJ_DIR, 'admin.crt')
         admin_key_path = os.path.join(PROJ_DIR, 'admin.key')
         admin_passphrase = os.environ.get('MSCHF_ADMIN_PASSPHRASE', 'changeit')
+        # Drives the first-run hint: we may tell the user the DEFAULT passphrase
+        # in the UI, but never a custom one from the environment.
+        self._admin_passphrase_is_default = 'MSCHF_ADMIN_PASSPHRASE' not in os.environ
+
+        # Per-user workspace folder for .msf files — the sensible location for
+        # an installed app (cwd / install dir are not user workspaces).
+        try:
+            self.data_dir = str(self.paths.data)
+            os.makedirs(self.data_dir, exist_ok=True)
+        except Exception as data_dir_err:
+            log.warning(f"Could not prepare user data dir: {data_dir_err}")
+            self.data_dir = PROJ_DIR
 
         if not os.path.isfile(admin_cert_path) or not os.path.isfile(admin_key_path):
             with open(ca_cert_path, 'rb') as f:
@@ -349,8 +425,20 @@ class Mschf(toga.App):
             style=Pack(direction=ROW, margin=5)
         )
 
+        # First-run onboarding banner: contextual next-step guidance, populated
+        # by _update_onboarding() from the auth/workspace state.
+        self.onboarding_label = toga.Label("", style=Pack(margin=8, font_size=10))
+        self.btn_create_starter = toga.Button(
+            'Create Starter App', on_press=self.create_starter_app,
+            style=Pack(margin=8, margin_top=0), enabled=is_valid,
+        )
+        self.onboarding_box = toga.Box(
+            children=[self.onboarding_label, self.btn_create_starter],
+            style=Pack(direction=COLUMN, background_color='#fff7ed', margin_bottom=5),
+        )
+
         outer_box = toga.Box(
-            children=[self.identity_label, btn_box, self.workspace, self.label],
+            children=[self.onboarding_box, self.identity_label, btn_box, self.workspace, self.label],
             style=Pack(direction=COLUMN, margin=10)
         )
 

@@ -25,4 +25,4 @@ atexit.register = custom_register
 
 # Semver, pre-1.0: bump MINOR for features, PATCH for fixes. Keep in sync with
 # pyproject.toml [tool.briefcase] version and add a CHANGELOG.md entry.
-__version__ = '0.3.1'
+__version__ = '0.4.0'

@@ -11,6 +11,27 @@ entry here.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-18
+
+### Added
+
+- **First-run onboarding**: the Workspace Manager now tells a fresh user what
+  to do. A contextual banner shows the next step — logged out: how to sign in
+  (the built-in `admin` identity, with the default-passphrase hint; a custom
+  `MSCHF_ADMIN_PASSPHRASE` is referenced but never displayed); signed in with
+  an empty workspace: where apps live plus a **Create Starter App** button;
+  otherwise hidden. The Auth Gateway prefills `admin` and shows the same hint.
+- **Starter micro-app** (`src/mschf/starter.py`): one click authors a real
+  signed `.msf` ("Getting Started") — the creating identity bootstraps as
+  container admin, audit triggers install via signed DDL, welcome notes are
+  seeded, and the UI (signed notes demo) deploys as a signed by-value code
+  blob. The authored container passes the replay audit. `test_starter.py`
+  covers authoring headlessly (CI) and the container is render-verified
+  through the sandbox locally.
+- Workspace scanning now includes the per-user data directory (where the
+  starter app is created) — the meaningful workspace for installed builds
+  whose cwd/install dir aren't user-writable locations.
+
 ## [0.3.1] - 2026-07-18
 
 ### Fixed
