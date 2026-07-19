@@ -75,9 +75,22 @@ class Mschf(toga.App):
         and emit a periodic liveness heartbeat to the runtime log."""
         seq = 0
         last_heartbeat = 0.0
+        max_lag = 0.0
         log.info("Runtime monitor started (heartbeat every %ss).", self.HEARTBEAT_SECONDS)
         while True:
+            before = time.monotonic()
             await asyncio.sleep(self.WATCH_INTERVAL_SECONDS)
+            # How much later than requested did this coroutine actually resume?
+            # toga_winforms marshals every asyncio iteration onto the GUI thread
+            # (proactor.py), so an oversleep is GUI-thread scheduling latency: it
+            # stays ~0 while the thread services work on time, and spikes if the
+            # thread is CPU-starved/blocked. A freeze with LOW lag means the pump
+            # is fine and input is being routed away (window ghosting); a freeze
+            # with HIGH lag means the GUI thread itself stalled.
+            lag = (time.monotonic() - before) - self.WATCH_INTERVAL_SECONDS
+            if lag > max_lag:
+                max_lag = lag
+
             for doc in list(self.documents):
                 if isinstance(doc, MSF):
                     try:
@@ -91,22 +104,34 @@ class Mschf(toga.App):
                 seq += 1
                 gdi, user = self._gui_resource_counts()
                 log.info(
-                    "heartbeat #%d - docs=%d identity=%s gdi=%s user=%s",
+                    "heartbeat #%d - docs=%d identity=%s gdi=%s user=%s loop_lag_max=%.3fs",
                     seq, len(list(self.documents)),
                     getattr(self.active_identity, 'cn', '?') if self.active_identity.is_valid else 'none',
-                    gdi, user,
+                    gdi, user, max_lag,
                 )
+                max_lag = 0.0
 
     @staticmethod
     def _gui_resource_counts():
         """(GDI, USER) handle counts for this process on Windows; (None, None)
         elsewhere or on failure. A climbing trend before a freeze indicates
-        handle exhaustion (widgets recreated without disposal)."""
+        handle exhaustion (widgets recreated without disposal).
+
+        The handle args must be marshaled at pointer width: GetCurrentProcess()
+        returns a pseudo-handle (-1) and GetGuiResources takes a HANDLE, so
+        without explicit argtypes/restype ctypes passes a truncated 32-bit value
+        on 64-bit Windows and the call silently returns 0 (the bug in 0.4.2)."""
         try:
             import ctypes
+            from ctypes import wintypes
             GR_GDIOBJECTS, GR_USEROBJECTS = 0, 1
-            proc = ctypes.windll.kernel32.GetCurrentProcess()
-            user32 = ctypes.windll.user32
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.GetCurrentProcess.argtypes = []
+            user32.GetGuiResources.restype = wintypes.DWORD
+            user32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            proc = kernel32.GetCurrentProcess()
             return (user32.GetGuiResources(proc, GR_GDIOBJECTS),
                     user32.GetGuiResources(proc, GR_USEROBJECTS))
         except Exception:

@@ -11,6 +11,21 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Runtime-log heartbeat diagnostics, after a second freeze (a live process with
+  a normal last frame but unresponsive input — heartbeats kept firing on time
+  throughout, ruling out a hang/crash/sleep):
+  - GDI/USER handle counts were always 0 — `GetCurrentProcess()`'s pseudo-handle
+    was passed truncated to `GetGuiResources` on 64-bit Windows; with explicit
+    `argtypes`/`restype` it now reports real counts (verified 18/20 in a bare
+    Toga app), so a future freeze shows whether handles are climbing.
+  - Heartbeat now logs `loop_lag_max` — the worst asyncio-resume latency in the
+    window. Because toga marshals every loop iteration onto the GUI thread,
+    low lag during a freeze means the pump is healthy and input is being routed
+    away (window ghosting); high lag means the GUI thread itself stalled. This
+    is the discriminator to root-cause the freeze on its next occurrence.
+
 ## [0.4.2] - 2026-07-18
 
 ### Added
