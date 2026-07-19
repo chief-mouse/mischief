@@ -13,6 +13,8 @@ entry here.
 
 ### Fixed
 
+- `pyproject.toml` description shortened to ≤80 chars (Briefcase warned it was
+  133); the fuller text moved to `long_description`.
 - Runtime-log heartbeat diagnostics, after a second freeze (a live process with
   a normal last frame but unresponsive input — heartbeats kept firing on time
   throughout, ruling out a hang/crash/sleep):

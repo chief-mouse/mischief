@@ -10,7 +10,10 @@ author_email = "mouse.cheif@gmail.com"
 
 [tool.briefcase.app.mschf]
 formal_name = "Mischief Workspace Manager"
-description = "Workspace Manager for cryptographically signed micro-apps (.msf): X.509 identities, RBAC, and a signed transaction ledger over SQLite"
+description = "Workspace Manager for cryptographically signed micro-apps (.msf)"
+long_description = """Mischief is a Workspace Manager for micro-apps: single .msf files (SQLite) \
+carrying signed UI code, RBAC rules, and a replay-auditable ledger of \
+cryptographically signed transactions, verified against a local X.509 CA."""
 icon = "src/mschf/resources/mschf"
 sources = ["src/mschf"]
 requires = [
