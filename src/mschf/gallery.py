@@ -55,6 +55,35 @@ def gallery_app(toga, host_api):
             col.add(w)
         return toga.ScrollContainer(horizontal=False, content=col, style=P(flex=1))
 
+    def fit_columns(widget, headers, rows, caps):
+        # WinForms Table/Tree (both virtual-mode ListViews) equal-split their
+        # columns, truncating content. Measure the cell text and set explicit
+        # widths, hijacking the backend's _resize_columns so the layout pass
+        # uses ours. try/except keeps other platforms on their defaults.
+        try:
+            from System.Windows.Forms import TextRenderer
+            native = widget._impl.native
+            font = native.Font
+            cols = [[h] for h in headers]
+            for r in rows:
+                for i, v in enumerate(r):
+                    cols[i].append(str(v))
+
+            def resize(*_):
+                try:
+                    native.BeginUpdate()
+                    for i in range(native.Columns.Count):
+                        w = max(TextRenderer.MeasureText(t, font).Width for t in cols[i]) + 32
+                        native.Columns[i].Width = max(48, min(w, caps[i]))
+                    native.EndUpdate()
+                except Exception:
+                    pass
+
+            widget._impl._resize_columns = resize
+            resize()
+        except Exception:
+            pass
+
     # ----- Text & inputs -----
     inputs = tab(
         heading("Label"), toga.Label("A static text label."),
@@ -116,6 +145,15 @@ def gallery_app(toga, host_api):
         ],
         style=P(flex=1, height=160),
     )
+    fit_columns(table, ["Widget", "Category"],
+                [("Button", "control"), ("Table", "collection"), ("Canvas", "graphics")],
+                caps=[180, 160])
+    # Tree's Name column carries expand arrows + indent, so give it headroom.
+    fit_columns(tree, ["Name", "Kind"],
+                [("Inputs", "group"), ("    TextInput", "widget"), ("    Slider", "widget"),
+                 ("Collections", "group"), ("    Table", "widget"), ("    Tree", "widget")],
+                caps=[220, 140])
+
     collections = tab(
         heading("Table"), table,
         heading("DetailedList"), dlist,
@@ -164,7 +202,7 @@ def gallery_app(toga, host_api):
         mapview = toga.MapView(style=P(flex=1, height=220))
         mapview.location = (40.7128, -74.0060)
         mapview.zoom = 11
-        mapview.add_pin(toga.MapPin((40.7128, -74.0060), title="Mischief", subtitle="WebView2 + Leaflet"))
+        mapview.pins.add(toga.MapPin((40.7128, -74.0060), title="Mischief", subtitle="WebView2 + Leaflet"))
         web_widgets.append(mapview)
     except Exception as e:
         web_widgets.append(note("MapView unavailable: " + str(e)))
