@@ -19,6 +19,8 @@ python test_authorizer.py    # authorizer-hook enforcement (JOIN/INSERT..SELECT 
 python test_reactive.py      # reactive-redraw plumbing (on_commit notify + external-change marker, loop prevention)
 python test_ledger_audit.py  # ledger replay audit (clean pass + detects out-of-band row/ledger/trigger tampering)
 python test_starter.py       # starter-app authoring (signed container, trigger stamping, replay-audit clean)
+python test_webreport.py     # signed WebView chart/report: strict-CSP lockdown + no-remote-code + replay-audit
+python make_webreport.py     # author webreport.msf (chart/report in a CSP-locked WebView), then open it as admin
 
 python dev_tracker.py init   # dogfood: build dev_tracker.msf, a task-board micro-app tracking this project's own backlog
 python dev_tracker.py list   # …also: add "title" ["detail"] | status <id> <backlog|in_progress|done> | update-app | audit | verify

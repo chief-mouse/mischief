@@ -11,6 +11,20 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **Signed web-report micro-app** (`src/mschf/webreport.py`, `make_webreport.py`):
+  a proof-of-concept for rendering application data (charts, reports) in a
+  WebView without breaking the signed/sandboxed/audited model. Data comes from
+  signed queries; the renderer (an inline SVG bar chart — no external library,
+  no CDN) lives in the signed code blob; a strict Content-Security-Policy
+  (`default-src 'none'; connect-src 'none'; script-src 'unsafe-inline'`) blocks
+  fetch/XHR exfiltration and remote code; navigation is denied. The page runs a
+  live self-test that attempts to `fetch()` the data out and shows it blocked,
+  so the boundary is verifiable on screen. `test_webreport.py` asserts the CSP
+  and no-remote-code properties are present in the signed source and that the
+  container passes the replay audit (CI-safe).
+
 ## [0.4.2] - 2026-07-18
 
 ### Added

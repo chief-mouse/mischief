@@ -43,6 +43,9 @@ jobs:
       - name: Starter-app authoring
         run: python test_starter.py
 
+      - name: Signed web-report authoring
+        run: python test_webreport.py
+
       - name: Container generation (signed code deployment)
         run: python test_microapp.py
 
