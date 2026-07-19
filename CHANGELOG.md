@@ -11,6 +11,16 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **Widget gallery micro-app** (`src/mschf/gallery.py`, `make_gallery.py`): a
+  signed `.msf` whose UI demonstrates every Toga widget available on this
+  platform, grouped into tabs (Inputs, Controls, Collections, Graphics,
+  Web & Map, Containers) — a live reference for the widget vocabulary. Authored
+  by-value like the starter app (self-contained code blob), passes the replay
+  audit. `test_gallery.py` verifies authoring + all-widgets-referenced +
+  audit (CI-safe); rendering was verified through the sandbox on Windows.
+
 ## [0.4.2] - 2026-07-18
 
 ### Added
