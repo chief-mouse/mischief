@@ -112,6 +112,27 @@ class Mschf(toga.App):
                 max_lag = 0.0
 
     @staticmethod
+    def _disable_window_ghosting():
+        """Turn off Windows' window-ghosting for this process.
+
+        When an app briefly stops pumping input, Windows substitutes a
+        non-responsive "ghost" window that shows the last frame and does not
+        recover even after the app resumes — routing user input to the ghost.
+        Disabling it keeps the *real* window, which resumes once the transient
+        passes.
+
+        Diagnosed via the runtime heartbeat: across three freezes the event
+        loop kept ticking with loop_lag_max=0.000s and flat, trivially-low
+        GDI/USER counts — i.e. the GUI thread was healthy and it was not handle
+        exhaustion; the window had been ghosted. This is a no-op off Windows."""
+        try:
+            import ctypes
+            ctypes.WinDLL('user32').DisableProcessWindowsGhosting()
+            log.info("Window ghosting disabled for this process.")
+        except Exception as e:
+            log.warning(f"Could not disable window ghosting: {e}")
+
+    @staticmethod
     def _gui_resource_counts():
         """(GDI, USER) handle counts for this process on Windows; (None, None)
         elsewhere or on failure. A climbing trend before a freeze indicates
@@ -433,6 +454,9 @@ class Mschf(toga.App):
         log.info(f"We're running on {host_name}")
         log.info(f"Current working directory: {os.path.abspath(os.getcwd())}")
         load_settings()
+
+        # Keep the real window alive instead of letting Windows ghost it.
+        self._disable_window_ghosting()
 
         # Prune the stock document commands that don't fit the .msf model. A
         # container is never "saved" — every change is a signed transaction

@@ -13,6 +13,15 @@ entry here.
 
 ### Fixed
 
+- **Window-freeze mitigation**: disable Windows window-ghosting at startup
+  (`DisableProcessWindowsGhosting`). Root-caused via the runtime heartbeat —
+  across three freezes the app stayed fully alive (event loop ticking, up to
+  ~21.7h), with `loop_lag_max=0.000s` (GUI thread pumping with zero latency, so
+  not stalled) and flat, trivially-low GDI/USER counts (handle exhaustion ruled
+  out). A live, healthy GUI thread behind an unresponsive window is Windows
+  ghosting: the OS substitutes a dead "ghost" that never recovers. Disabling it
+  keeps the real window so it resumes once the transient passes. No-op off
+  Windows.
 - `pyproject.toml` description shortened to ≤80 chars (Briefcase warned it was
   133); the fuller text moved to `long_description`.
 - Runtime-log heartbeat diagnostics, after a second freeze (a live process with
