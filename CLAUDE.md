@@ -19,6 +19,8 @@ python test_authorizer.py    # authorizer-hook enforcement (JOIN/INSERT..SELECT 
 python test_reactive.py      # reactive-redraw plumbing (on_commit notify + external-change marker, loop prevention)
 python test_ledger_audit.py  # ledger replay audit (clean pass + detects out-of-band row/ledger/trigger tampering)
 python test_starter.py       # starter-app authoring (signed container, trigger stamping, replay-audit clean)
+python test_gallery.py       # widget-gallery authoring (signed container demoing every Toga widget; replay-audit clean)
+python make_gallery.py       # author widget_gallery.msf into the workspace, then open it in the app (sign in as admin)
 
 python dev_tracker.py init   # dogfood: build dev_tracker.msf, a task-board micro-app tracking this project's own backlog
 python dev_tracker.py list   # …also: add "title" ["detail"] | status <id> <backlog|in_progress|done> | update-app | audit | verify
