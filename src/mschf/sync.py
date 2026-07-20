@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,33 +114,83 @@ def homing(storage):
 
 
 # ---------------------------------------------------------------------------
-# Sidecar: external head attestation record
+# Hub head attestation (container_meta infrastructure metadata)
 # ---------------------------------------------------------------------------
 
-def head_sidecar_path(container_path):
-    return f'{container_path}.head'
+_HUB_ATTESTATION_KEY = 'hub_attestation'
 
 
-def load_attested_head(container_path):
-    path = head_sidecar_path(container_path)
-    if not os.path.isfile(path):
+def load_attested_head(storage):
+    """Return the verified hub head record from ``container_meta``, or None."""
+    row = storage.conn.execute(
+        "SELECT value FROM container_meta WHERE key = ?",
+        (_HUB_ATTESTATION_KEY,),
+    ).fetchone()
+    if row is None or not row[0]:
         return None
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    try:
+        return json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
-def store_attested_head(container_path, head_dict):
-    """Persist the latest verified head attestation next to the container."""
-    path = head_sidecar_path(container_path)
-    # Keep a compact, stable record: next_seq, prev_hash, full attestation.
+def store_attested_head(storage, head_dict):
+    """Persist the latest verified head attestation in ``container_meta``.
+
+    Direct unsigned write — same class of infrastructure metadata as
+    ``set_payload_fmt_floor`` / ``container_uid`` (not ledgered history).
+    """
     record = {
         'container': head_dict.get('container'),
         'next_seq': head_dict['next_seq'],
         'prev_hash': head_dict['prev_hash'],
         'attestation': head_dict.get('attestation'),
     }
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(record, f, indent=2, sort_keys=True)
+    storage.conn.execute(
+        "INSERT OR REPLACE INTO container_meta (key, value) VALUES (?, ?)",
+        (_HUB_ATTESTATION_KEY, json.dumps(record, sort_keys=True)),
+    )
+    storage.conn.commit()
+
+
+def _migrate_legacy_head_sidecar(storage):
+    """One-way import of a legacy ``<container>.msf.head`` sidecar into meta.
+
+    If a sidecar file exists next to the open container: parse it; when the
+    container has no ``hub_attestation`` yet or the sidecar's ``next_seq`` is
+    higher, import the compact record into ``container_meta``; then delete the
+    sidecar. Unreadable sidecars are left in place and a warning is printed
+    (do not destroy what we cannot parse).
+    """
+    # Legacy path: <container path>.head — only consulted here for migration.
+    path = f'{storage.filename}.head'
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            sidecar = json.load(f)
+        if not isinstance(sidecar, dict):
+            raise ValueError('sidecar JSON is not an object')
+        if 'next_seq' not in sidecar or 'prev_hash' not in sidecar:
+            raise ValueError('sidecar missing next_seq/prev_hash')
+    except Exception as e:
+        print(
+            f'warning: unreadable legacy head sidecar {path!r} '
+            f'(left in place): {e}',
+            file=sys.stderr,
+        )
+        return
+
+    existing = load_attested_head(storage)
+    if existing is None or sidecar['next_seq'] > existing.get('next_seq', -1):
+        store_attested_head(storage, sidecar)
+    try:
+        os.remove(path)
+    except OSError as e:
+        print(
+            f'warning: could not delete legacy head sidecar {path!r}: {e}',
+            file=sys.stderr,
+        )
 
 
 def _head_extends(previous, hub_next_seq, hub_prev_hash):
@@ -369,11 +420,15 @@ def pull_and_apply(
     SQL with ``_active_signer`` and a ``datetime`` override so triggers stamp
     historically-correct attribution and timestamps.
 
-    Stores the latest verified head attestation in ``<container>.msf.head``.
-    Raises if the hub head regresses relative to a previously attested head.
+    Stores the latest verified head attestation in ``container_meta``
+    (``hub_attestation`` key). Raises if the hub head regresses relative to a
+    previously attested head.
     """
     ca = ca_cert_path if ca_cert_path is not None else storage._ca_cert_path_arg
     td = trust_dir if trust_dir is not None else storage.trust_dir
+
+    # Import any legacy <container>.msf.head sidecar before the regression check.
+    _migrate_legacy_head_sidecar(storage)
 
     next_seq, prev_hash, head = fetch_head(
         hub_url, container_id,
@@ -382,7 +437,7 @@ def pull_and_apply(
         trust_dir=td,
     )
 
-    previous = load_attested_head(storage.filename)
+    previous = load_attested_head(storage)
     if not _head_extends(previous, next_seq, prev_hash):
         raise PermissionError(
             f'pull_and_apply: hub head (next_seq={next_seq}, prev_hash={prev_hash!r}) '
@@ -525,14 +580,14 @@ def pull_and_apply(
         # frozen at the last replayed ledger timestamp.
         storage.conn.create_function('datetime', -1, _live_datetime)
 
-    # Sidecar: store the fetched-head attestation iff the local tip now equals
-    # it; otherwise leave the previous sidecar in place (next pull persists a
-    # fresh one). Mid-pull race: hub advanced between head-fetch and row-fetch
-    # so the replica's applied tip lands *past* the fetched head
-    # (local_next > next_seq with applied > 0) — benign; skip sidecar store.
+    # Store the fetched-head attestation iff the local tip now equals it;
+    # otherwise leave the previous container_meta record in place (next pull
+    # persists a fresh one). Mid-pull race: hub advanced between head-fetch
+    # and row-fetch so the replica's applied tip lands *past* the fetched head
+    # (local_next > next_seq with applied > 0) — benign; skip attestation store.
     local_next, local_prev = storage.get_chain_head()
     if local_next == next_seq and local_prev == prev_hash:
-        store_attested_head(storage.filename, head)
+        store_attested_head(storage, head)
     elif applied == 0 and (local_next, local_prev) != (next_seq, prev_hash):
         raise PermissionError(
             f'pull_and_apply: local head ({local_next}, {local_prev!r}) does not '
@@ -571,6 +626,9 @@ def bootstrap(
         f.write(data)
 
     storage = MSFStorage(dest_path, ca_cert_path=ca_cert_path, trust_dir=trust_dir)
+    # Clean up a leftover legacy .head sidecar next to dest (bootstrap
+    # overwrites the .msf itself; pull is the primary migration path).
+    _migrate_legacy_head_sidecar(storage)
     report = replay_audit(storage)
     if not report.get('ok'):
         storage.close()
@@ -592,5 +650,7 @@ def bootstrap(
             f'bootstrap: local head ({local_next}, {local_prev!r}) != '
             f'hub head ({next_seq}, {prev_hash!r})'
         )
-    store_attested_head(dest_path, head)
+    # After head check passes: store attestation (overwrites any imported
+    # legacy record with the verified hub head for this bootstrap snapshot).
+    store_attested_head(storage, head)
     return storage

@@ -11,6 +11,22 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hub head attestation moved into the container — `.head` sidecar files
+  eliminated**: sync previously stored the hub-countersigned head attestation
+  in a separate `<container>.msf.head` JSON file, breaking the single-file
+  container philosophy (and its "external record" placement bought no real
+  security: the regression check defends against a rolled-back hub, for which
+  storage location is irrelevant, and a local sidecar is exactly as
+  tamperable as the `.msf` itself). The attestation now lives in
+  `container_meta` under `hub_attestation` — the unsigned infrastructure
+  table alongside `container_uid` — so it travels with the file and copied
+  replicas keep their truncation protection. Existing sidecars are imported
+  and deleted on the next pull/bootstrap (unreadable ones are left with a
+  warning). Regression semantics unchanged. Implemented by the grok agent;
+  reviewed and independently re-tested by Claude.
+
 ## [0.6.2] - 2026-07-20
 
 Fixes the silently broken v0.6.1 Linux `.deb` (missing girepository runtime

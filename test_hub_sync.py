@@ -4,7 +4,8 @@ Run: python test_hub_sync.py
 
 Covers bootstrap, write-through with attribution triggers, multi-spoke
 convergence, stale-head retry, bad signature / untrusted signer rejection,
-head attestation + sidecar anti-truncation, and datetime replay fidelity.
+head attestation (container_meta) anti-truncation, legacy .head migration,
+and datetime replay fidelity.
 """
 import json
 import os
@@ -242,11 +243,15 @@ def run():
         local_head = spoke_a.get_chain_head()
         assert local_head == hub_head, f'heads mismatch: local={local_head} hub={hub_head}'
 
-        sidecar = msync.load_attested_head(spoke_a_path)
-        assert sidecar is not None, 'bootstrap must write .head sidecar'
-        assert sidecar['next_seq'] == local_head[0]
-        assert sidecar['prev_hash'] == local_head[1]
-        print(f'  [OK] bootstrap audit clean; heads match {local_head}')
+        attested = msync.load_attested_head(spoke_a)
+        assert attested is not None, 'bootstrap must store hub_attestation in container_meta'
+        assert attested['next_seq'] == local_head[0]
+        assert attested['prev_hash'] == local_head[1]
+        assert not os.path.isfile(f'{spoke_a_path}.head'), (
+            'bootstrap must not create a .head sidecar'
+        )
+        print(f'  [OK] bootstrap audit clean; heads match {local_head}; '
+              f'hub_attestation in container_meta')
 
         # Homing helper
         url, cn = msync.homing(spoke_a)
@@ -419,9 +424,9 @@ def run():
             print(f'  [OK] rejected: {e}')
 
         # ==================================================================
-        # 7. Head attestation
+        # 7. Head attestation (container_meta) + anti-truncation
         # ==================================================================
-        print('\n=== 7. Head attestation + sidecar anti-truncation ===')
+        print('\n=== 7. Head attestation + container_meta anti-truncation ===')
         try:
             msync.fetch_head(
                 hub_url, container_id,
@@ -433,27 +438,45 @@ def run():
             assert 'does not match expected' in str(e) or 'CN' in str(e), str(e)
             print(f'  [OK] wrong expected_hub_cn raises: {e}')
 
-        # Pull on spoke A so sidecar updates after the writes above.
-        pre_side = msync.load_attested_head(spoke_a_path)
+        # Pull on spoke A so hub_attestation updates after the writes above.
+        pre_att = msync.load_attested_head(spoke_a)
         msync.pull_and_apply(
             spoke_a, hub_url, container_id,
             expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
         )
-        post_side = msync.load_attested_head(spoke_a_path)
-        assert post_side is not None
-        assert post_side['next_seq'] == spoke_a.get_chain_head()[0]
-        assert post_side['next_seq'] >= (pre_side['next_seq'] if pre_side else 0)
-        print(f'  [OK] sidecar updated to next_seq={post_side["next_seq"]}')
+        post_att = msync.load_attested_head(spoke_a)
+        assert post_att is not None
+        assert post_att['next_seq'] == spoke_a.get_chain_head()[0]
+        assert post_att['next_seq'] >= (pre_att['next_seq'] if pre_att else 0)
+        # (a) no .head sidecar; container_meta matches hub head
+        assert not os.path.isfile(f'{spoke_a_path}.head'), (
+            'pull must not create a .head sidecar'
+        )
+        hub_head_now = hub_storage.get_chain_head()
+        assert post_att['next_seq'] == hub_head_now[0]
+        assert post_att['prev_hash'] == hub_head_now[1]
+        meta_row = spoke_a.conn.execute(
+            "SELECT value FROM container_meta WHERE key = 'hub_attestation'"
+        ).fetchone()
+        assert meta_row is not None and meta_row[0]
+        meta_parsed = json.loads(meta_row[0])
+        assert meta_parsed['next_seq'] == post_att['next_seq']
+        assert meta_parsed['prev_hash'] == post_att['prev_hash']
+        print(f'  [OK] hub_attestation updated to next_seq={post_att["next_seq"]} '
+              f'(no .head file; matches hub)')
 
-        # Fabricated regressed head: hand-write sidecar with higher seq.
+        # (c) Fabricated regressed head: raw-write container_meta with higher seq.
         fake = {
             'container': container_id,
-            'next_seq': post_side['next_seq'] + 100,
+            'next_seq': post_att['next_seq'] + 100,
             'prev_hash': 'deadbeef' * 8,
-            'attestation': post_side.get('attestation'),
+            'attestation': post_att.get('attestation'),
         }
-        with open(msync.head_sidecar_path(spoke_a_path), 'w', encoding='utf-8') as f:
-            json.dump(fake, f)
+        spoke_a.conn.execute(
+            "INSERT OR REPLACE INTO container_meta (key, value) VALUES (?, ?)",
+            ('hub_attestation', json.dumps(fake, sort_keys=True)),
+        )
+        spoke_a.conn.commit()
         try:
             msync.pull_and_apply(
                 spoke_a, hub_url, container_id,
@@ -461,15 +484,49 @@ def run():
             )
             raise AssertionError('regressed head should raise')
         except PermissionError as e:
-            assert 'does not extend' in str(e) or 'truncation' in str(e).lower() or 'fork' in str(e).lower(), str(e)
-            print(f'  [OK] fabricated higher sidecar raises: {e}')
-        # Restore a valid sidecar for cleanup hygiene.
-        msync.store_attested_head(spoke_a_path, {
+            assert (
+                'does not extend' in str(e)
+                or 'truncation' in str(e).lower()
+                or 'fork' in str(e).lower()
+            ), str(e)
+            print(f'  [OK] fabricated higher container_meta attestation raises: {e}')
+        # Restore a valid attestation for subsequent tests.
+        msync.store_attested_head(spoke_a, {
             'container': container_id,
             'next_seq': spoke_a.get_chain_head()[0],
             'prev_hash': spoke_a.get_chain_head()[1],
-            'attestation': post_side.get('attestation'),
+            'attestation': post_att.get('attestation'),
         })
+
+        # (b) Legacy .head sidecar migration: wipe meta key, hand-write sidecar,
+        # pull imports into container_meta and deletes the sidecar file.
+        print('\n=== 7b. Legacy .head sidecar → container_meta migration ===')
+        spoke_a.conn.execute(
+            "DELETE FROM container_meta WHERE key = 'hub_attestation'"
+        )
+        spoke_a.conn.commit()
+        assert msync.load_attested_head(spoke_a) is None
+        legacy_side = {
+            'container': container_id,
+            'next_seq': spoke_a.get_chain_head()[0],
+            'prev_hash': spoke_a.get_chain_head()[1],
+            'attestation': post_att.get('attestation'),
+        }
+        legacy_path = f'{spoke_a_path}.head'
+        with open(legacy_path, 'w', encoding='utf-8') as f:
+            json.dump(legacy_side, f)
+        assert os.path.isfile(legacy_path)
+        msync.pull_and_apply(
+            spoke_a, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        assert not os.path.isfile(legacy_path), 'migration must delete readable sidecar'
+        migrated = msync.load_attested_head(spoke_a)
+        assert migrated is not None, 'migration must import into container_meta'
+        assert migrated['next_seq'] == spoke_a.get_chain_head()[0]
+        assert migrated['prev_hash'] == spoke_a.get_chain_head()[1]
+        print(f'  [OK] legacy sidecar imported (next_seq={migrated["next_seq"]}) '
+              f'and file removed')
 
         # ==================================================================
         # 8. Timestamps
