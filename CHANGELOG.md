@@ -11,6 +11,13 @@ entry here.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-20
+
+Fixes the silently broken v0.6.1 Linux `.deb` (missing girepository runtime
+dependency) — caught by the new packaged-app smoke tests, which now install,
+launch, and screenshot the real DMG and .deb on CI after every packaging run.
+Use this release's `.deb` instead of v0.6.1's.
+
 ### Fixed
 
 - **Linux `.deb` missing girepository runtime dependency**: the bundled
