@@ -22,6 +22,7 @@ python test_starter.py       # starter-app authoring (signed container, trigger 
 
 python dev_tracker.py init   # dogfood: build dev_tracker.msf, a task-board micro-app tracking this project's own backlog
 python dev_tracker.py list   # …also: add "title" ["detail"] | status <id> <backlog|in_progress|done> | update-app | audit | verify
+                             # sign as a non-admin identity: --identity <cn> or MSCHF_TRACKER_IDENTITY (default admin; agents claude/grok have role 'agent'); init always signs as admin
 ```
 
 There is no pytest/lint setup — the test scripts are standalone integration scripts run directly with `python`. They insert `src/` into `sys.path` themselves and read/write artifacts (`.msf` files, certs) in the project root. `verify_microapp.py` depends on `test_microapp.py` having produced `test_microapp.msf` (it auto-runs it if missing).

@@ -2,18 +2,31 @@
 
 Authors dev_tracker.msf (a signed micro-app container) seeded with the current
 hardening backlog, and doubles as a signed CLI for updating it. Every read and
-write — CLI or GUI — goes through MSFStorage.execute_signed, signed with the
-host's own admin identity (admin.crt / passphrase-encrypted admin.key), so the
-tracker exercises the exact code paths we are hardening.
+write — CLI or GUI — goes through MSFStorage.execute_signed, signed with a host
+identity (default admin.crt / passphrase-encrypted admin.key), so the tracker
+exercises the exact code paths we are hardening.
 
 Usage:
+  python dev_tracker.py [--identity <cn>] <command> ...
+
+  Identity (who signs CLI transactions):
+    --identity <cn>              use PROJ_DIR/<cn>.crt + <cn>.key (global flag)
+    MSCHF_TRACKER_IDENTITY       same, when --identity is omitted (default: admin)
+    MSCHF_TRACKER_PASSPHRASE     key passphrase (falls back to MSCHF_ADMIN_PASSPHRASE,
+                                 then 'changeit')
+
   python dev_tracker.py init                     # (re)create dev_tracker.msf with seeded backlog
+                                                 # (always signs as admin; override is ignored)
   python dev_tracker.py list                     # show tasks (signed SELECT)
   python dev_tracker.py add "title" ["detail"]   # add a backlog task (signed INSERT)
   python dev_tracker.py status <id> <backlog|in_progress|done>
   python dev_tracker.py update-app               # hot-deploy the current UI code (keeps task data)
   python dev_tracker.py verify                   # load the .msf and run it through the sandbox
   python dev_tracker.py audit                    # replay the signed ledger; flag out-of-band writes
+
+  Examples:
+    python dev_tracker.py --identity grok list
+    MSCHF_TRACKER_IDENTITY=grok python dev_tracker.py add "task title"
 """
 import sys
 import os
@@ -26,7 +39,13 @@ from mschf.storage import MSFStorage, canonical_payload
 DB_PATH = os.path.join(PROJ_DIR, 'dev_tracker.msf')
 ADMIN_CERT_PATH = os.path.join(PROJ_DIR, 'admin.crt')
 ADMIN_KEY_PATH = os.path.join(PROJ_DIR, 'admin.key')
+# Legacy module-level default (admin path); load_identity() prefers
+# MSCHF_TRACKER_PASSPHRASE then MSCHF_ADMIN_PASSPHRASE.
 PASSPHRASE = os.environ.get('MSCHF_ADMIN_PASSPHRASE', 'changeit')
+
+# Set by main() when --identity is parsed; load_identity() also reads
+# MSCHF_TRACKER_IDENTITY when this is None.
+_CLI_IDENTITY = None
 
 VALID_STATUSES = ('backlog', 'in_progress', 'done')
 
@@ -55,21 +74,55 @@ SEED_TASKS = [
 ]
 
 
-def load_admin_identity():
-    """Load the host admin cert and unlock its passphrase-encrypted private key."""
+def _active_cn():
+    """CN for CLI signing: --identity flag, else MSCHF_TRACKER_IDENTITY, else admin."""
+    if _CLI_IDENTITY is not None:
+        return _CLI_IDENTITY
+    return os.environ.get('MSCHF_TRACKER_IDENTITY', 'admin')
+
+
+def _identity_passphrase():
+    """Key passphrase: MSCHF_TRACKER_PASSPHRASE → MSCHF_ADMIN_PASSPHRASE → changeit."""
+    return (
+        os.environ.get('MSCHF_TRACKER_PASSPHRASE')
+        or os.environ.get('MSCHF_ADMIN_PASSPHRASE')
+        or 'changeit'
+    )
+
+
+def load_identity(cn=None):
+    """Load a host identity by CN and unlock its passphrase-encrypted private key.
+
+    Cert/key paths are PROJ_DIR/<cn>.crt and PROJ_DIR/<cn>.key. When cn is
+    omitted, uses --identity / MSCHF_TRACKER_IDENTITY / 'admin'.
+    """
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
-    if not (os.path.isfile(ADMIN_CERT_PATH) and os.path.isfile(ADMIN_KEY_PATH)):
-        sys.exit("admin.crt/admin.key not found in project root — run the app once ('briefcase dev') to generate them.")
-    with open(ADMIN_CERT_PATH, 'rb') as f:
+    if cn is None:
+        cn = _active_cn()
+    cert_path = os.path.join(PROJ_DIR, f'{cn}.crt')
+    key_path = os.path.join(PROJ_DIR, f'{cn}.key')
+    if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
+        sys.exit(
+            f"{cn}.crt/{cn}.key not found in project root — "
+            "run the app once ('briefcase dev') to generate admin, "
+            "or provision the requested identity."
+        )
+    passphrase = _identity_passphrase()
+    with open(cert_path, 'rb') as f:
         cert_pem = f.read()
-    with open(ADMIN_KEY_PATH, 'rb') as f:
+    with open(key_path, 'rb') as f:
         key_pem = f.read()
     try:
-        private_key = load_pem_private_key(key_pem, password=PASSPHRASE.encode('utf-8'))
+        private_key = load_pem_private_key(key_pem, password=passphrase.encode('utf-8'))
     except (TypeError, ValueError):
         # Legacy plaintext key (the app auto-upgrades these on startup)
         private_key = load_pem_private_key(key_pem, password=None)
     return cert_pem, private_key
+
+
+def load_admin_identity():
+    """Load the host admin cert (compat wrapper for other importers)."""
+    return load_identity('admin')
 
 
 def sign_payload(db, private_key, query, params):
@@ -131,33 +184,44 @@ def _cert_cn(cert_pem):
 
 
 def _ensure_schema(db, cert_pem, private_key):
-    """Idempotent, signed migration of dev_tasks to the attribution schema."""
-    identity = f"cert:CN={_cert_cn(cert_pem)}"
-    cols = {r[1] for r in db.conn.execute("PRAGMA table_info(dev_tasks)")}
-    added = [c for c in ('created_at', 'created_by', 'updated_by') if c not in cols]
-    for col in added:
-        signed_exec(db, cert_pem, private_key, f"ALTER TABLE dev_tasks ADD COLUMN {col} TEXT", [])
-    if added:
-        # Backfill: everything so far was created in the seeding pass, and every
-        # prior write was signed by this same identity (the ledger proves it).
-        signed_exec(db, cert_pem, private_key,
-                    "UPDATE dev_tasks SET created_at = COALESCE(created_at, updated_at), "
-                    "created_by = COALESCE(created_by, ?), updated_by = COALESCE(updated_by, ?)",
-                    [identity, identity])
-        print(f"Migrated dev_tasks schema (added: {', '.join(added)}).")
+    """Idempotent, signed migration of dev_tasks to the attribution schema.
 
-    existing = {r[0] for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-    missing = [ddl for ddl in AUDIT_TRIGGERS if ddl.split()[2] not in existing]
-    if missing:
-        # Normalize legacy CN-only attribution to identity strings BEFORE the
-        # immutability trigger locks created_by down.
-        for col in ('created_by', 'updated_by'):
+    When the schema is already current this performs no signed writes. Pending
+    migrations require admin (DDL / system-table-adjacent writes); non-admin
+    identities get a clear exit message instead of a traceback.
+    """
+    try:
+        identity = f"cert:CN={_cert_cn(cert_pem)}"
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(dev_tasks)")}
+        added = [c for c in ('created_at', 'created_by', 'updated_by') if c not in cols]
+        for col in added:
+            signed_exec(db, cert_pem, private_key, f"ALTER TABLE dev_tasks ADD COLUMN {col} TEXT", [])
+        if added:
+            # Backfill: everything so far was created in the seeding pass, and every
+            # prior write was signed by this same identity (the ledger proves it).
             signed_exec(db, cert_pem, private_key,
-                        f"UPDATE dev_tasks SET {col} = 'cert:CN=' || {col} "
-                        f"WHERE {col} IS NOT NULL AND {col} NOT LIKE 'cert:%' AND {col} NOT LIKE 'key:%'", [])
-        for ddl in missing:
-            signed_exec(db, cert_pem, private_key, ddl, [])
-        print(f"Installed audit triggers ({len(missing)}); attribution is now engine-enforced.")
+                        "UPDATE dev_tasks SET created_at = COALESCE(created_at, updated_at), "
+                        "created_by = COALESCE(created_by, ?), updated_by = COALESCE(updated_by, ?)",
+                        [identity, identity])
+            print(f"Migrated dev_tasks schema (added: {', '.join(added)}).")
+
+        existing = {r[0] for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+        missing = [ddl for ddl in AUDIT_TRIGGERS if ddl.split()[2] not in existing]
+        if missing:
+            # Normalize legacy CN-only attribution to identity strings BEFORE the
+            # immutability trigger locks created_by down.
+            for col in ('created_by', 'updated_by'):
+                signed_exec(db, cert_pem, private_key,
+                            f"UPDATE dev_tasks SET {col} = 'cert:CN=' || {col} "
+                            f"WHERE {col} IS NOT NULL AND {col} NOT LIKE 'cert:%' AND {col} NOT LIKE 'key:%'", [])
+            for ddl in missing:
+                signed_exec(db, cert_pem, private_key, ddl, [])
+            print(f"Installed audit triggers ({len(missing)}); attribution is now engine-enforced.")
+    except PermissionError as e:
+        sys.exit(
+            f"Schema migration requires admin identity — run once as admin "
+            f"(e.g. python dev_tracker.py --identity admin <cmd>): {e}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +416,11 @@ def dev_tracker_app(toga, host_api):
 # ---------------------------------------------------------------------------
 def cmd_init():
     import dill
+    # init always bootstraps as admin; a non-admin first-writer would become
+    # container admin via bootstrap_admin.
+    override = _active_cn()
+    if override != 'admin':
+        print(f"Note: identity override '{override}' ignored for init (always uses admin).")
     cert_pem, private_key = load_admin_identity()
 
     if os.path.exists(DB_PATH):
@@ -395,7 +464,7 @@ def cmd_init():
 
 
 def _open_for_cli():
-    cert_pem, private_key = load_admin_identity()
+    cert_pem, private_key = load_identity()
     if not os.path.exists(DB_PATH):
         sys.exit("dev_tracker.msf not found — run: python dev_tracker.py init")
     return MSFStorage(DB_PATH), cert_pem, private_key
@@ -459,18 +528,20 @@ def cmd_verify():
     code_func = db.get_code(entry_point)
     assert code_func is not None, "Failed to load code from container"
 
+    cn = _active_cn()
+    key_path = os.path.join(PROJ_DIR, f'{cn}.key')
     widget = execute_micro_app(
         code_func, PROJ_DIR, db,
-        current_user_cn='admin',
+        current_user_cn=cn,
         current_user_cert_pem=cert_pem.decode('utf-8'),
-        key_path=ADMIN_KEY_PATH,
-        key_passphrase=PASSPHRASE,
+        key_path=key_path,
+        key_passphrase=_identity_passphrase(),
     )
     assert widget is not None, "Micro-app returned no widget"
     print(f"Sandbox returned widget: {type(widget).__name__} (id={widget.id})")
     # The task board carries an explicit widget id; the lockout view and the
     # sandbox's error-fallback box do not — so reaching it proves the signed
-    # SELECT inside refresh() succeeded under the admin identity.
+    # SELECT inside refresh() succeeded under the active identity.
     assert widget.id == 'dev_tracker_board', "Expected the task board, got a lockout/error view"
     db.close()
     print("\nDev Tracker container verified end-to-end (signed reads/writes + sandbox execution).")
@@ -482,12 +553,17 @@ def cmd_update_app():
     A signed code replacement: task data is untouched, the new blob is signed
     and appended to the audit log, and get_code_signature_status() verifies the
     newest deployment. Reopen the document in the GUI to load the new UI.
+    Non-admin identities are denied by RBAC (source_code is a system table).
     """
     db, cert_pem, private_key = _open_for_cli()
     _ensure_schema(db, cert_pem, private_key)
     pickled = __import__('dill').dumps(dev_tracker_app)
-    sig = sign_payload(db, private_key, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", ['main_app', pickled])
-    db.store_code('main_app', dev_tracker_app, sig, cert_pem)
+    try:
+        sig = sign_payload(db, private_key, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", ['main_app', pickled])
+        db.store_code('main_app', dev_tracker_app, sig, cert_pem)
+    except PermissionError as e:
+        db.close()
+        sys.exit(f"Permission denied: update-app requires admin identity ({e})")
     status = db.get_code_signature_status('main_app')
     db.close()
     assert status['verified'], f"Deployed code failed signature verification: {status['error']}"
@@ -505,8 +581,29 @@ def cmd_audit():
     sys.exit(0 if report['ok'] else 1)
 
 
+def _parse_global_flags(argv):
+    """Pull global flags (e.g. --identity) out of argv; set _CLI_IDENTITY; return rest."""
+    global _CLI_IDENTITY
+    rest = []
+    identity_cn = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--identity' and i + 1 < len(argv):
+            identity_cn = argv[i + 1]
+            i += 2
+        elif arg.startswith('--identity='):
+            identity_cn = arg.split('=', 1)[1]
+            i += 1
+        else:
+            rest.append(arg)
+            i += 1
+    _CLI_IDENTITY = identity_cn
+    return rest
+
+
 def main():
-    args = sys.argv[1:]
+    args = _parse_global_flags(sys.argv[1:])
     if not args:
         print(__doc__)
         sys.exit(1)

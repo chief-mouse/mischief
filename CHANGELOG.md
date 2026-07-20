@@ -13,6 +13,18 @@ entry here.
 
 ### Added
 
+- **Dev-tracker CLI identity selection**: `dev_tracker.py` can now sign as any
+  host identity — `--identity <cn>` (global flag) or `MSCHF_TRACKER_IDENTITY`,
+  defaulting to `admin`; key passphrase from `MSCHF_TRACKER_PASSPHRASE` →
+  `MSCHF_ADMIN_PASSPHRASE` → `changeit`. Purpose: per-agent identities
+  (`claude`, `grok`, role `agent`: dev_tasks read/write only) record their own
+  work with engine-enforced attribution via `current_signer()` triggers,
+  instead of everything signing as admin. `init` always bootstraps as admin
+  (a non-admin first writer would claim the container); pending schema
+  migrations and `update-app` exit with clear messages (not tracebacks) for
+  non-admin identities. Implemented by the grok agent from a written spec;
+  reviewed, independently verified, and integrated by Claude.
+
 - **Configurable trust anchors (org CA / trust store)**: the host now trusts
   its own `ca.crt` **plus** every `*.crt`/`*.pem` certificate in a
   `trusted_cas/` directory next to it (overridable via `MSCHF_TRUST_DIR`, or
