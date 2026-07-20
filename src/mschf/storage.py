@@ -98,6 +98,107 @@ def set_payload_fmt_floor(storage, value):
     storage.conn.commit()
 
 
+def legacy_prefix_digest(storage, upto_id=None):
+    """SHA-256 digest of the pre-chaining (``seq IS NULL``) ledger prefix.
+
+    Returns ``(count, last_id, digest_hex)``. Rows are ordered by ``id`` and
+    serialized as a sorted-keys JSON array of
+    ``{id, query, params, signature (b64), pub_key (str), timestamp}``.
+    When ``upto_id`` is set, only rows with ``id <= upto_id`` are included
+    (used by audit to recompute the fenced prefix). Empty prefix yields
+    ``(0, 0, digest-of-empty-list)``.
+    """
+    if upto_id is None:
+        rows = storage.conn.execute(
+            "SELECT id, query, params, signature, pub_key, timestamp "
+            "FROM transactions WHERE seq IS NULL ORDER BY id"
+        ).fetchall()
+    else:
+        rows = storage.conn.execute(
+            "SELECT id, query, params, signature, pub_key, timestamp "
+            "FROM transactions WHERE seq IS NULL AND id <= ? ORDER BY id",
+            (upto_id,),
+        ).fetchall()
+
+    entries = []
+    for txn_id, query, params, signature, pub_key, timestamp in rows:
+        if isinstance(pub_key, bytes):
+            pub_key_str = pub_key.decode('utf-8', errors='replace')
+        else:
+            pub_key_str = str(pub_key) if pub_key is not None else ''
+        entries.append({
+            'id': txn_id,
+            'query': query,
+            'params': params,
+            'signature': base64.b64encode(bytes(signature or b'')).decode('ascii'),
+            'pub_key': pub_key_str,
+            'timestamp': timestamp,
+        })
+    last_id = entries[-1]['id'] if entries else 0
+    digest_hex = hashlib.sha256(
+        json.dumps(entries, sort_keys=True).encode('utf-8')
+    ).hexdigest()
+    return len(entries), last_id, digest_hex
+
+
+def create_legacy_checkpoint(storage, private_key, cert_pem):
+    """Commit a signed manifest checkpoint of the entire legacy prefix.
+
+    Digests every ``seq IS NULL`` row, then writes manifest key
+    ``legacy_checkpoint`` via a normal signed (v3) transaction — admin-only
+    because manifest is a system table. Subsequent ``replay_audit`` calls
+    recompute the digest and fail closed on any scrub of the fenced prefix.
+
+    Raises ``ValueError`` when there are no legacy rows. When a checkpoint
+    already exists with the same digest, returns without writing (idempotent
+    no-op). Returns the checkpoint value dict on a new write, or the existing
+    value on no-op.
+    """
+    count, last_id, digest_hex = legacy_prefix_digest(storage)
+    if count == 0:
+        raise ValueError(
+            "No legacy (seq IS NULL) rows to checkpoint; "
+            "containers without a pre-chaining prefix do not need one."
+        )
+
+    checkpoint = {
+        'upto_id': last_id,
+        'count': count,
+        'digest': digest_hex,
+    }
+    value = json.dumps(checkpoint, sort_keys=True)
+
+    existing = storage.get_manifest_item('legacy_checkpoint')
+    if existing is not None:
+        try:
+            prev = json.loads(existing)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            prev = None
+        if isinstance(prev, dict) and prev.get('digest') == digest_hex:
+            # Identical state — no-op, do not append a duplicate ledger row.
+            return prev
+
+    # Accept PEM bytes/str or an already-loaded private key.
+    if hasattr(private_key, 'sign') and not isinstance(private_key, (bytes, str)):
+        key = private_key
+    else:
+        key_bytes = (
+            private_key.encode('utf-8') if isinstance(private_key, str) else private_key
+        )
+        key = serialization.load_pem_private_key(
+            key_bytes, password=None, backend=default_backend()
+        )
+
+    query = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
+    params = ['legacy_checkpoint', value]
+    next_seq, prev_hash = storage.get_chain_head()
+    payload = canonical_payload(
+        query, params, next_seq, prev_hash, storage.container_uid)
+    signature = key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+    storage.execute_signed(query, params, signature, cert_pem)
+    return checkpoint
+
+
 class MSFStorage:
     # Tables owned by the platform itself; writable only by admin identities.
     SYSTEM_TABLES = frozenset({

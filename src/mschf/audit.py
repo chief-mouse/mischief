@@ -18,10 +18,10 @@ Design notes (each of these prevents a class of false positives):
   exempt, but must all precede the first chained row. (Inherent limits:
   pure truncation of the ledger *tail* leaves an intact chain — detecting
   that needs an external record of the expected head — and rows *within* a
-  legacy prefix are not linked to each other, so deleting a legacy row whose
-  absence doesn't change replayed state, e.g. a signed read's audit row,
-  is not detectable; only the last legacy row is anchored by the first
-  chained row.)
+  legacy prefix are not linked to each other by the chain itself. When an
+  admin has committed a signed ``legacy_checkpoint`` (digest of the whole
+  prefix), scrubbing a legacy audit row is detectable; without one, only
+  the last legacy row is anchored by the first chained row.)
 - **Time is replayed, not re-evaluated**: the shadow connection overrides the
   ``datetime`` SQL function so ``datetime('now')`` — in query text, trigger
   bodies, and column defaults — returns the ledger row's own timestamp.
@@ -55,7 +55,7 @@ from datetime import datetime, timedelta
 
 from mschf.storage import (
     MSFStorage, GENESIS_PREV_HASH, PAYLOAD_FMT_V2, PAYLOAD_FMT_V3,
-    ledger_row_hash, payload_from_ledger_row,
+    ledger_row_hash, payload_from_ledger_row, legacy_prefix_digest,
 )
 
 # Tables never diffed: transactions is the replay input, source_code is
@@ -196,6 +196,9 @@ def replay_audit(storage):
             # Non-failing: trusted v2 rows from a stale writer amid v3 history
             # whose prev_hash matches the old (no-container) derivation.
             'version_skew': [],
+            # Legacy-prefix digest checkpoint (see create_legacy_checkpoint).
+            # Absent on pure-chained containers; mismatch fails the audit.
+            'legacy_checkpoint': {'status': 'none'},
         },
         'tables': {},
         'code': {},
@@ -363,12 +366,58 @@ def replay_audit(storage):
     for (code_id,) in live.execute("SELECT id FROM source_code"):
         report['code'][code_id] = storage.get_code_signature_status(code_id)
 
+    # Legacy-prefix checkpoint: when an admin signed a digest of the
+    # pre-chaining rows, recompute it over live rows with id <= upto_id.
+    # A scrubbed SELECT audit row (previously invisible to the hash chain)
+    # fails here. Rows with id > upto_id keep the normal legacy-after-chained
+    # / version-skew rules — the checkpoint only fences what it signed.
+    cp_raw = live.execute(
+        "SELECT value FROM manifest WHERE key = 'legacy_checkpoint'"
+    ).fetchone()
+    if cp_raw is None:
+        txr['legacy_checkpoint'] = {'status': 'none'}
+    else:
+        cp_value = cp_raw[0]
+        try:
+            expected = json.loads(cp_value)
+            upto_id = expected['upto_id']
+            exp_count = expected['count']
+            exp_digest = expected['digest']
+            act_count, _act_last, act_digest = legacy_prefix_digest(
+                storage, upto_id=upto_id)
+            if act_count == exp_count and act_digest == exp_digest:
+                txr['legacy_checkpoint'] = {
+                    'status': 'verified',
+                    'count': act_count,
+                }
+            else:
+                txr['legacy_checkpoint'] = {
+                    'status': 'mismatch',
+                    'expected': {
+                        'upto_id': upto_id,
+                        'count': exp_count,
+                        'digest': exp_digest,
+                    },
+                    'actual': {
+                        'count': act_count,
+                        'digest': act_digest,
+                    },
+                }
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as e:
+            txr['legacy_checkpoint'] = {
+                'status': 'mismatch',
+                'expected': cp_value,
+                'actual': f'unparseable: {e}',
+            }
+
     shadow_store.close()
+    cp_status = txr['legacy_checkpoint'].get('status')
     report['ok'] = (
         not txr['invalid_signatures']
         and not txr['untrusted_signers']
         and not txr['replay_anomalies']
         and not txr['chain_breaks']
+        and cp_status != 'mismatch'
         and all(t['status'] in ('match', 'skew') for t in report['tables'].values())
         and all(c['verified'] for c in report['code'].values())
     )
@@ -389,6 +438,14 @@ def format_report(report):
         lines.append(f"  [!!] CHAIN BREAK at txn #{item['id']}: {item['error']}")
     for item in txr.get('version_skew', []):
         lines.append(f"  [~] VERSION SKEW at txn #{item['id']}: {item['error']}")
+    cp = txr.get('legacy_checkpoint') or {}
+    if cp.get('status') == 'verified':
+        lines.append(f"  [OK] legacy checkpoint: {cp.get('count', 0)} rows verified")
+    elif cp.get('status') == 'mismatch':
+        lines.append(
+            f"  [!!] LEGACY CHECKPOINT MISMATCH expected={cp.get('expected')!r} "
+            f"actual={cp.get('actual')!r}"
+        )
     for item in txr['replay_anomalies']:
         lines.append(f"  [!] replay anomaly on txn #{item['id']}: {item.get('error')}")
     for table, result in report['tables'].items():
