@@ -13,6 +13,17 @@ entry here.
 
 ### Added
 
+- **Legacy-prefix checkpoint**: closes the documented gap where rows inside a
+  pre-chaining legacy prefix weren't linked to each other, so deleting a
+  state-neutral legacy audit row (e.g. a signed read) was undetectable.
+  `create_legacy_checkpoint` performs a signed manifest write committing to a
+  SHA-256 digest of the entire legacy prefix (`legacy_prefix_digest`), and
+  `replay_audit` recomputes and verifies it on every audit — a scrubbed or
+  altered legacy row now fails the audit with a checkpoint mismatch.
+  Idempotent (same digest → no-op), refuses containers with no legacy rows,
+  and containers without a checkpoint keep today's behavior. Implemented by
+  the grok agent; reviewed and independently re-tested by Claude.
+
 - **Version-skew downgrade policy**: `replay_audit` now distinguishes a
   benign stale-writer row from a malicious downgrade splice. A v2 row amid
   v3 history is classified as non-failing `version_skew` only when its

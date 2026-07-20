@@ -25,7 +25,9 @@ import os
 sys.path.insert(0, os.path.abspath('src'))
 
 import sqlite3
-from mschf.storage import MSFStorage, canonical_payload
+from mschf.storage import (
+    MSFStorage, canonical_payload, create_legacy_checkpoint, legacy_prefix_digest,
+)
 from mschf.audit import replay_audit, format_report
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert, default_backend, serialization
 from cryptography.hazmat.primitives import hashes
@@ -395,6 +397,161 @@ def run():
         print(f"  [OK] floor=4 blocks writer: {e}")
     db7.close()
     os.remove(db7_path)
+
+    # ------------------------------------------------------------------
+    # 12–16. Legacy-prefix checkpoint (closes scrubbing gap for seq IS NULL)
+    # ------------------------------------------------------------------
+    print("--- 12. Legacy checkpoint: create, verify, no-op re-run ---")
+    db8_path = 'test_ledger_audit_legacy_cp.msf'
+    if os.path.exists(db8_path):
+        os.remove(db8_path)
+    db8 = MSFStorage(db8_path)
+    db8.conn.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)")
+    db8.conn.commit()
+
+    admin_key_obj = serialization.load_pem_private_key(
+        admin_key, password=None, backend=default_backend())
+
+    def insert_v1_legacy(query, params, apply_sql=True, ts='2020-01-01 00:00:00'):
+        """Hand-craft a valid v1 (seq NULL) ledger row from the trusted cert."""
+        payload = canonical_payload(query, params)  # v1: no seq
+        sig = admin_key_obj.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+        if apply_sql:
+            db8._active_signer = db8._get_identity(admin_cert)
+            try:
+                if params:
+                    db8.conn.execute(query, params)
+                else:
+                    db8.conn.execute(query)
+            finally:
+                db8._active_signer = None
+        db8.conn.execute(
+            "INSERT INTO transactions "
+            "(query, params, signature, pub_key, timestamp, seq, prev_hash, payload_fmt) "
+            "VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)",
+            (query, _json.dumps(params), sig, admin_cert, ts),
+        )
+        db8.conn.commit()
+        return db8.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    # 3+ legacy rows including a SELECT audit row (scrub target).
+    insert_v1_legacy(
+        "INSERT INTO notes (body) VALUES (?)", ['legacy-a'], ts='2020-01-01 00:00:01')
+    insert_v1_legacy(
+        "INSERT INTO notes (body) VALUES (?)", ['legacy-b'], ts='2020-01-01 00:00:02')
+    select_id = insert_v1_legacy(
+        "SELECT id, body FROM notes", [], apply_sql=False, ts='2020-01-01 00:00:03')
+    insert_v1_legacy(
+        "INSERT INTO notes (body) VALUES (?)", ['legacy-c'], ts='2020-01-01 00:00:04')
+
+    legacy_n = db8.conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE seq IS NULL").fetchone()[0]
+    assert legacy_n >= 3, f"expected 3+ legacy rows, got {legacy_n}"
+
+    def signed8(query, params, bootstrap=False):
+        sig = make_signed_payload(db8, query, params, admin_key)
+        if bootstrap:
+            return db8.bootstrap_admin(query, params, sig, admin_cert)
+        return db8.execute_signed(query, params, sig, admin_cert)
+
+    # Chained v3 history after the legacy prefix.
+    signed8("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['entry_point', 'none'], bootstrap=True)
+    signed8("INSERT INTO notes (body) VALUES (?)", ['chained-1'])
+
+    count0, last0, dig0 = legacy_prefix_digest(db8)
+    assert count0 == legacy_n and last0 > 0 and len(dig0) == 64
+
+    cp = create_legacy_checkpoint(db8, admin_key, admin_cert)
+    assert cp['count'] == count0 and cp['digest'] == dig0
+    assert cp['upto_id'] == last0
+    report = replay_audit(db8)
+    print(format_report(report))
+    assert report['ok'], "checkpointed container must audit clean"
+    assert report['transactions']['legacy_checkpoint']['status'] == 'verified'
+    assert report['transactions']['legacy_checkpoint']['count'] == count0
+    print(f"  [OK] create_legacy_checkpoint → audit verified ({count0} rows)")
+
+    print("--- 13. Idempotent re-run is a no-op ---")
+    n_before = db8.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    cp2 = create_legacy_checkpoint(db8, admin_key, admin_cert)
+    n_after = db8.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    assert n_before == n_after, "identical-state re-run must not append a ledger row"
+    assert cp2['digest'] == dig0
+    print(f"  [OK] re-run no-op (txn count still {n_after})")
+
+    print("--- 14. Scrubbing a legacy SELECT audit row fails the checkpoint ---")
+    # Capture the row so we can restore it with identical values (incl. id).
+    select_row = db8.conn.execute(
+        "SELECT id, query, params, signature, pub_key, timestamp, seq, prev_hash, payload_fmt "
+        "FROM transactions WHERE id = ?", (select_id,)
+    ).fetchone()
+    assert select_row is not None and select_row[0] == select_id
+    raw8 = sqlite3.connect(db8_path)
+    raw8.execute("DELETE FROM transactions WHERE id = ?", (select_id,))
+    raw8.commit()
+    raw8.close()
+
+    report = replay_audit(db8)
+    print(format_report(report))
+    assert not report['ok'], "scrubbed legacy SELECT must fail audit"
+    cp_rep = report['transactions']['legacy_checkpoint']
+    assert cp_rep['status'] == 'mismatch', cp_rep
+    print(f"  [OK] deleted legacy SELECT → legacy_checkpoint mismatch")
+
+    print("--- 15. Restore identical row → audit passes again ---")
+    raw8 = sqlite3.connect(db8_path)
+    raw8.execute(
+        "INSERT INTO transactions "
+        "(id, query, params, signature, pub_key, timestamp, seq, prev_hash, payload_fmt) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        select_row,
+    )
+    raw8.commit()
+    raw8.close()
+
+    report = replay_audit(db8)
+    print(format_report(report))
+    assert report['ok'], "restored identical legacy row must pass"
+    assert report['transactions']['legacy_checkpoint']['status'] == 'verified'
+    print(f"  [OK] content-based restore (same id/fields) re-verifies")
+    db8.close()
+    os.remove(db8_path)
+
+    print("--- 16. No legacy rows → refuse checkpoint; audit status none ---")
+    db9_path = 'test_ledger_audit_no_legacy.msf'
+    if os.path.exists(db9_path):
+        os.remove(db9_path)
+    db9 = MSFStorage(db9_path)
+    db9.conn.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)")
+    db9.conn.commit()
+
+    def signed9(query, params, bootstrap=False):
+        sig = make_signed_payload(db9, query, params, admin_key)
+        if bootstrap:
+            return db9.bootstrap_admin(query, params, sig, admin_cert)
+        return db9.execute_signed(query, params, sig, admin_cert)
+
+    signed9("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['entry_point', 'none'], bootstrap=True)
+    signed9("INSERT INTO notes (body) VALUES (?)", ['pure-v3'])
+
+    try:
+        create_legacy_checkpoint(db9, admin_key, admin_cert)
+        raise AssertionError("create_legacy_checkpoint must refuse empty legacy prefix")
+    except ValueError as e:
+        assert 'legacy' in str(e).lower() or 'no legacy' in str(e).lower(), e
+        print(f"  [OK] refused: {e}")
+
+    report = replay_audit(db9)
+    print(format_report(report))
+    assert report['ok'], "pure-v3 container without checkpoint must still pass"
+    assert report['transactions']['legacy_checkpoint']['status'] == 'none'
+    print(f"  [OK] audit status=none, ok=True")
+    db9.close()
+    os.remove(db9_path)
 
     print("\n==========================================")
     print("ALL LEDGER AUDIT TESTS PASSED")
