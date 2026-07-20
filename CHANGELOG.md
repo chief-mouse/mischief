@@ -13,6 +13,30 @@ entry here.
 
 ### Added
 
+- **Hub-and-spoke ledger sync (v1)**: multi-machine collaboration on a shared
+  `.msf`. `src/mschf/hub.py` is a small stdlib HTTP server (`python -m
+  mschf.hub`) holding the authoritative containers — trusted for ordering and
+  availability only, never integrity: every submission runs through
+  `execute_signed` (signature, chain position, CA trust, RBAC, authorizer),
+  stale-head submissions return 409 with the fresh head, and every head
+  response carries a hub-countersigned **attestation** — the external head
+  record that makes ledger tail truncation detectable. `src/mschf/sync.py` is
+  the spoke client: verified head fetch (attestation must chain to the trust
+  store and match the pinned CN from the container's `sync_hub_url` /
+  `sync_hub_cn` manifest homing keys), sign-against-hub-head submit with
+  retry, bootstrap by downloading the container and refusing it unless
+  `replay_audit` passes, and replay-apply that re-verifies each row's
+  signature and chain linkage, executes with the historical signer so
+  attribution triggers stamp correctly, and refuses hub heads that regress
+  the sidecar-recorded attestation. Covered by `test_hub_sync.py` (bootstrap,
+  write-through attribution, multi-spoke convergence, stale-head retry,
+  bad-signature/untrusted-CA rejection, attestation checks, timestamp
+  fidelity). Known v1 limits: replicas do not re-enforce RBAC on replayed
+  rows (hub-side enforcement; tracked as follow-up), and the post-pull
+  `datetime()` shim handles one-argument forms only. Implemented by the grok
+  agent from a written spec; reviewed, independently re-tested, and
+  integrated by Claude.
+
 - **Dev-tracker CLI identity selection**: `dev_tracker.py` can now sign as any
   host identity — `--identity <cn>` (global flag) or `MSCHF_TRACKER_IDENTITY`,
   defaulting to `admin`; key passphrase from `MSCHF_TRACKER_PASSPHRASE` →
