@@ -214,3 +214,309 @@ jobs:
         with:
           files: dist/*.deb
           generate_release_notes: true
+
+  # Packaged-app smoke: install the .deb, launch under Xvfb, assert first-run
+  # artifacts land under MSCHF_HOME (packaged-paths fix), screenshot. New +
+  # environment-sensitive; signal, not release-blocking — tighten once stable.
+  smoke-linux:
+    name: Smoke install+launch (Linux)
+    needs: package-linux
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Download .deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mischief-deb
+
+      - name: Install package + smoke tools, launch, assert, screenshot
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "=== artifact layout ==="
+          find . -type f -print
+
+          DEB=$(find . -name '*.deb' -type f | head -n 1)
+          if [ -z "$DEB" ]; then
+            echo "ERROR: no .deb found in downloaded artifact"
+            exit 1
+          fi
+          echo "Found deb: $DEB"
+          # apt needs a path with a slash for local packages
+          case "$DEB" in
+            /*|./*) ;;
+            *) DEB="./$DEB" ;;
+          esac
+
+          sudo apt-get update
+          # Dependency resolution succeeding is itself part of the test.
+          sudo apt-get install -y "$DEB"
+
+          PKG_NAME=$(dpkg-deb -f "$DEB" Package)
+          echo "Installed package: $PKG_NAME"
+          echo "=== dpkg -L $PKG_NAME ==="
+          dpkg -L "$PKG_NAME"
+
+          # Discover launch binary: prefer /usr/bin/*, else any */bin/* executable.
+          # Do not hardcode a guessed name.
+          BIN=""
+          while IFS= read -r path; do
+            if [ -f "$path" ] && [ -x "$path" ]; then
+              case "$path" in
+                /usr/bin/*)
+                  BIN="$path"
+                  break
+                  ;;
+              esac
+            fi
+          done < <(dpkg -L "$PKG_NAME")
+
+          if [ -z "$BIN" ]; then
+            while IFS= read -r path; do
+              if [ -f "$path" ] && [ -x "$path" ]; then
+                case "$path" in
+                  */bin/*)
+                    BIN="$path"
+                    break
+                    ;;
+                esac
+              fi
+            done < <(dpkg -L "$PKG_NAME")
+          fi
+
+          if [ -z "$BIN" ]; then
+            echo "ERROR: could not discover launch binary under /usr/bin or */bin for package $PKG_NAME"
+            dpkg -L "$PKG_NAME"
+            exit 1
+          fi
+          echo "Discovered launch binary: $BIN"
+
+          sudo apt-get install -y xvfb imagemagick x11-utils
+
+          export MSCHF_HOME="${RUNNER_TEMP}/mschf-home"
+          mkdir -p "$MSCHF_HOME"
+          echo "MSCHF_HOME=$MSCHF_HOME"
+
+          Xvfb :99 -screen 0 1400x900x24 &
+          XVFB_PID=$!
+          export DISPLAY=:99
+          # Give Xvfb a moment to bind the display
+          sleep 2
+
+          LOG_FILE="${GITHUB_WORKSPACE}/smoke-linux.log"
+          SCREENSHOT="${GITHUB_WORKSPACE}/smoke-linux.png"
+          : > "$LOG_FILE"
+
+          "$BIN" >"$LOG_FILE" 2>&1 &
+          APP_PID=$!
+          echo "Launched PID=$APP_PID"
+          sleep 25
+
+          # --- assertions ---
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            echo "ERROR: app process (PID $APP_PID) is not alive after settle"
+            echo "=== smoke-linux.log ==="
+            cat "$LOG_FILE" || true
+            echo "=== MSCHF_HOME ==="
+            ls -la "$MSCHF_HOME" || true
+            kill "$XVFB_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "App process still alive (PID $APP_PID)"
+
+          MISSING=""
+          for f in ca.crt admin.crt settings.toml; do
+            if [ ! -f "$MSCHF_HOME/$f" ]; then
+              MISSING="$MISSING $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: first-run artifacts missing under MSCHF_HOME=$MSCHF_HOME:$MISSING"
+            echo "(expected ca.crt, admin.crt, settings.toml via mschf.paths.host_root())"
+            echo "=== MSCHF_HOME listing ==="
+            ls -la "$MSCHF_HOME" || true
+            echo "=== smoke-linux.log ==="
+            cat "$LOG_FILE" || true
+            kill "$APP_PID" 2>/dev/null || true
+            kill "$XVFB_PID" 2>/dev/null || true
+            exit 1
+          fi
+          echo "First-run artifacts present under $MSCHF_HOME:"
+          ls -la "$MSCHF_HOME"
+
+          # Screenshot of the Xvfb root window
+          if ! import -display :99 -window root "$SCREENSHOT"; then
+            echo "import failed; trying xwd | convert fallback"
+            xwd -display :99 -root -out "${RUNNER_TEMP}/root.xwd"
+            convert "${RUNNER_TEMP}/root.xwd" "$SCREENSHOT"
+          fi
+          ls -la "$SCREENSHOT"
+
+          # Terminate app + Xvfb
+          kill "$APP_PID" 2>/dev/null || true
+          wait "$APP_PID" 2>/dev/null || true
+          kill "$XVFB_PID" 2>/dev/null || true
+          echo "Smoke Linux completed"
+
+      - name: Upload smoke screenshot + log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-linux-screenshot
+          path: |
+            smoke-linux.png
+            smoke-linux.log
+          if-no-files-found: error
+
+  # Packaged-app smoke: attach DMG, launch Cocoa binary, assert first-run
+  # artifacts under MSCHF_HOME, screenshot. New + environment-sensitive;
+  # signal, not release-blocking — tighten once stable.
+  smoke-macos:
+    name: Smoke install+launch (macOS)
+    needs: package-macos
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mischief-dmg
+
+      - name: Attach DMG, launch, assert, screenshot
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "=== artifact layout ==="
+          find . -type f -print
+
+          DMG=$(find . -name '*.dmg' -type f | head -n 1)
+          if [ -z "$DMG" ]; then
+            echo "ERROR: no .dmg found in downloaded artifact"
+            exit 1
+          fi
+          echo "Found dmg: $DMG"
+
+          ATTACH_OUT=$(hdiutil attach -nobrowse "$DMG")
+          echo "=== hdiutil attach ==="
+          echo "$ATTACH_OUT"
+          # Mount point is a /Volumes/... path in the attach output — do not
+          # hardcode the volume name.
+          MOUNT=$(echo "$ATTACH_OUT" | grep -oE '/Volumes/[^[:space:]]+' | tail -n 1)
+          if [ -z "$MOUNT" ] || [ ! -d "$MOUNT" ]; then
+            echo "ERROR: could not determine DMG mount point from hdiutil output"
+            exit 1
+          fi
+          echo "Mount point: $MOUNT"
+          echo "=== volume listing ==="
+          ls -la "$MOUNT"
+
+          APP_NAME=$(ls -1 "$MOUNT" | grep '\.app$' | head -n 1)
+          if [ -z "$APP_NAME" ]; then
+            echo "ERROR: no .app found on volume $MOUNT"
+            ls -la "$MOUNT"
+            hdiutil detach "$MOUNT" || true
+            exit 1
+          fi
+          echo "Discovered app bundle: $APP_NAME"
+
+          DEST="${RUNNER_TEMP}/MischiefApps"
+          mkdir -p "$DEST"
+          cp -R "$MOUNT/$APP_NAME" "$DEST/"
+          APP_LOCAL="$DEST/$APP_NAME"
+          echo "Copied app to: $APP_LOCAL"
+
+          # Ad-hoc signed — clear quarantine so the binary can launch on the runner.
+          xattr -dr com.apple.quarantine "$APP_LOCAL" || true
+
+          BIN_DIR="$APP_LOCAL/Contents/MacOS"
+          if [ ! -d "$BIN_DIR" ]; then
+            echo "ERROR: missing Contents/MacOS in $APP_LOCAL"
+            ls -laR "$APP_LOCAL" || true
+            hdiutil detach "$MOUNT" || true
+            exit 1
+          fi
+          echo "=== Contents/MacOS ==="
+          ls -la "$BIN_DIR"
+
+          BIN=""
+          for f in "$BIN_DIR"/*; do
+            if [ -f "$f" ] && [ -x "$f" ]; then
+              BIN="$f"
+              break
+            fi
+          done
+          if [ -z "$BIN" ]; then
+            echo "ERROR: no executable found in $BIN_DIR"
+            ls -la "$BIN_DIR"
+            hdiutil detach "$MOUNT" || true
+            exit 1
+          fi
+          echo "Discovered launch binary: $BIN"
+
+          export MSCHF_HOME="${RUNNER_TEMP}/mschf-home"
+          mkdir -p "$MSCHF_HOME"
+          echo "MSCHF_HOME=$MSCHF_HOME"
+
+          LOG_FILE="${GITHUB_WORKSPACE}/smoke-macos.log"
+          SCREENSHOT="${GITHUB_WORKSPACE}/smoke-macos.png"
+          : > "$LOG_FILE"
+
+          # Launch the binary directly (not `open`) so we own the process + env.
+          "$BIN" >"$LOG_FILE" 2>&1 &
+          APP_PID=$!
+          echo "Launched PID=$APP_PID"
+          sleep 25
+
+          # --- assertions ---
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            echo "ERROR: app process (PID $APP_PID) is not alive after settle"
+            echo "=== smoke-macos.log ==="
+            cat "$LOG_FILE" || true
+            echo "=== MSCHF_HOME ==="
+            ls -la "$MSCHF_HOME" || true
+            hdiutil detach "$MOUNT" || true
+            exit 1
+          fi
+          echo "App process still alive (PID $APP_PID)"
+
+          MISSING=""
+          for f in ca.crt admin.crt settings.toml; do
+            if [ ! -f "$MSCHF_HOME/$f" ]; then
+              MISSING="$MISSING $f"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: first-run artifacts missing under MSCHF_HOME=$MSCHF_HOME:$MISSING"
+            echo "(expected ca.crt, admin.crt, settings.toml via mschf.paths.host_root())"
+            echo "=== MSCHF_HOME listing ==="
+            ls -la "$MSCHF_HOME" || true
+            echo "=== smoke-macos.log ==="
+            cat "$LOG_FILE" || true
+            kill "$APP_PID" 2>/dev/null || true
+            hdiutil detach "$MOUNT" || true
+            exit 1
+          fi
+          echo "First-run artifacts present under $MSCHF_HOME:"
+          ls -la "$MSCHF_HOME"
+
+          screencapture -x "$SCREENSHOT"
+          ls -la "$SCREENSHOT"
+
+          kill "$APP_PID" 2>/dev/null || true
+          wait "$APP_PID" 2>/dev/null || true
+          hdiutil detach "$MOUNT" || true
+          echo "Smoke macOS completed"
+
+      - name: Upload smoke screenshot + log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-macos-screenshot
+          path: |
+            smoke-macos.png
+            smoke-macos.log
+          if-no-files-found: error

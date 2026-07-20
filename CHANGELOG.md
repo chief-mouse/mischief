@@ -11,6 +11,21 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **Packaged-app smoke tests on CI**: after packaging, `smoke-linux` installs
+  the freshly built `.deb` on the noble runner (dependency resolution is part
+  of the test) and `smoke-macos` mounts the DMG and launches the copied
+  `.app` (quarantine-stripped) — each starting the real GUI with `MSCHF_HOME`
+  isolated, asserting the process survives startup and that first-run
+  artifacts (`ca.crt`, `admin.crt`, `settings.toml`) are generated in the
+  per-user root (live verification of the packaged-paths fix), then
+  uploading a screenshot + app log artifact — the first-ever renders of the
+  app on GTK and Cocoa. Binary/app names are discovered from the package
+  contents, never hardcoded; jobs are `continue-on-error` while they
+  stabilize. Implemented by the grok agent; reviewed and runner-verified by
+  Claude.
+
 ## [0.6.1] - 2026-07-20
 
 The packaging release: installers for all three desktop platforms (Windows
