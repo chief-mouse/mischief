@@ -11,7 +11,8 @@ The Mischief platform operates on a **zero-trust model** for database modificati
 2. **Identity Extraction:** Identities are bound to X.509 Certificates or RSA Public Keys. When a transaction is submitted, the platform extracts a stable identifier:
     *   **Certificates:** Extracts the Common Name (e.g., `cert:CN=system_admin`).
     *   **Raw Public Keys:** Falls back to a stable SHA-256 fingerprint (e.g., `key:8e1fa92b`).
-3. **Auditable Ledger:** Every executed write operation is cryptographically logged to the `transactions` table, preserving the query, serialized parameters, the signature, and the signer's public key.
+3. **Auditable Ledger:** Every executed operation is cryptographically logged to the `transactions` table, preserving the query, serialized parameters, the signature, and the signer's public key.
+4. **Hash-Chained History:** Each signed payload embeds a sequence number (`seq`) and the hash of the previous ledger row (`prev_hash`), obtained from `MSFStorage.get_chain_head()` immediately before signing. A signature therefore commits to one exact position in one exact history: ledger rows cannot be dropped, reordered, or spliced between containers without breaking replay verification (`mschf.audit.replay_audit` reports these as chain breaks). Rows signed before chaining existed (NULL `seq`) still verify under the legacy payload format, and the chain anchors onto the last legacy row. One inherent limit: truncating the *tail* of the ledger leaves an intact chain, so detecting that requires an out-of-band record of the expected head.
 
 ### 1.1 Root Certificate Authority vs. User Certificates
 
@@ -24,7 +25,7 @@ The cryptographic hierarchy strictly separates the **Trust Anchor** from the **U
 
 ## 2. Bootstrapping a New MSF Container
 
-Mischief uses a **Trust on First Use (TOFU)** bootstrapping mechanism. When an MSF file is initialized, the `user_roles` table is empty. The identity that signs the **very first transaction** is automatically assigned the `admin` role.
+Mischief uses a **Trust on First Use (TOFU)** bootstrapping mechanism. When an MSF file is initialized, the `user_roles` table is empty. The identity that signs the **very first transaction** is assigned the `admin` role — but only through the deliberate `bootstrap_admin()` authoring call. Ordinary `execute_signed` never bootstraps, so merely opening or running someone else's `.msf` can never make you its admin.
 
 ### Step-by-Step Bootstrap Procedure
 
@@ -47,9 +48,7 @@ with open('admin.key', 'wb') as f:
 Initialize the storage engine and assign the first manifest element (typically the `entry_point` variable) to bootstrap your admin privilege.
 
 ```python
-import json
-import base64
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
@@ -62,12 +61,12 @@ db = MSFStorage('my_app.msf')
 query = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
 params = ['entry_point', 'main_view']
 
-# 3. Create a stable JSON payload to sign
-payload_dict = {
-    "query": query, 
-    "params": ["entry_point", "main_view"]
-}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+# 3. Build the canonical payload against the container's current chain head.
+#    canonical_payload() is the single source of truth for what gets signed;
+#    get_chain_head() must be called immediately before signing, because every
+#    signed transaction (reads included) advances the head.
+next_seq, prev_hash = db.get_chain_head()
+payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
 
 # 4. Sign the payload using your Admin Private Key
 private_key = serialization.load_pem_private_key(admin_key, password=None, backend=default_backend())
@@ -77,8 +76,10 @@ signature = private_key.sign(
     hashes.SHA256()
 )
 
-# 5. Execute transaction to bootstrap 'admin' role
-db.set_manifest_item('entry_point', 'main_view', signature, admin_cert)
+# 5. Execute the first write through the deliberate opt-in bootstrap path —
+#    this is the ONLY entry point that claims the 'admin' role for the first
+#    writer (plain execute_signed never bootstraps).
+db.bootstrap_admin(query, params, signature, admin_cert)
 print("✓ Database initialized. Your identity is now registered as root admin.")
 ```
 
@@ -103,9 +104,9 @@ support_identity = db._get_identity(support_cert)
 query = "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)"
 params = [support_identity, 'support']
 
-# Sign using Admin Private Key
-payload_dict = {"query": query, "params": params}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+# Sign against the current chain head using the Admin Private Key
+next_seq, prev_hash = db.get_chain_head()
+payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
 signature = private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
 # Commit the assignment
@@ -124,11 +125,11 @@ The administrator defines permission rules at four granular levels. Rules map a 
 def add_rule(level, target, role, permission):
     query = "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)"
     params = [level, target, role, permission]
-    
-    payload_dict = {"query": query, "params": params}
-    payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+
+    next_seq, prev_hash = db.get_chain_head()
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
     sig = private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
-    
+
     db.add_rbac_rule(level, target, role, permission, sig, admin_cert)
 ```
 
@@ -207,13 +208,13 @@ def my_custom_app(toga, host_api):
 # Serialize code
 pickled_bytes = dill.dumps(my_custom_app)
 
-# Prepare query
+# Prepare query — pass the raw dill bytes; canonical_payload base64-encodes
+# bytes params itself so the signed JSON is deterministic
 query = "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)"
-# dill bytes must be encoded to base64 for signed transaction logging
-params = ['main_app', base64.b64encode(pickled_bytes).decode('utf-8')]
+params = ['main_app', pickled_bytes]
 
-payload_dict = {"query": query, "params": params}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+next_seq, prev_hash = db.get_chain_head()
+payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
 sig = private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
 # Deploy to container

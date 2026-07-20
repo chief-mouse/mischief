@@ -11,6 +11,13 @@ Design notes (each of these prevents a class of false positives):
 - **Signatures first**: every ledger row is re-verified (payload signature +
   signer chains to the trusted CA) before use; tampered ledger rows are
   reported and still replayed (they *were* executed historically).
+- **The chain is verified alongside the signatures**: chained rows embed
+  ``seq`` and ``prev_hash`` in their signed payload, so dropped, reordered,
+  or spliced ledger rows surface as ``chain_breaks`` even though each row's
+  own signature still verifies. Legacy pre-chaining rows (NULL ``seq``) are
+  exempt, but must all precede the first chained row. (Inherent limit: pure
+  truncation of the ledger *tail* leaves an intact chain — detecting that
+  needs an external record of the expected head.)
 - **Time is replayed, not re-evaluated**: the shadow connection overrides the
   ``datetime`` SQL function so ``datetime('now')`` — in query text, trigger
   bodies, and column defaults — returns the ledger row's own timestamp.
@@ -42,7 +49,9 @@ import json
 import re
 from datetime import datetime, timedelta
 
-from mschf.storage import MSFStorage
+from mschf.storage import (
+    MSFStorage, GENESIS_PREV_HASH, canonical_payload, ledger_row_hash,
+)
 
 # Tables never diffed: transactions is the replay input, source_code is
 # verified via signatures (see module docstring), sqlite_sequence is engine
@@ -162,7 +171,8 @@ def replay_audit(storage):
     shadow.commit()
 
     ledger = live.execute(
-        "SELECT id, query, params, signature, pub_key, timestamp FROM transactions ORDER BY id"
+        "SELECT id, query, params, signature, pub_key, timestamp, seq, prev_hash "
+        "FROM transactions ORDER BY id"
     ).fetchall()
 
     report = {
@@ -170,21 +180,49 @@ def replay_audit(storage):
         'transactions': {
             'total': len(ledger), 'replayed': 0, 'skipped_reads': 0,
             'invalid_signatures': [], 'untrusted_signers': [], 'replay_anomalies': [],
+            'chain_breaks': [],
         },
         'tables': {},
         'code': {},
     }
     txr = report['transactions']
 
+    # Hash-chain state: every row (legacy or chained) advances running_hash;
+    # chained rows must link to it and carry consecutive seq values.
+    chained_seen = False
+    expected_seq = 1
+    running_hash = GENESIS_PREV_HASH
+
     bootstrapped = False
-    for txn_id, query, params_str, signature, pub_key, ts in ledger:
+    for txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash in ledger:
         try:
             params = json.loads(params_str) if params_str else []
         except json.JSONDecodeError:
             params = []
             txr['replay_anomalies'].append({'id': txn_id, 'error': 'unparseable params JSON'})
 
-        payload = json.dumps({'query': query, 'params': params}, sort_keys=True).encode('utf-8')
+        if seq is None:
+            payload = canonical_payload(query, params)
+            if chained_seen:
+                txr['chain_breaks'].append({
+                    'id': txn_id,
+                    'error': 'unchained legacy row after chained history (spliced or downgraded)'})
+        else:
+            payload = canonical_payload(query, params, seq, prev_hash)
+            if seq != expected_seq:
+                txr['chain_breaks'].append({
+                    'id': txn_id,
+                    'error': f'seq {seq} where {expected_seq} was expected '
+                             '(row dropped, injected, or reordered)'})
+                expected_seq = seq  # resync so one gap doesn't cascade
+            if prev_hash != running_hash:
+                txr['chain_breaks'].append({
+                    'id': txn_id,
+                    'error': 'prev_hash does not match the preceding row (chain broken)'})
+            chained_seen = True
+            expected_seq += 1
+        running_hash = ledger_row_hash(payload, signature)
+
         if not storage.verify_signature(payload, signature, pub_key):
             txr['invalid_signatures'].append({'id': txn_id, 'query': query[:120]})
         elif not storage._signer_is_ca_trusted(pub_key):
@@ -219,9 +257,9 @@ def replay_audit(storage):
         # Progressive ledger copy: statements later in the ledger that READ
         # the transactions table see exactly what they saw historically.
         shadow.execute(
-            "INSERT INTO transactions (id, query, params, signature, pub_key, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (txn_id, query, params_str, signature, pub_key, ts))
+            "INSERT INTO transactions (id, query, params, signature, pub_key, timestamp, seq, prev_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash))
     shadow.commit()
 
     # Diff every user + ledger-driven system table present on either side.
@@ -242,6 +280,7 @@ def replay_audit(storage):
         not txr['invalid_signatures']
         and not txr['untrusted_signers']
         and not txr['replay_anomalies']
+        and not txr['chain_breaks']
         and all(t['status'] in ('match', 'skew') for t in report['tables'].values())
         and all(c['verified'] for c in report['code'].values())
     )
@@ -258,6 +297,8 @@ def format_report(report):
         lines.append(f"  [!!] INVALID SIGNATURE on txn #{item['id']}: {item['query']}")
     for item in txr['untrusted_signers']:
         lines.append(f"  [!!] UNTRUSTED SIGNER on txn #{item['id']}: {item['query']}")
+    for item in txr['chain_breaks']:
+        lines.append(f"  [!!] CHAIN BREAK at txn #{item['id']}: {item['error']}")
     for item in txr['replay_anomalies']:
         lines.append(f"  [!] replay anomaly on txn #{item['id']}: {item.get('error')}")
     for table, result in report['tables'].items():

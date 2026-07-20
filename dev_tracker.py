@@ -17,13 +17,11 @@ Usage:
 """
 import sys
 import os
-import json
-import base64
 
 PROJ_DIR = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(PROJ_DIR, 'src'))
 
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 
 DB_PATH = os.path.join(PROJ_DIR, 'dev_tracker.msf')
 ADMIN_CERT_PATH = os.path.join(PROJ_DIR, 'admin.crt')
@@ -57,16 +55,6 @@ SEED_TASKS = [
 ]
 
 
-def _make_json_serializable(obj):
-    if isinstance(obj, bytes):
-        return base64.b64encode(obj).decode('utf-8')
-    elif isinstance(obj, (list, tuple)):
-        return [_make_json_serializable(i) for i in obj]
-    elif isinstance(obj, dict):
-        return {k: _make_json_serializable(v) for k, v in obj.items()}
-    return obj
-
-
 def load_admin_identity():
     """Load the host admin cert and unlock its passphrase-encrypted private key."""
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -84,16 +72,17 @@ def load_admin_identity():
     return cert_pem, private_key
 
 
-def sign_payload(private_key, query, params):
+def sign_payload(db, private_key, query, params):
+    """Sign against db's current chain head (must execute before the head moves)."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
-    payload_dict = {"query": query, "params": _make_json_serializable(params)}
-    payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+    next_seq, prev_hash = db.get_chain_head()
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
     return private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
 
 def signed_exec(db, cert_pem, private_key, query, params, bootstrap=False):
-    signature = sign_payload(private_key, query, params)
+    signature = sign_payload(db, private_key, query, params)
     if bootstrap:
         return db.bootstrap_admin(query, params, signature, cert_pem)
     return db.execute_signed(query, params, signature, cert_pem)
@@ -380,7 +369,7 @@ def cmd_init():
     # First signed write deliberately claims admin for cert:CN=admin (opt-in
     # bootstrap). Everything after — including trigger DDL — is a signed,
     # ledgered transaction so a replay audit can reconstruct history exactly.
-    sig = sign_payload(private_key, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main_app'])
+    sig = sign_payload(db, private_key, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main_app'])
     db.bootstrap_admin("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main_app'], sig, cert_pem)
 
     # Audit triggers via SIGNED DDL, before any task rows exist: replay sees
@@ -394,11 +383,11 @@ def cmd_init():
 
     # Micro-app code, signed like any other transaction.
     pickled = dill.dumps(dev_tracker_app)
-    sig = sign_payload(private_key, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", ['main_app', pickled])
+    sig = sign_payload(db, private_key, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", ['main_app', pickled])
     db.store_code('main_app', dev_tracker_app, sig, cert_pem)
     for key, value in (('name', 'Mischief Dev Tracker'), ('version', '1.0'),
                        ('description', 'Dogfood tracker for the mschf hardening backlog.')):
-        sig = sign_payload(private_key, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", [key, value])
+        sig = sign_payload(db, private_key, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", [key, value])
         db.set_manifest_item(key, value, sig, cert_pem)
 
     db.close()
@@ -497,7 +486,7 @@ def cmd_update_app():
     db, cert_pem, private_key = _open_for_cli()
     _ensure_schema(db, cert_pem, private_key)
     pickled = __import__('dill').dumps(dev_tracker_app)
-    sig = sign_payload(private_key, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", ['main_app', pickled])
+    sig = sign_payload(db, private_key, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", ['main_app', pickled])
     db.store_code('main_app', dev_tracker_app, sig, cert_pem)
     status = db.get_code_signature_status('main_app')
     db.close()

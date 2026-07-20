@@ -9,17 +9,19 @@ sqlite3 client would, and asserts every class of tampering is flagged:
   2. injected row    (raw INSERT)         -> unexplained_rows
   3. deleted row     (raw DELETE)         -> missing_rows
   4. edited ledger   (raw UPDATE on transactions.query) -> invalid signature
-  5. trigger shield  (raw DML on a trigger-guarded table fails outright:
+  5. dropped ledger row (raw DELETE on transactions)    -> chain break
+                      (each signed payload embeds seq + prev-row hash, so
+                      removing or reordering rows breaks the hash chain even
+                      though every remaining row's own signature verifies)
+  6. trigger shield  (raw DML on a trigger-guarded table fails outright:
                       current_signer() doesn't exist outside the host)
 """
 import sys
 import os
 sys.path.insert(0, os.path.abspath('src'))
 
-import json
-import base64
 import sqlite3
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 from mschf.audit import replay_audit, format_report
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert, default_backend, serialization
 from cryptography.hazmat.primitives import hashes
@@ -28,16 +30,9 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from dev_tracker import AUDIT_TRIGGERS  # canonical trigger pattern
 
 
-def make_signed_payload(query, params, pem_key_bytes):
-    def _mjs(obj):
-        if isinstance(obj, bytes):
-            return base64.b64encode(obj).decode('utf-8')
-        elif isinstance(obj, (list, tuple)):
-            return [_mjs(i) for i in obj]
-        elif isinstance(obj, dict):
-            return {k: _mjs(v) for k, v in obj.items()}
-        return obj
-    payload_bytes = json.dumps({"query": query, "params": _mjs(params)}, sort_keys=True).encode('utf-8')
+def make_signed_payload(db, query, params, pem_key_bytes):
+    next_seq, prev_hash = db.get_chain_head()
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
     key = serialization.load_pem_private_key(pem_key_bytes, password=None, backend=default_backend())
     return key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
@@ -63,7 +58,7 @@ def run():
     db = MSFStorage(db_path)
 
     def signed(query, params, bootstrap=False):
-        sig = make_signed_payload(query, params, admin_key)
+        sig = make_signed_payload(db, query, params, admin_key)
         if bootstrap:
             return db.bootstrap_admin(query, params, sig, admin_cert)
         return db.execute_signed(query, params, sig, admin_cert)
@@ -124,7 +119,21 @@ def run():
     assert report['transactions']['invalid_signatures'], "edited ledger row must fail verification"
     print(f"  [OK] invalid signature flagged: txn #{report['transactions']['invalid_signatures'][0]['id']}")
 
-    print("--- 6. Trigger shield: raw DML on guarded tables fails outright ---")
+    print("--- 6. Dropped ledger row breaks the hash chain ---")
+    # Delete a mid-chain row: every remaining signature still verifies, but the
+    # seq gap and prev_hash mismatch expose the removal.
+    victim = raw.execute(
+        "SELECT id FROM transactions WHERE seq IS NOT NULL "
+        "ORDER BY seq LIMIT 1 OFFSET 3").fetchone()[0]
+    raw.execute("DELETE FROM transactions WHERE id = ?", (victim,))
+    raw.commit()
+    report = replay_audit(db)
+    breaks = report['transactions']['chain_breaks']
+    assert any('seq' in b['error'] for b in breaks), f"expected a seq-gap chain break, got {breaks}"
+    assert not report['ok']
+    print(f"  [OK] dropped row flagged as chain break: {breaks[0]['error']}")
+
+    print("--- 7. Trigger shield: raw DML on guarded tables fails outright ---")
     try:
         raw.execute("INSERT INTO dev_tasks (title) VALUES ('sneaky')")
         raise AssertionError("raw insert into trigger-guarded table should fail")

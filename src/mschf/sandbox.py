@@ -76,24 +76,16 @@ class HostAPI:
         with open(self.key_path, 'rb') as f:
             pem_key = f.read()
             
-        import json
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
         from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        import base64
-        
-        def _make_json_serializable(obj):
-            if isinstance(obj, bytes):
-                return base64.b64encode(obj).decode('utf-8')
-            elif isinstance(obj, (list, tuple)):
-                return [_make_json_serializable(i) for i in obj]
-            elif isinstance(obj, dict):
-                return {k: _make_json_serializable(v) for k, v in obj.items()}
-            return obj
+        from mschf.storage import canonical_payload
 
         params = params or []
-        payload_dict = {"query": query, "params": _make_json_serializable(params)}
-        payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+        # Sign against the current chain head so this transaction commits to
+        # its exact position in the ledger's hash chain.
+        next_seq, prev_hash = self.db.get_chain_head()
+        payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
 
         password = self.key_passphrase.encode('utf-8') if self.key_passphrase else None
         try:

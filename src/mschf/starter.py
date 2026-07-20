@@ -12,13 +12,11 @@ functions by reference, but a function born outside any importable module is
 pickled BY VALUE — so the container carries its own code, like any micro-app
 authored elsewhere.
 """
-import json
-import base64
 import os
 
 import dill
 
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 
 STARTER_SOURCE = '''
 def starter_app(toga, host_api):
@@ -138,23 +136,17 @@ def create_starter_container(dest_path, identity, ca_cert_path):
     private_key = load_pem_private_key(key_pem, password=password)
     cert_pem = identity.cert_pem
 
-    def _mjs(obj):
-        if isinstance(obj, bytes):
-            return base64.b64encode(obj).decode('utf-8')
-        elif isinstance(obj, (list, tuple)):
-            return [_mjs(i) for i in obj]
-        elif isinstance(obj, dict):
-            return {k: _mjs(v) for k, v in obj.items()}
-        return obj
-
-    def sign(query, params):
-        payload = json.dumps({"query": query, "params": _mjs(params)}, sort_keys=True).encode('utf-8')
-        return private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
-
     if os.path.exists(dest_path):
         raise FileExistsError(f"{dest_path} already exists — not overwriting.")
 
     db = MSFStorage(dest_path, ca_cert_path=ca_cert_path)
+
+    def sign(query, params):
+        # Each signature commits to the ledger's current chain head.
+        next_seq, prev_hash = db.get_chain_head()
+        payload = canonical_payload(query, params, next_seq, prev_hash)
+        return private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+
     try:
         # Table schema is unsigned authoring (pre-seeded by replay audits).
         db.conn.execute(

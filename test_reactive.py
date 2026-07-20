@@ -12,24 +12,15 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath('src'))
 
-import json
-import base64
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert, default_backend, serialization
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
 
-def make_signed_payload(query, params, pem_key_bytes):
-    def _mjs(obj):
-        if isinstance(obj, bytes):
-            return base64.b64encode(obj).decode('utf-8')
-        elif isinstance(obj, (list, tuple)):
-            return [_mjs(i) for i in obj]
-        elif isinstance(obj, dict):
-            return {k: _mjs(v) for k, v in obj.items()}
-        return obj
-    payload_bytes = json.dumps({"query": query, "params": _mjs(params)}, sort_keys=True).encode('utf-8')
+def make_signed_payload(db, query, params, pem_key_bytes):
+    next_seq, prev_hash = db.get_chain_head()
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
     key = serialization.load_pem_private_key(pem_key_bytes, password=None, backend=default_backend())
     return key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
@@ -68,7 +59,7 @@ def run():
     writer.on_commit = lambda storage: events.append(storage.filename)
 
     def signed(db, query, params, bootstrap=False):
-        sig = make_signed_payload(query, params, admin_key)
+        sig = make_signed_payload(db, query, params, admin_key)
         if bootstrap:
             return db.bootstrap_admin(query, params, sig, admin_cert)
         return db.execute_signed(query, params, sig, admin_cert)

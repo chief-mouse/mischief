@@ -2,37 +2,17 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath('src'))
 
-import json
-import base64
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 from mschf.gen_cert import generate_selfsigned_cert, default_backend, serialization
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# Helper to sign payloads
-def sign_payload(payload_dict, pem_key_bytes):
-    payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+# Helper to sign payloads against the container's current chain head.
+def make_signed_payload(db, query, params, pem_key_bytes):
+    next_seq, prev_hash = db.get_chain_head()
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
     private_key = serialization.load_pem_private_key(pem_key_bytes, password=None, backend=default_backend())
-    signature = private_key.sign(
-        payload_bytes,
-        padding.PKCS1v15(),
-        hashes.SHA256()
-    )
-    return signature
-
-def make_signed_payload(query, params, pem_key_bytes):
-    def _make_json_serializable(obj):
-        if isinstance(obj, bytes):
-            return base64.b64encode(obj).decode('utf-8')
-        elif isinstance(obj, (list, tuple)):
-            return [_make_json_serializable(i) for i in obj]
-        elif isinstance(obj, dict):
-            return {k: _make_json_serializable(v) for k, v in obj.items()}
-        return obj
-    
-    payload_dict = {"query": query, "params": _make_json_serializable(params)}
-    sig = sign_payload(payload_dict, pem_key_bytes)
-    return sig
+    return private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
 def run_rbac_test():
     db_path = 'test_rbac.msf'
@@ -73,7 +53,7 @@ def run_rbac_test():
     print(f"Hacker Identity:  {hacker_id}")
 
     print("\n--- Step 1: Bootstrapping Root Admin ---")
-    sig = make_signed_payload("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main'], admin_key)
+    sig = make_signed_payload(db, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main'], admin_key)
     db.bootstrap_admin("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'main'], sig, admin_cert)
 
     cursor = db.conn.cursor()
@@ -82,7 +62,7 @@ def run_rbac_test():
     print("✓ Root Admin auto-bootstrapped successfully!")
 
     print("\n--- Step 2: Provisioning Guest / Support User ---")
-    sig = make_signed_payload("INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)", [support_id, 'support'], admin_key)
+    sig = make_signed_payload(db, "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)", [support_id, 'support'], admin_key)
     db.assign_user_role(support_id, 'support', sig, admin_cert)
     
     cursor.execute("SELECT role FROM user_roles WHERE identity = ?", (support_id,))
@@ -91,19 +71,19 @@ def run_rbac_test():
 
     print("\n--- Step 3: Setting Up RBAC Rules (Admin Only) ---")
     # Grant 'support' database-level full permission (both read and write)
-    sig = make_signed_payload("INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['database', '*', 'support', '*'], admin_key)
+    sig = make_signed_payload(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['database', '*', 'support', '*'], admin_key)
     db.add_rbac_rule('database', '*', 'support', '*', sig, admin_cert)
 
     # Let 'support' read 'customer_dashboard'
-    sig = make_signed_payload("INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['view', 'customer_dashboard', 'support', 'read'], admin_key)
+    sig = make_signed_payload(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['view', 'customer_dashboard', 'support', 'read'], admin_key)
     db.add_rbac_rule('view', 'customer_dashboard', 'support', 'read', sig, admin_cert)
 
     # Create the dynamic 'tickets' table
-    sig = make_signed_payload("CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)", [], admin_key)
+    sig = make_signed_payload(db, "CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)", [], admin_key)
     db.create_object_table('tickets', {'title': 'TEXT'}, sig, admin_cert)
 
     # Allow 'support' role to read (SELECT) from 'tickets' table
-    sig = make_signed_payload("INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['object', 'tickets', 'support', 'read'], admin_key)
+    sig = make_signed_payload(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['object', 'tickets', 'support', 'read'], admin_key)
     db.add_rbac_rule('object', 'tickets', 'support', 'read', sig, admin_cert)
 
     print("✓ Created tables and configured RBAC rules successfully.")
@@ -117,7 +97,7 @@ def run_rbac_test():
     print("✓ View level permissions verified!")
 
     print("\n--- Step 5: Verification of Field-Level Permissions ---")
-    sig = make_signed_payload("INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['field', 'tickets.title', 'support', 'read'], admin_key)
+    sig = make_signed_payload(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['field', 'tickets.title', 'support', 'read'], admin_key)
     db.add_rbac_rule('field', 'tickets.title', 'support', 'read', sig, admin_cert)
 
     assert db.check_field_permission('tickets', 'title', 'read', support_cert) is True, "Support should read ticket title"
@@ -130,7 +110,7 @@ def run_rbac_test():
 
     # Support attempts to insert into tickets - Rejected by Object-level RBAC (since they have 'database:write' but no 'object:tickets:write')!
     print("Checking unauthorized object-level write rejection...")
-    sig_fail = make_signed_payload("INSERT INTO tickets (title) VALUES (?)", ['Broken pipe'], support_key)
+    sig_fail = make_signed_payload(db, "INSERT INTO tickets (title) VALUES (?)", ['Broken pipe'], support_key)
     try:
         db.execute_signed("INSERT INTO tickets (title) VALUES (?)", ['Broken pipe'], sig_fail, support_cert)
         raise AssertionError("Security breach: Support user inserted into tickets without permission!")
@@ -140,7 +120,7 @@ def run_rbac_test():
 
     # Hacker attempts any signed transaction - Rejected at Database level (since they have no permissions)!
     print("Checking hacker/unregistered transaction rejection...")
-    sig_hack = make_signed_payload("INSERT INTO tickets (title) VALUES (?)", ['Hacked'], hacker_key)
+    sig_hack = make_signed_payload(db, "INSERT INTO tickets (title) VALUES (?)", ['Hacked'], hacker_key)
     try:
         db.execute_signed("INSERT INTO tickets (title) VALUES (?)", ['Hacked'], sig_hack, hacker_cert)
         raise AssertionError("Security breach: Hacker signed transaction allowed!")
@@ -150,7 +130,7 @@ def run_rbac_test():
 
     # Hacker attempts a read query - Rejected with Chain Verification Failed
     print("Checking hacker read query rejection...")
-    sig_hack_read = make_signed_payload("SELECT * FROM tickets", [], hacker_key)
+    sig_hack_read = make_signed_payload(db, "SELECT * FROM tickets", [], hacker_key)
     try:
         db.execute_signed("SELECT * FROM tickets", [], sig_hack_read, hacker_cert)
         raise AssertionError("Security breach: Hacker read allowed!")
@@ -160,7 +140,7 @@ def run_rbac_test():
 
     # Admin attempts same insertion - Allowed!
     print("Checking admin authorized write...")
-    sig_ok = make_signed_payload("INSERT INTO tickets (title) VALUES (?)", ['Urgent issue'], admin_key)
+    sig_ok = make_signed_payload(db, "INSERT INTO tickets (title) VALUES (?)", ['Urgent issue'], admin_key)
     db.execute_signed("INSERT INTO tickets (title) VALUES (?)", ['Urgent issue'], sig_ok, admin_cert)
     print("✓ Authorized write verified!")
 

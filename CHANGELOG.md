@@ -11,6 +11,25 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **Ledger hash-chaining**: every signed transaction now embeds a sequence
+  number and the SHA-256 of the previous ledger row (payload + signature) in
+  its signed payload, making the `transactions` ledger a hash chain. Dropping,
+  reordering, or splicing ledger rows now breaks verification even though each
+  surviving row's own signature stays valid — `replay_audit` reports these as
+  `chain_breaks` (tail truncation remains undetectable without an external
+  head record, by nature of hash chains). Signers fetch
+  `MSFStorage.get_chain_head()` immediately before signing;
+  `execute_signed` re-derives the expected head under a `BEGIN IMMEDIATE`
+  transaction, so stale-head signatures fail closed and concurrent writers
+  cannot fork the chain. Payload canonicalization is now centralized in
+  `storage.canonical_payload()` (previously copy-pasted across nine files).
+  Backward compatible: pre-chaining rows (NULL `seq`) verify under the legacy
+  payload format, existing containers are migrated in place (two new nullable
+  ledger columns), and the chain anchors onto the last legacy row.
+  Groundwork for multi-user ledger replication.
+
 ### Fixed
 
 - **Window-freeze mitigation**: disable Windows window-ghosting at startup

@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import json
+import base64
 import dill
 import re
 import hashlib
@@ -17,6 +18,46 @@ from mschf.gen_cert import is_cert_signed_by_ca
 # malicious app ship its own ca.crt and have its signatures "verified" against it.
 HOST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DEFAULT_CA_CERT_PATH = os.path.join(HOST_ROOT, "ca.crt")
+
+# prev_hash value signed by the first transaction of a fresh ledger.
+GENESIS_PREV_HASH = ''
+
+
+def make_json_serializable(obj):
+    """Recursively base64-encode bytes so params serialize deterministically."""
+    if isinstance(obj, bytes):
+        return base64.b64encode(obj).decode('utf-8')
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_serializable(i) for i in obj]
+    elif isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    return obj
+
+
+def canonical_payload(query, params, seq=None, prev_hash=None):
+    """The exact byte string a signer signs for a ledger transaction.
+
+    This is the single source of truth for payload canonicalization — every
+    signer and verifier (execute_signed, get_code_signature_status, the
+    sandbox HostAPI, replay_audit, authoring scripts) must build payloads
+    through this function, or signatures stop verifying.
+
+    With ``seq``/``prev_hash`` the payload is the chained v2 format: the
+    signature then binds the transaction to one exact position in one exact
+    ledger history. Without them (seq=None) it is the legacy v1 format, kept
+    only to verify ledger rows signed before chaining existed (their ``seq``
+    column is NULL).
+    """
+    payload = {"query": query, "params": make_json_serializable(params)}
+    if seq is not None:
+        payload["seq"] = seq
+        payload["prev_hash"] = prev_hash if prev_hash is not None else GENESIS_PREV_HASH
+    return json.dumps(payload, sort_keys=True).encode('utf-8')
+
+
+def ledger_row_hash(payload_bytes, signature):
+    """Chain hash of a ledger row: binds the signed payload AND its signature."""
+    return hashlib.sha256(payload_bytes + b'\x1f' + bytes(signature)).hexdigest()
 
 
 class MSFStorage:
@@ -61,7 +102,10 @@ class MSFStorage:
             )
         ''')
         
-        # Transactions table (audit log of signed transactions)
+        # Transactions table (audit log of signed transactions). seq/prev_hash
+        # make the ledger a hash chain: both are embedded in the signed payload,
+        # so rows cannot be dropped, reordered, or spliced without breaking
+        # replay verification. NULL seq marks legacy (pre-chaining) rows.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,9 +113,17 @@ class MSFStorage:
                 params TEXT,
                 signature BLOB,
                 pub_key BLOB,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                seq INTEGER,
+                prev_hash TEXT
             )
         ''')
+        # Migrate pre-chaining containers in place (their existing rows keep
+        # NULL seq/prev_hash and verify under the legacy payload format).
+        existing_cols = {r[1] for r in cursor.execute("PRAGMA table_info(transactions)")}
+        for col, decl in (('seq', 'INTEGER'), ('prev_hash', 'TEXT')):
+            if col not in existing_cols:
+                cursor.execute(f"ALTER TABLE transactions ADD COLUMN {col} {decl}")
         
         # RBAC table
         cursor.execute('''
@@ -118,6 +170,35 @@ class MSFStorage:
                 # Extreme fallback if bytes are corrupted or arbitrary
                 h = hashlib.sha256(pub_key_bytes).hexdigest()
                 return f"raw:{h[:16]}"
+
+    def get_chain_head(self):
+        """(next_seq, prev_hash) that the NEXT transaction's payload must embed.
+
+        Signers call this immediately before signing; execute_signed re-derives
+        the same pair at verification time, so a signature computed against a
+        stale head fails closed and the signer must re-read and re-sign.
+
+        prev_hash is the chain hash of the newest ledger row (GENESIS_PREV_HASH
+        on an empty ledger). Legacy pre-chaining rows still anchor the chain:
+        their hash is computed over their v1 payload, and the first chained row
+        after them starts at seq 1.
+        """
+        row = self.conn.execute(
+            "SELECT query, params, signature, seq, prev_hash FROM transactions "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return 1, GENESIS_PREV_HASH
+        query, params_str, signature, seq, prev_hash = row
+        try:
+            params = json.loads(params_str) if params_str else []
+        except json.JSONDecodeError:
+            params = []
+        if seq is not None:
+            payload = canonical_payload(query, params, seq, prev_hash)
+        else:
+            payload = canonical_payload(query, params)
+        return (seq or 0) + 1, ledger_row_hash(payload, signature)
 
     def _parse_sql_query(self, query):
         """Extract (operation, table_name) from basic SQLite queries."""
@@ -353,29 +434,57 @@ class MSFStorage:
             return False
 
     def execute_signed(self, query, params, signature, pub_key_pem, allow_bootstrap=False):
-        """Execute a query only if the signature and RBAC checks pass.
+        """Execute a query only if the signature, chain, and RBAC checks pass.
+
+        The signed payload must embed the current chain head (``seq`` and
+        ``prev_hash`` from ``get_chain_head``), so every ledger row commits to
+        one exact position in one exact history. This method re-derives the
+        expected head itself and verifies the signature against it — a
+        signature over a stale head (or over the legacy unchained payload)
+        fails closed.
 
         ``allow_bootstrap`` is the ONLY way the first-writer-becomes-admin
         bootstrap can fire; callers that run untrusted code (the sandbox) must
         never set it. Use ``bootstrap_admin`` for the deliberate authoring step.
         """
-        import base64
-        def _make_json_serializable(obj):
-            if isinstance(obj, bytes):
-                return base64.b64encode(obj).decode('utf-8')
-            elif isinstance(obj, (list, tuple)):
-                return [_make_json_serializable(i) for i in obj]
-            elif isinstance(obj, dict):
-                return {k: _make_json_serializable(v) for k, v in obj.items()}
-            return obj
+        # Hold the write lock across verify -> execute -> ledger append: the
+        # chain head read below must still be the head when the audit row
+        # commits, or a concurrent writer could extend the same head (a fork).
+        own_txn = not self.conn.in_transaction
+        if own_txn:
+            self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            operation, cursor = self._execute_signed_locked(
+                query, params, signature, pub_key_pem, allow_bootstrap)
+            self.conn.commit()
+        except Exception:
+            if own_txn and self.conn.in_transaction:
+                self.conn.rollback()
+            raise
 
-        # Verify Signature
-        payload_dict = {"query": query, "params": _make_json_serializable(params)}
-        payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-        
+        # Reactive redraw: notify the host after mutating transactions only.
+        # Signed reads also commit (they append an audit row), so notifying on
+        # 'read' would let two open documents redraw each other forever.
+        if operation != 'read' and self.on_commit:
+            try:
+                self.on_commit(self)
+            except Exception as e:
+                print(f"on_commit notification failed: {e}")
+
+        return cursor
+
+    def _execute_signed_locked(self, query, params, signature, pub_key_pem, allow_bootstrap):
+        """Body of execute_signed; runs inside the connection's write transaction."""
+        next_seq, prev_hash = self.get_chain_head()
+        payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
+
         if not self.verify_signature(payload_bytes, signature, pub_key_pem):
-            raise PermissionError("Invalid transaction signature")
-            
+            raise PermissionError(
+                "Invalid transaction signature: the payload must be signed against "
+                f"the current chain head (expected seq={next_seq}, "
+                f"prev_hash={prev_hash!r}). Re-read get_chain_head() and re-sign."
+            )
+
         # Cryptographic Chain-of-Trust Check for X.509 Certificates.
         # The trust anchor is the HOST's Root CA (self.ca_cert_path) — never a
         # ca.crt sitting next to the .msf container. Fail closed: if the trusted
@@ -409,7 +518,8 @@ class MSFStorage:
             cursor.execute("SELECT COUNT(*) FROM user_roles")
             if cursor.fetchone()[0] == 0:
                 cursor.execute("INSERT INTO user_roles (identity, role) VALUES (?, 'admin')", (identity,))
-                self.conn.commit()
+                # No commit here: the bootstrap grant rides in the same write
+                # transaction and rolls back if the statement is later denied.
 
         # Parse query for RBAC
         operation, table_name = self._parse_sql_query(query)
@@ -459,25 +569,17 @@ class MSFStorage:
             self._active_signer = None
 
 
-        # Log the transaction using a separate cursor so we do not clobber the main query's results
+        # Log the transaction using a separate cursor so we do not clobber the
+        # main query's results. seq/prev_hash are the chain position the
+        # signature was just verified against.
         audit_cursor = self.conn.cursor()
         audit_cursor.execute('''
-            INSERT INTO transactions (query, params, signature, pub_key)
-            VALUES (?, ?, ?, ?)
-        ''', (query, json.dumps(_make_json_serializable(params)), signature, pub_key_pem))
-        
-        self.conn.commit()
+            INSERT INTO transactions (query, params, signature, pub_key, seq, prev_hash)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (query, json.dumps(make_json_serializable(params)), signature, pub_key_pem,
+              next_seq, prev_hash))
 
-        # Reactive redraw: notify the host after mutating transactions only.
-        # Signed reads also commit (they append an audit row), so notifying on
-        # 'read' would let two open documents redraw each other forever.
-        if operation != 'read' and self.on_commit:
-            try:
-                self.on_commit(self)
-            except Exception as e:
-                print(f"on_commit notification failed: {e}")
-
-        return cursor
+        return operation, cursor
 
     def set_manifest_item(self, key, value, signature, pub_key_pem):
         """Set a manifest item securely."""
@@ -517,20 +619,24 @@ class MSFStorage:
         """
         try:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT query, params, signature, pub_key FROM transactions WHERE query LIKE 'INSERT OR REPLACE INTO source_code%' ORDER BY id DESC")
+            cursor.execute("SELECT query, params, signature, pub_key, seq, prev_hash FROM transactions WHERE query LIKE 'INSERT OR REPLACE INTO source_code%' ORDER BY id DESC")
             rows = cursor.fetchall()
-            
-            for query, params_str, signature, pub_key_pem in rows:
+
+            for query, params_str, signature, pub_key_pem, seq, prev_hash in rows:
                 try:
                     params = json.loads(params_str)
                 except Exception:
                     continue
                 if isinstance(params, list) and len(params) > 0 and params[0] == id_val:
                     # Found the transaction that stored this code blob!
-                    # Reconstruct payload_bytes
-                    payload_dict = {"query": query, "params": params}
-                    payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-                    
+                    # Reconstruct the payload exactly as it was signed: chained
+                    # rows carry their seq/prev_hash, legacy rows (NULL seq)
+                    # were signed over the unchained v1 payload.
+                    if seq is not None:
+                        payload_bytes = canonical_payload(query, params, seq, prev_hash)
+                    else:
+                        payload_bytes = canonical_payload(query, params)
+
                     # Verify signature
                     verified = self.verify_signature(payload_bytes, signature, pub_key_pem)
                     error = None if verified else "Signature verification failed (data was tampered with or key is invalid)"

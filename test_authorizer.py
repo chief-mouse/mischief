@@ -14,31 +14,21 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath('src'))
 
-import json
-import base64
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert, default_backend, serialization
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
 
-def make_signed_payload(query, params, pem_key_bytes):
-    def _mjs(obj):
-        if isinstance(obj, bytes):
-            return base64.b64encode(obj).decode('utf-8')
-        elif isinstance(obj, (list, tuple)):
-            return [_mjs(i) for i in obj]
-        elif isinstance(obj, dict):
-            return {k: _mjs(v) for k, v in obj.items()}
-        return obj
-    payload_dict = {"query": query, "params": _mjs(params)}
-    payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
+def make_signed_payload(db, query, params, pem_key_bytes):
+    next_seq, prev_hash = db.get_chain_head()
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
     private_key = serialization.load_pem_private_key(pem_key_bytes, password=None, backend=default_backend())
     return private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
 
 def expect_denied(db, query, params, key, cert, must_mention, label):
-    sig = make_signed_payload(query, params, key)
+    sig = make_signed_payload(db, query, params, key)
     try:
         db.execute_signed(query, params, sig, cert)
         raise AssertionError(f"SECURITY BREACH ({label}): statement was allowed: {query}")
@@ -73,7 +63,7 @@ def run():
 
     print("--- Provisioning container (admin bootstrap, tables, RBAC) ---")
     q = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
-    db.bootstrap_admin(q, ['entry_point', 'main'], make_signed_payload(q, ['entry_point', 'main'], admin_key), admin_cert)
+    db.bootstrap_admin(q, ['entry_point', 'main'], make_signed_payload(db, q, ['entry_point', 'main'], admin_key), admin_cert)
 
     db.conn.execute("CREATE TABLE tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
     db.conn.execute("CREATE TABLE secrets (id INTEGER PRIMARY KEY AUTOINCREMENT, secret TEXT)")
@@ -82,7 +72,7 @@ def run():
     db.conn.commit()
 
     def admin_exec(query, params):
-        db.execute_signed(query, params, make_signed_payload(query, params, admin_key), admin_cert)
+        db.execute_signed(query, params, make_signed_payload(db, query, params, admin_key), admin_cert)
 
     q = "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)"
     admin_exec(q, [support_id, 'support'])
@@ -91,16 +81,16 @@ def run():
     admin_exec(q, ['object', 'tickets', 'support', '*'])  # tickets read+write; NOTHING on secrets
 
     print("\n--- Positive controls (legitimate access still works) ---")
-    sig = make_signed_payload("SELECT id, title FROM tickets", [], support_key)
+    sig = make_signed_payload(db, "SELECT id, title FROM tickets", [], support_key)
     rows = db.execute_signed("SELECT id, title FROM tickets", [], sig, support_cert).fetchall()
     assert rows and rows[0][1] == 'printer on fire'
     print("  [OK] support can read tickets")
 
-    sig = make_signed_payload("INSERT INTO tickets (title) VALUES (?)", ['coffee machine down'], support_key)
+    sig = make_signed_payload(db, "INSERT INTO tickets (title) VALUES (?)", ['coffee machine down'], support_key)
     db.execute_signed("INSERT INTO tickets (title) VALUES (?)", ['coffee machine down'], sig, support_cert)
     print("  [OK] support can write tickets")
 
-    sig = make_signed_payload("SELECT t.title, s.secret FROM tickets t JOIN secrets s", [], admin_key)
+    sig = make_signed_payload(db, "SELECT t.title, s.secret FROM tickets t JOIN secrets s", [], admin_key)
     rows = db.execute_signed("SELECT t.title, s.secret FROM tickets t JOIN secrets s", [], sig, admin_cert).fetchall()
     assert any('crown jewels' in r[1] for r in rows)
     print("  [OK] admin can join across secrets")

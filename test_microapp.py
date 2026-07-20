@@ -1,13 +1,11 @@
 import sys
 import os
-import json
-import base64
 import socket
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath('src'))
 
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 from mschf.gen_cert import generate_user_cert, x509, default_backend, serialization
 import dill
 from cryptography.hazmat.primitives import hashes, serialization as crypto_serialization
@@ -36,25 +34,14 @@ with open(ca_cert_path, 'rb') as f:
 with open(ca_key_path, 'rb') as f:
     ca_key_pem = f.read()
 
-# Helper to sign payloads
-def sign_payload(payload_bytes, pem_key_bytes):
+# Helper to sign payloads against the container's current chain head. Must be
+# called immediately before executing the query (the head moves on every
+# signed transaction, including reads).
+def chained_signature(db, query, params, pem_key_bytes):
+    next_seq, prev_hash = db.get_chain_head()
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
     private_key = serialization.load_pem_private_key(pem_key_bytes, password=None, backend=default_backend())
-    signature = private_key.sign(
-        payload_bytes,
-        padding.PKCS1v15(),
-        hashes.SHA256()
-    )
-    return signature
-
-# Helper to encode bytes
-def _make_json_serializable(obj):
-    if isinstance(obj, bytes):
-        return base64.b64encode(obj).decode('utf-8')
-    elif isinstance(obj, (list, tuple)):
-        return [_make_json_serializable(i) for i in obj]
-    elif isinstance(obj, dict):
-        return {k: _make_json_serializable(v) for k, v in obj.items()}
-    return obj
+    return private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
 # 2. Generate the identities this container recognizes.
 # The admin identity is generated IN MEMORY only (used to sign the seed data below)
@@ -98,16 +85,12 @@ db.conn.execute("CREATE TABLE IF NOT EXISTS confidential_billing (id INTEGER PRI
 db.conn.commit()
 
 # Seed Confidential Billing Logs signed by Admin
-payload_dict = {"query": "INSERT OR REPLACE INTO confidential_billing (id, client, amount) VALUES (?, ?, ?)", "params": [1, 'Mischief Dev LLC', 12500.00]}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT OR REPLACE INTO confidential_billing (id, client, amount) VALUES (?, ?, ?)", [1, 'Mischief Dev LLC', 12500.00], user_keys['admin'])
 # First write on a fresh container: explicitly claim admin (opt-in bootstrap).
 db.bootstrap_admin("INSERT OR REPLACE INTO confidential_billing (id, client, amount) VALUES (?, ?, ?)", [1, 'Mischief Dev LLC', 12500.00], signature, user_certs['admin'])
 
 # Seed support ticket with SSN signed by Admin
-payload_dict = {"query": "INSERT OR REPLACE INTO custom_tickets (id, title, customer_ssn, status) VALUES (?, ?, ?, ?)", "params": [1, 'System Reset Needed', '999-12-3456', 'open']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT OR REPLACE INTO custom_tickets (id, title, customer_ssn, status) VALUES (?, ?, ?, ?)", [1, 'System Reset Needed', '999-12-3456', 'open'], user_keys['admin'])
 db.execute_signed("INSERT OR REPLACE INTO custom_tickets (id, title, customer_ssn, status) VALUES (?, ?, ?, ?)", [1, 'System Reset Needed', '999-12-3456', 'open'], signature, user_certs['admin'])
 
 
@@ -344,9 +327,7 @@ def my_micro_app(toga, host_api):
 print("Signing and storing micro-app code using admin certificate...")
 id_val = 'main_app'
 pickled_code = dill.dumps(my_micro_app)
-payload_dict = {"query": "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", "params": _make_json_serializable([id_val, pickled_code])}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)", [id_val, pickled_code], user_keys['admin'])
 
 db.store_code(id_val, my_micro_app, signature, user_certs['admin'])
 
@@ -354,9 +335,7 @@ db.store_code(id_val, my_micro_app, signature, user_certs['admin'])
 print("Setting manifest entry point...")
 manifest_key = 'entry_point'
 manifest_val = 'main_app'
-payload_dict = {"query": "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", "params": [manifest_key, manifest_val]}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", [manifest_key, manifest_val], user_keys['admin'])
 
 db.set_manifest_item(manifest_key, manifest_val, signature, user_certs['admin'])
 
@@ -368,45 +347,31 @@ admin_id = db._get_identity(user_certs['admin'])
 support_id = db._get_identity(user_certs['support'])
 
 # Assign Role: admin to Admin identity
-payload_dict = {"query": "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)", "params": [admin_id, 'admin']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)", [admin_id, 'admin'], user_keys['admin'])
 db.assign_user_role(admin_id, 'admin', signature, user_certs['admin'])
 
 # Assign Role: support to Support identity
-payload_dict = {"query": "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)", "params": [support_id, 'support']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)", [support_id, 'support'], user_keys['admin'])
 db.assign_user_role(support_id, 'support', signature, user_certs['admin'])
 
 # Allow support role view-level access to the customer dashboard
-payload_dict = {"query": "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", "params": ['view', 'customer_dashboard', 'support', 'read']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['view', 'customer_dashboard', 'support', 'read'], user_keys['admin'])
 db.add_rbac_rule('view', 'customer_dashboard', 'support', 'read', signature, user_certs['admin'])
 
 # Allow support role read-only database-level access
-payload_dict = {"query": "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", "params": ['database', '*', 'support', 'read']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['database', '*', 'support', 'read'], user_keys['admin'])
 db.add_rbac_rule('database', '*', 'support', 'read', signature, user_certs['admin'])
 
 # Allow support role read-only table object-level access on custom_tickets
-payload_dict = {"query": "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", "params": ['object', 'custom_tickets', 'support', 'read']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['object', 'custom_tickets', 'support', 'read'], user_keys['admin'])
 db.add_rbac_rule('object', 'custom_tickets', 'support', 'read', signature, user_certs['admin'])
 
 # Allow admin role view-level access to the admin_panel
-payload_dict = {"query": "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", "params": ['view', 'admin_panel', 'admin', 'read']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['view', 'admin_panel', 'admin', 'read'], user_keys['admin'])
 db.add_rbac_rule('view', 'admin_panel', 'admin', 'read', signature, user_certs['admin'])
 
 # EXPLICITLY ALLOW ADMIN FULL FIELD-LEVEL ACCESS TO custom_tickets.customer_ssn
-payload_dict = {"query": "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", "params": ['field', 'custom_tickets.customer_ssn', 'admin', 'read']}
-payload_bytes = json.dumps(payload_dict, sort_keys=True).encode('utf-8')
-signature = sign_payload(payload_bytes, user_keys['admin'])
+signature = chained_signature(db, "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)", ['field', 'custom_tickets.customer_ssn', 'admin', 'read'], user_keys['admin'])
 db.add_rbac_rule('field', 'custom_tickets.customer_ssn', 'admin', 'read', signature, user_certs['admin'])
 
 db.close()
