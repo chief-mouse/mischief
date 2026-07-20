@@ -144,7 +144,11 @@ def replay_audit(storage):
     every audited table matches (timestamp skews don't fail the audit).
     """
     live = storage.conn
-    shadow_store = MSFStorage(':memory:', ca_cert_path=storage.ca_cert_path)
+    shadow_store = MSFStorage(
+        ':memory:',
+        ca_cert_path=storage.ca_cert_path,
+        trust_dir=storage.trust_dir,
+    )
     shadow = shadow_store.conn
 
     # Replayed time: datetime('now') yields the in-flight ledger timestamp.

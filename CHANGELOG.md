@@ -13,6 +13,23 @@ entry here.
 
 ### Added
 
+- **Configurable trust anchors (org CA / trust store)**: the host now trusts
+  its own `ca.crt` **plus** every `*.crt`/`*.pem` certificate in a
+  `trusted_cas/` directory next to it (overridable via `MSCHF_TRUST_DIR`, or
+  per-storage with `MSFStorage(..., trust_dir=...)`). Dropping an
+  organization's root CA cert into the trust store lets the host verify
+  transactions signed by identities that organization issued — the
+  prerequisite for multi-user `.msf` collaboration across machines. Anchors
+  are re-resolved on every verification (no restart needed), unparseable
+  files are skipped with a warning, and verification **fails closed** when no
+  anchors exist at all — including `Identity.load`, which previously skipped
+  the chain check when the CA file was missing and now rejects instead.
+  `replay_audit`'s shadow store mirrors the audited storage's trust
+  configuration. New module `src/mschf/trust.py`
+  (`resolve_trust_anchors` / `is_cert_trusted`); covered by
+  `test_trust_store.py`. Implemented by the grok agent from a written spec;
+  reviewed, verified, and integrated by Claude.
+
 - **Ledger hash-chaining**: every signed transaction now embeds a sequence
   number and the SHA-256 of the previous ledger row (payload + signature) in
   its signed payload, making the `transactions` ledger a hash chain. Dropping,

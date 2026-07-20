@@ -11,13 +11,13 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.backends import default_backend
 
-from mschf.gen_cert import is_cert_signed_by_ca
+from mschf.trust import resolve_trust_anchors, is_cert_trusted, DEFAULT_CA_CERT_PATH
 
 # The trusted Root CA is anchored to the host installation, never to the .msf's
 # own directory. Sourcing it from next to the (untrusted) container would let a
 # malicious app ship its own ca.crt and have its signatures "verified" against it.
+# DEFAULT_CA_CERT_PATH is defined in trust.py (same HOST_ROOT derivation).
 HOST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-DEFAULT_CA_CERT_PATH = os.path.join(HOST_ROOT, "ca.crt")
 
 # prev_hash value signed by the first transaction of a fresh ledger.
 GENESIS_PREV_HASH = ''
@@ -64,9 +64,14 @@ class MSFStorage:
     # Tables owned by the platform itself; writable only by admin identities.
     SYSTEM_TABLES = frozenset({'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles'})
 
-    def __init__(self, filename, ca_cert_path=None):
+    def __init__(self, filename, ca_cert_path=None, trust_dir=None):
         self.filename = filename
+        # Keep the original constructor arg (may be None) so resolve_trust_anchors
+        # applies its own defaulting consistently at check time. Do not cache
+        # anchors at init — a trust-dir cert added later must be picked up.
+        self._ca_cert_path_arg = ca_cert_path
         self.ca_cert_path = ca_cert_path or DEFAULT_CA_CERT_PATH
+        self.trust_dir = trust_dir
         self.conn = sqlite3.connect(filename)
         self.conn.execute("PRAGMA foreign_keys = ON")
         # current_signer(): SQL function returning the verified identity string
@@ -399,19 +404,17 @@ class MSFStorage:
         return False
 
     def _signer_is_ca_trusted(self, pub_key_pem):
-        """True only if the signer presented an X.509 cert that chains to the host Root CA.
+        """True only if the signer presented an X.509 cert that chains to a trust anchor.
 
         A bare public key (no certificate) has no chain to the CA and is therefore
         not trusted for the "verified" banner, even if its signature is valid.
+        Anchors are resolved at check time (host ca.crt + trust_dir / MSCHF_TRUST_DIR).
         """
         pub_key_str = pub_key_pem.decode('utf-8') if isinstance(pub_key_pem, bytes) else pub_key_pem
         if "-----BEGIN CERTIFICATE-----" not in pub_key_str:
             return False
-        if not os.path.isfile(self.ca_cert_path):
-            return False
-        with open(self.ca_cert_path, 'rb') as f:
-            ca_cert_pem = f.read()
-        return is_cert_signed_by_ca(pub_key_str, ca_cert_pem)
+        anchors = resolve_trust_anchors(self._ca_cert_path_arg, self.trust_dir)
+        return is_cert_trusted(pub_key_str, anchors)
 
     def verify_signature(self, payload, signature, pub_key_pem):
         """Verify the signature of a payload using the provided PEM public key or certificate."""
@@ -494,21 +497,21 @@ class MSFStorage:
             )
 
         # Cryptographic Chain-of-Trust Check for X.509 Certificates.
-        # The trust anchor is the HOST's Root CA (self.ca_cert_path) — never a
-        # ca.crt sitting next to the .msf container. Fail closed: if the trusted
-        # CA is missing we cannot verify the chain, so the transaction is rejected.
+        # Trust anchors are the host Root CA plus any org CAs in the trust store
+        # — never a ca.crt sitting next to the .msf container. Fail closed: if
+        # no anchors are available we cannot verify the chain.
         pub_key_str = pub_key_pem.decode('utf-8') if isinstance(pub_key_pem, bytes) else pub_key_pem
         if "-----BEGIN CERTIFICATE-----" in pub_key_str:
-            if not os.path.isfile(self.ca_cert_path):
+            anchors = resolve_trust_anchors(self._ca_cert_path_arg, self.trust_dir)
+            if not anchors:
                 raise PermissionError(
-                    "Cryptographic Chain Verification Failed: trusted Root CA not found at "
-                    f"{self.ca_cert_path}."
+                    "Cryptographic Chain Verification Failed: no trusted Root CA is available "
+                    "(host ca.crt missing and trust store empty)."
                 )
-            with open(self.ca_cert_path, 'rb') as f:
-                ca_cert_pem = f.read()
             # A self-signed Root CA verifies against itself, so signing directly
-            # with the Root CA is still accepted; anything else must be CA-issued.
-            if not is_cert_signed_by_ca(pub_key_str, ca_cert_pem):
+            # with a trusted Root CA is still accepted; anything else must be
+            # issued by one of the resolved anchors.
+            if not is_cert_trusted(pub_key_str, anchors):
                 raise PermissionError(
                     "Cryptographic Chain Verification Failed: Identity certificate is not "
                     "signed by the trusted Root CA."

@@ -9,7 +9,8 @@ should ever reconstruct a key filename from a CN; it reads ``key_path`` here.
 import os
 import logging
 
-from mschf.gen_cert import x509, NameOID, default_backend, is_cert_signed_by_ca
+from mschf.gen_cert import x509, NameOID, default_backend
+from mschf.trust import resolve_trust_anchors, is_cert_trusted
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +50,12 @@ class Identity:
         )
 
     @classmethod
-    def load(cls, cert_path, ca_cert_path):
-        """Load a certificate, verify it chains to the Root CA, and locate its key.
+    def load(cls, cert_path, ca_cert_path=None, trust_dir=None):
+        """Load a certificate, verify it chains to a trust anchor, and locate its key.
+
+        ``ca_cert_path`` stays positional-compatible for existing callers.
+        Trust is resolved via ``resolve_trust_anchors`` (host CA file + optional
+        trust directory); an identity chaining to *any* anchor is valid.
 
         Returns a valid ``Identity`` on success, or a ``NO_ACCESS`` identity
         (with an explanatory ``status_text``) on any failure.
@@ -65,15 +70,13 @@ class Identity:
             except Exception:
                 cn = "Unknown"
 
-            if os.path.isfile(ca_cert_path):
-                with open(ca_cert_path, 'rb') as f:
-                    ca_cert_pem = f.read()
-                if not is_cert_signed_by_ca(pem_cert, ca_cert_pem):
-                    log.warning(f"CRITICAL: identity certificate at {cert_path} is not signed by Root CA.")
-                    return cls.invalid(
-                        f"Active Identity: {cn} (INVALID - NOT SIGNED BY CA)",
-                        f"Error: Identity {cn} is not signed by Root CA. Denied.",
-                    )
+            anchors = resolve_trust_anchors(ca_cert_path, trust_dir)
+            if not is_cert_trusted(pem_cert, anchors):
+                log.warning(f"CRITICAL: identity certificate at {cert_path} is not signed by a trusted CA.")
+                return cls.invalid(
+                    f"Active Identity: {cn} (INVALID - NOT SIGNED BY CA)",
+                    f"Error: Identity {cn} is not signed by Root CA. Denied.",
+                )
 
             cert_pem = pem_cert.decode('utf-8') if isinstance(pem_cert, bytes) else pem_cert
             return cls(

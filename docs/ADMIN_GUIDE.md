@@ -21,6 +21,18 @@ The cryptographic hierarchy strictly separates the **Trust Anchor** from the **U
 *   **Root CA (`ca.crt` / `ca.key`):** This is a true Certificate Authority (contains `CA:TRUE` in its basic constraints). Its private key is kept highly isolated and is used *exclusively* to digitally sign/issue subordinate user certificates. The CA is never used to run micro-apps or sign transactional queries.
 *   **User Certificates (`admin.crt`, `support.crt`):** These represent physical operators or automated service accounts, containing `CA:FALSE` under basic constraints. They are signed by the root CA. Transactions are signed using the user's specific key pair, which is then validated against their user certificate and verified back to the root CA.
 
+### 1.2 Importing Organization CAs (the Trust Store)
+
+Beyond its own `ca.crt`, the host trusts every `*.crt`/`*.pem` certificate placed in the **trust store** — a `trusted_cas/` directory next to `ca.crt` (override the location with the `MSCHF_TRUST_DIR` environment variable, or per-container with `MSFStorage(..., trust_dir=...)`). A signature verifies if the signer's certificate chains to **any** trust anchor.
+
+To collaborate with another organization: obtain their root CA **certificate** (never the private key) over a channel you trust, and drop it into `trusted_cas/`. Identities issued by that CA on other machines are immediately accepted — anchors are re-resolved on every verification, so no restart is needed. Removing the file revokes that trust just as immediately (for new verifications; `replay_audit` re-checks historical ledger rows against the *current* anchors, so removing a CA also flags that org's past transactions as untrusted).
+
+Rules of the road:
+
+*   **Fail closed:** with no `ca.crt` and an empty trust store, every signed transaction and identity load is rejected.
+*   Files that do not parse as X.509 certificates are skipped with a warning.
+*   **Never** import a CA that arrived alongside an `.msf` file — that is exactly the attack the host-side anchor design prevents (a malicious container vouching for itself).
+
 ---
 
 ## 2. Bootstrapping a New MSF Container
