@@ -26,9 +26,11 @@ from mschf.audit import replay_audit
 from mschf.storage import (
     GENESIS_PREV_HASH,
     MSFStorage,
+    PAYLOAD_FMT_V3,
     canonical_payload,
     ledger_row_hash,
     make_json_serializable,
+    payload_from_ledger_row,
 )
 from mschf.trust import is_cert_trusted, resolve_trust_anchors
 
@@ -281,20 +283,32 @@ def sign_and_submit(
     expected_hub_cn=None,
     ca_cert_path=None,
     trust_dir=None,
+    expected_container_uid=None,
 ):
-    """Fetch verified head → sign with ``canonical_payload`` → submit; retry on StaleHead."""
+    """Fetch verified head → sign with ``canonical_payload`` → submit; retry on StaleHead.
+
+    The hub's head response includes ``container_uid``; the payload is signed
+    under v3 against that claim. When ``expected_container_uid`` is set (local
+    replica's uid), a mismatch with the hub raises before signing.
+    """
     if isinstance(cert_pem, bytes):
         cert_pem = cert_pem.decode('utf-8')
     params = params if params is not None else []
     last_err = None
     for _ in range(max_retries):
-        next_seq, prev_hash, _att = fetch_head(
+        next_seq, prev_hash, head = fetch_head(
             hub_url, container_id,
             expected_hub_cn=expected_hub_cn,
             ca_cert_path=ca_cert_path,
             trust_dir=trust_dir,
         )
-        payload = canonical_payload(query, params, next_seq, prev_hash)
+        hub_uid = head.get('container_uid')
+        if expected_container_uid is not None and hub_uid != expected_container_uid:
+            raise PermissionError(
+                f'sign_and_submit: hub container_uid {hub_uid!r} does not match '
+                f'local expected_container_uid {expected_container_uid!r}'
+            )
+        payload = canonical_payload(query, params, next_seq, prev_hash, hub_uid)
         signature = private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
         try:
             return submit(
@@ -318,8 +332,17 @@ def _local_max_seq(storage):
     return row[0] if row else 0
 
 
-def _verify_row_signature(storage, query, params, signature, pub_key, seq, prev_hash):
-    payload = canonical_payload(query, params, seq, prev_hash)
+def _verify_row_signature(storage, query, params, signature, pub_key, seq, prev_hash,
+                          payload_fmt=None):
+    # Replica and hub share container_uid by construction (bootstrap copies the
+    # whole file). Reconstruct from the row's stored fmt using this storage's uid.
+    uid = storage.container_uid
+    if payload_fmt == PAYLOAD_FMT_V3 and not uid:
+        raise PermissionError(
+            f'pull_and_apply: v3 row seq={seq} but local container_uid is missing'
+        )
+    payload = payload_from_ledger_row(
+        query, params, seq, prev_hash, payload_fmt, uid)
     if not storage.verify_signature(payload, signature, pub_key):
         raise PermissionError(
             f'pull_and_apply: invalid signature on hub row seq={seq}'
@@ -421,6 +444,7 @@ def pull_and_apply(
             ts = row['timestamp']
             seq = row['seq']
             row_prev = row['prev_hash']
+            payload_fmt = row.get('payload_fmt')
             txn_id = row['id']
 
             if seq != expected_next:
@@ -434,7 +458,8 @@ def pull_and_apply(
                 )
 
             payload = _verify_row_signature(
-                storage, query, params, signature, pub_key, seq, row_prev
+                storage, query, params, signature, pub_key, seq, row_prev,
+                payload_fmt=payload_fmt,
             )
 
             operation, _ = storage._parse_sql_query(query)
@@ -462,13 +487,15 @@ def pull_and_apply(
                     storage._active_signer = None
                     now_holder['ts'] = None
 
-            # Insert the ledger row verbatim (explicit id, timestamp, seq, prev_hash).
+            # Insert the ledger row verbatim (explicit id, timestamp, seq,
+            # prev_hash, payload_fmt).
             params_str = json.dumps(make_json_serializable(params))
             storage.conn.execute(
                 "INSERT INTO transactions "
-                "(id, query, params, signature, pub_key, timestamp, seq, prev_hash) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (txn_id, query, params_str, signature, pub_key, ts, seq, row_prev),
+                "(id, query, params, signature, pub_key, timestamp, seq, prev_hash, "
+                "payload_fmt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (txn_id, query, params_str, signature, pub_key, ts, seq, row_prev,
+                 payload_fmt),
             )
             running_hash = ledger_row_hash(payload, signature)
             expected_next = seq + 1

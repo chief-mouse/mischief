@@ -54,13 +54,14 @@ import re
 from datetime import datetime, timedelta
 
 from mschf.storage import (
-    MSFStorage, GENESIS_PREV_HASH, canonical_payload, ledger_row_hash,
+    MSFStorage, GENESIS_PREV_HASH, PAYLOAD_FMT_V3,
+    ledger_row_hash, payload_from_ledger_row,
 )
 
 # Tables never diffed: transactions is the replay input, source_code is
 # verified via signatures (see module docstring), sqlite_sequence is engine
-# bookkeeping.
-EXCLUDED_TABLES = {'transactions', 'source_code', 'sqlite_sequence'}
+# bookkeeping, container_meta is unsigned infrastructure (minted at open).
+EXCLUDED_TABLES = {'transactions', 'source_code', 'sqlite_sequence', 'container_meta'}
 
 # Replay errors that only mean "the pre-seeded live schema already contains
 # this DDL's end state" — safe to skip.
@@ -167,7 +168,10 @@ def replay_audit(storage):
     shadow.create_function('datetime', -1, _replay_datetime)
 
     # Pre-seed table schemas (NOT triggers — see module docstring).
-    system = {'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles'}
+    system = {
+        'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles',
+        'container_meta',
+    }
     for (sql,) in live.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL "
         "AND name NOT LIKE 'sqlite_%'"
@@ -179,8 +183,8 @@ def replay_audit(storage):
     shadow.commit()
 
     ledger = live.execute(
-        "SELECT id, query, params, signature, pub_key, timestamp, seq, prev_hash "
-        "FROM transactions ORDER BY id"
+        "SELECT id, query, params, signature, pub_key, timestamp, seq, prev_hash, "
+        "payload_fmt FROM transactions ORDER BY id"
     ).fetchall()
 
     report = {
@@ -198,11 +202,14 @@ def replay_audit(storage):
     # Hash-chain state: every row (legacy or chained) advances running_hash;
     # chained rows must link to it and carry consecutive seq values.
     chained_seen = False
+    v3_seen = False
     expected_seq = 1
     running_hash = GENESIS_PREV_HASH
+    container_uid = storage.container_uid
 
     bootstrapped = False
-    for txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash in ledger:
+    for (txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash,
+         payload_fmt) in ledger:
         try:
             params = json.loads(params_str) if params_str else []
         except json.JSONDecodeError:
@@ -210,13 +217,23 @@ def replay_audit(storage):
             txr['replay_anomalies'].append({'id': txn_id, 'error': 'unparseable params JSON'})
 
         if seq is None:
-            payload = canonical_payload(query, params)
+            payload = payload_from_ledger_row(
+                query, params, seq, prev_hash, payload_fmt, container_uid)
             if chained_seen:
                 txr['chain_breaks'].append({
                     'id': txn_id,
                     'error': 'unchained legacy row after chained history (spliced or downgraded)'})
         else:
-            payload = canonical_payload(query, params, seq, prev_hash)
+            # Format downgrade: a v2 row (NULL/2 fmt) after a v3 row is a break,
+            # mirroring the legacy-after-chained rule. v2 rows before the
+            # upgrade point remain valid.
+            is_v3 = payload_fmt == PAYLOAD_FMT_V3
+            if v3_seen and not is_v3:
+                txr['chain_breaks'].append({
+                    'id': txn_id,
+                    'error': 'format downgrade: v2 row after v3 history (spliced or downgraded)'})
+            payload = payload_from_ledger_row(
+                query, params, seq, prev_hash, payload_fmt, container_uid)
             if seq != expected_seq:
                 txr['chain_breaks'].append({
                     'id': txn_id,
@@ -228,6 +245,8 @@ def replay_audit(storage):
                     'id': txn_id,
                     'error': 'prev_hash does not match the preceding row (chain broken)'})
             chained_seen = True
+            if is_v3:
+                v3_seen = True
             expected_seq += 1
         running_hash = ledger_row_hash(payload, signature)
 
@@ -265,9 +284,10 @@ def replay_audit(storage):
         # Progressive ledger copy: statements later in the ledger that READ
         # the transactions table see exactly what they saw historically.
         shadow.execute(
-            "INSERT INTO transactions (id, query, params, signature, pub_key, timestamp, seq, prev_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash))
+            "INSERT INTO transactions "
+            "(id, query, params, signature, pub_key, timestamp, seq, prev_hash, payload_fmt) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash, payload_fmt))
     shadow.commit()
 
     # Diff every user + ledger-driven system table present on either side.

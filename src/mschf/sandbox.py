@@ -82,10 +82,12 @@ class HostAPI:
         from mschf.storage import canonical_payload
 
         params = params or []
-        # Sign against the current chain head so this transaction commits to
-        # its exact position in the ledger's hash chain.
+        # Sign against the current chain head + container_uid (v3) so this
+        # transaction commits to its exact position in this container's chain.
         next_seq, prev_hash = self.db.get_chain_head()
-        payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
+        payload_bytes = canonical_payload(
+            query, params, next_seq, prev_hash, self.db.container_uid)
+
 
         password = self.key_passphrase.encode('utf-8') if self.key_passphrase else None
         try:
