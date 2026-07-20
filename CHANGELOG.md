@@ -11,6 +11,19 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux `.deb` missing girepository runtime dependency**: the bundled
+  PyGObject is compiled against girepository-2.0 at package-build time, but
+  the `.deb` didn't declare `libgirepository-2.0-0` — on a clean machine
+  `import gi` failed (ENOENT on `libgirepository-2.0.so.0`) and the Briefcase
+  bootstrap swallowed the error, exiting 0 with no output. Found by the new
+  CI smoke test and pinned with strace. The package now declares
+  `libgirepository-2.0-0` + `gir1.2-gtk-3.0` via
+  `system_runtime_requires`. Note: the `.deb` attached to v0.6.1 predates
+  this fix and fails silently on launch. (The silent-exit bootstrap
+  behavior is an upstream Briefcase reporting gap worth filing.)
+
 ### Added
 
 - **Packaged-app smoke tests on CI**: after packaging, `smoke-linux` installs
