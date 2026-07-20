@@ -70,6 +70,78 @@ _REDUNDANT_DDL = ('duplicate column name', 'already exists')
 _TS_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 
+def historical_rbac_check(conn, identity, query, parse_fn):
+    """Coarse historical RBAC gate against the RBAC state visible in ``conn``.
+
+    Evaluates the same pre-authorizer gates ``execute_signed`` applies, using
+    whatever ``user_roles`` / ``rbac_rules`` are currently visible on ``conn``
+    (a shadow DB during ``replay_audit``, or a replica connection during
+    ``pull_and_apply``) at that point in the chain:
+
+    1. Resolve role from ``user_roles`` (absent → ``'guest'``).
+    2. ``operation, table = parse_fn(query)`` (pass ``MSFStorage._parse_sql_query``).
+    3. Database-level: role needs database read (op ``'read'``) or write (else)
+       permission per ``rbac_rules`` (admin bypasses, mirroring
+       ``check_permission``).
+    4. System tables (``MSFStorage.SYSTEM_TABLES``): any operation → role must
+       be ``'admin'``.
+    5. Otherwise object-level rule check for ``(operation, table)``, same
+       wildcard semantics as ``check_permission``.
+
+    **Limitation**: this is the coarse (operation, first-table) gate only — not
+    the compiled-statement authorizer. Replicas re-checking at authorizer depth
+    (joins, subqueries, CTEs, views, triggers, PRAGMA/ATTACH) is future work.
+
+    Returns ``(allowed: bool, reason: str | None)``.
+    """
+    row = conn.execute(
+        "SELECT role FROM user_roles WHERE identity = ?", (identity,)
+    ).fetchone()
+    role = row[0] if row else 'guest'
+
+    operation, table_name = parse_fn(query)
+
+    def _has_permission(level, target, permission):
+        if role == 'admin':
+            return True
+        count = conn.execute(
+            '''
+            SELECT COUNT(*) FROM rbac_rules
+            WHERE level = ?
+              AND (target = ? OR target = '*')
+              AND role = ?
+              AND (permission = ? OR permission = '*')
+            ''',
+            (level, target, role, permission),
+        ).fetchone()[0]
+        return count > 0
+
+    db_perm_needed = 'read' if operation == 'read' else 'write'
+    if not _has_permission('database', '*', db_perm_needed):
+        return (
+            False,
+            f"Identity '{identity}' does not have database-level "
+            f"{db_perm_needed} permissions",
+        )
+
+    if table_name != '*':
+        if table_name in MSFStorage.SYSTEM_TABLES:
+            if role != 'admin':
+                return (
+                    False,
+                    f"System table '{table_name}' can only be modified by admin.",
+                )
+        else:
+            if not _has_permission('object', table_name, operation):
+                return (
+                    False,
+                    f"Identity '{identity}' does not have '{operation}' "
+                    f"permission on table '{table_name}'.",
+                )
+
+    return True, None
+
+
 def _is_skew(a, b, tolerance_seconds=2):
     """True if a and b are timestamps within tolerance of each other."""
     try:
@@ -193,6 +265,10 @@ def replay_audit(storage):
             'total': len(ledger), 'replayed': 0, 'skipped_reads': 0,
             'invalid_signatures': [], 'untrusted_signers': [], 'replay_anomalies': [],
             'chain_breaks': [],
+            # Failing: mutating row that historical RBAC state would have denied
+            # (e.g. low-priv signer writing a system table). Row is still
+            # replayed so the table diff stays clean; the violation is the finding.
+            'rbac_violations': [],
             # Non-failing: trusted v2 rows from a stale writer amid v3 history
             # whose prev_hash matches the old (no-container) derivation.
             'version_skew': [],
@@ -330,6 +406,17 @@ def replay_audit(storage):
                     shadow.execute(
                         "INSERT INTO user_roles (identity, role) VALUES (?, 'admin')", (identity,))
                 bootstrapped = True
+            # Re-check coarse RBAC against historical shadow state *before*
+            # executing. Denied rows are flagged but still replayed so the
+            # table diff stays clean (the violation itself is the finding).
+            allowed, reason = historical_rbac_check(
+                shadow, identity, query, storage._parse_sql_query)
+            if not allowed:
+                txr['rbac_violations'].append({
+                    'id': txn_id,
+                    'identity': identity,
+                    'reason': reason,
+                })
             now_holder['ts'] = ts
             shadow_store._active_signer = identity
             try:
@@ -417,6 +504,7 @@ def replay_audit(storage):
         and not txr['untrusted_signers']
         and not txr['replay_anomalies']
         and not txr['chain_breaks']
+        and not txr['rbac_violations']
         and cp_status != 'mismatch'
         and all(t['status'] in ('match', 'skew') for t in report['tables'].values())
         and all(c['verified'] for c in report['code'].values())
@@ -445,6 +533,11 @@ def format_report(report):
         lines.append(
             f"  [!!] LEGACY CHECKPOINT MISMATCH expected={cp.get('expected')!r} "
             f"actual={cp.get('actual')!r}"
+        )
+    for item in txr.get('rbac_violations', []):
+        lines.append(
+            f"  [!!] RBAC VIOLATION on txn #{item['id']}: "
+            f"{item.get('reason')} (identity={item.get('identity')})"
         )
     for item in txr['replay_anomalies']:
         lines.append(f"  [!] replay anomaly on txn #{item['id']}: {item.get('error')}")

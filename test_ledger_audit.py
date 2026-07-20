@@ -24,9 +24,11 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath('src'))
 
+import json
 import sqlite3
 from mschf.storage import (
-    MSFStorage, canonical_payload, create_legacy_checkpoint, legacy_prefix_digest,
+    MSFStorage, PAYLOAD_FMT_V3, canonical_payload, create_legacy_checkpoint,
+    legacy_prefix_digest, make_json_serializable,
 )
 from mschf.audit import replay_audit, format_report
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert, default_backend, serialization
@@ -97,6 +99,9 @@ def run():
     print(format_report(report))
     assert report['ok'], "clean container must pass"
     assert report['tables']['dev_tasks']['status'] in ('match', 'skew')
+    assert not report['transactions'].get('rbac_violations'), (
+        "clean container must have zero rbac_violations"
+    )
 
     print("\n--- 2-4. Out-of-band tampering (raw sqlite3, no signatures) ---")
     raw = sqlite3.connect(db_path)
@@ -552,6 +557,101 @@ def run():
     print(f"  [OK] audit status=none, ok=True")
     db9.close()
     os.remove(db9_path)
+
+    print("\n--- 10. Historical RBAC violation flagged; table diff stays clean ---")
+    # Low-priv writer with notes-only rights; a colluding raw insert of a
+    # correctly-signed system-table write must surface as rbac_violations
+    # (not as unexplained/changed rows — the row is still replayed).
+    db10_path = 'test_ledger_audit_rbac.msf'
+    if os.path.exists(db10_path):
+        os.remove(db10_path)
+    writer_cert, writer_key = generate_user_cert(
+        'audit_writer', ca_cert_pem, ca_key_pem)
+    db10 = MSFStorage(db10_path)
+
+    def signed10(query, params, bootstrap=False):
+        sig = make_signed_payload(db10, query, params, admin_key)
+        if bootstrap:
+            return db10.bootstrap_admin(query, params, sig, admin_cert)
+        return db10.execute_signed(query, params, sig, admin_cert)
+
+    db10.conn.execute(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)")
+    db10.conn.commit()
+    signed10(
+        "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+        ['entry_point', 'none'], bootstrap=True)
+    for level, target, role, perm in [
+        ('database', '*', 'writer', 'read'),
+        ('database', '*', 'writer', 'write'),
+        ('object', 'notes', 'writer', 'write'),
+        ('object', 'notes', 'writer', 'read'),
+    ]:
+        signed10(
+            "INSERT INTO rbac_rules (level, target, role, permission) "
+            "VALUES (?, ?, ?, ?)",
+            [level, target, role, perm],
+        )
+    signed10(
+        "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)",
+        ['cert:CN=audit_writer', 'writer'],
+    )
+    signed10("INSERT INTO notes (body) VALUES (?)", ['legit'])
+
+    clean = replay_audit(db10)
+    assert clean['ok']
+    assert not clean['transactions']['rbac_violations']
+    print("  [OK] clean multi-role container has zero rbac_violations")
+
+    poison_q = (
+        "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)"
+    )
+    poison_params = ['cert:CN=evil', 'admin']
+    next_seq, prev_hash = db10.get_chain_head()
+    payload = canonical_payload(
+        poison_q, poison_params, next_seq, prev_hash, db10.container_uid)
+    key = serialization.load_pem_private_key(
+        writer_key, password=None, backend=default_backend())
+    poison_sig = key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+    from datetime import datetime as _dt
+    ts = _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    params_str = json.dumps(make_json_serializable(poison_params))
+    pub_key_val = (
+        writer_cert.decode('utf-8') if isinstance(writer_cert, bytes)
+        else writer_cert
+    )
+    raw10 = sqlite3.connect(db10_path)
+    raw10.execute(poison_q, poison_params)
+    raw10.execute(
+        "INSERT INTO transactions "
+        "(query, params, signature, pub_key, timestamp, seq, prev_hash, "
+        "payload_fmt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (poison_q, params_str, poison_sig, pub_key_val, ts,
+         next_seq, prev_hash, PAYLOAD_FMT_V3),
+    )
+    raw10.commit()
+    raw10.close()
+
+    # MSFStorage may hold a stale snapshot of user_roles; re-open for audit.
+    db10.close()
+    db10 = MSFStorage(db10_path)
+    report = replay_audit(db10)
+    print(format_report(report))
+    assert not report['ok'], "poisoned container must fail audit"
+    violations = report['transactions']['rbac_violations']
+    assert violations, "expected rbac_violations"
+    assert any(
+        v.get('identity') == 'cert:CN=audit_writer' for v in violations
+    ), violations
+    # Table diff must stay clean: violation is flagged, not double-reported
+    # as unexplained/changed rows from a failed replay.
+    for table, result in report['tables'].items():
+        assert result['status'] in ('match', 'skew'), (
+            f"{table} should match after replaying the denied row, got {result}"
+        )
+    print(f"  [OK] rbac_violations={violations}; table diffs clean")
+    db10.close()
+    os.remove(db10_path)
 
     print("\n==========================================")
     print("ALL LEDGER AUDIT TESTS PASSED")

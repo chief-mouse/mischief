@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.x509.oid import NameOID
 
-from mschf.audit import replay_audit
+from mschf.audit import historical_rbac_check, replay_audit
 from mschf.storage import (
     GENESIS_PREV_HASH,
     MSFStorage,
@@ -409,6 +409,10 @@ def pull_and_apply(
     # connection; after apply we reinstall a now-returning implementation
     # (passing None does not restore the engine builtin and leaves a
     # broken UDF that raises on call).
+    #
+    # Limitation: the shim only implements the 1-arg form
+    # (``datetime('now')`` and ``datetime(iso_string)``). Multi-arg SQLite
+    # ``datetime(timestring, modifier, ...)`` is not emulated.
     now_holder = {'ts': None}
 
     def _replay_datetime(*args):
@@ -465,6 +469,17 @@ def pull_and_apply(
             operation, _ = storage._parse_sql_query(query)
             if operation != 'read':
                 identity = storage._get_identity(pub_key)
+                # Re-enforce coarse historical RBAC before applying. A
+                # malicious hub colluding with a trusted-but-unprivileged
+                # signer can feed a correctly-chained row the writer-side
+                # RBAC would have denied; refuse and roll back the batch.
+                allowed, reason = historical_rbac_check(
+                    storage.conn, identity, query, storage._parse_sql_query)
+                if not allowed:
+                    raise PermissionError(
+                        f'pull_and_apply: rbac denied for seq={seq} '
+                        f'({identity}): {reason}'
+                    )
                 now_holder['ts'] = ts
                 storage._active_signer = identity
                 try:
@@ -510,44 +525,19 @@ def pull_and_apply(
         # frozen at the last replayed ledger timestamp.
         storage.conn.create_function('datetime', -1, _live_datetime)
 
-    # After applying, local head should match hub (or already matched if no rows).
-    local_next, local_prev = storage.get_chain_head()
-    if local_next != next_seq or local_prev != prev_hash:
-        # Hub may have advanced between fetch_head and fetch transactions; still
-        # require that what we applied is consistent. Store the head we verified
-        # only if our local tip matches it; otherwise leave sidecar and let the
-        # next pull catch up — but only when we applied nothing beyond.
-        if applied == 0 and (local_next, local_prev) != (next_seq, prev_hash):
-            raise PermissionError(
-                f'pull_and_apply: local head ({local_next}, {local_prev!r}) does not '
-                f'match hub head ({next_seq}, {prev_hash!r}) and no rows were available'
-            )
-
-    # Store attestation for the head we verified at the start of this pull.
-    # If the hub advanced further, the next pull will fetch a newer one.
-    # Prefer storing a head that matches local tip when possible.
-    if local_next == next_seq and local_prev == prev_hash:
-        store_attested_head(storage.filename, head)
-    elif applied > 0:
-        # Build a local attestation record from the applied tip (no hub countersig
-        # for intermediate heads). Keep the hub attestation only when it matches;
-        # otherwise store the verified hub head we started from only if we reached it.
-        if local_next > next_seq:
-            # Should not happen (hub is serializer); flag.
-            raise PermissionError(
-                'pull_and_apply: local head advanced past hub head (internal error)'
-            )
-        # Local still behind hub — store nothing newer than previous; re-fetch next time.
-        # But we did verify chain up to local tip. Store hub head only when caught up.
-        pass
-    else:
-        # applied == 0 and heads match was handled; if heads match store it.
-        store_attested_head(storage.filename, head)
-
-    # When we fully caught up to the fetched head, always persist.
+    # Sidecar: store the fetched-head attestation iff the local tip now equals
+    # it; otherwise leave the previous sidecar in place (next pull persists a
+    # fresh one). Mid-pull race: hub advanced between head-fetch and row-fetch
+    # so the replica's applied tip lands *past* the fetched head
+    # (local_next > next_seq with applied > 0) — benign; skip sidecar store.
     local_next, local_prev = storage.get_chain_head()
     if local_next == next_seq and local_prev == prev_hash:
         store_attested_head(storage.filename, head)
+    elif applied == 0 and (local_next, local_prev) != (next_seq, prev_hash):
+        raise PermissionError(
+            f'pull_and_apply: local head ({local_next}, {local_prev!r}) does not '
+            f'match hub head ({next_seq}, {prev_hash!r}) and no rows were available'
+        )
 
     return {
         'applied': applied,

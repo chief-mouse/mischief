@@ -13,6 +13,21 @@ entry here.
 
 ### Added
 
+- **Replica-side RBAC re-enforcement on replay**: closes the hub-sync v1
+  limit where replicas applied hub rows without re-checking RBAC — a
+  malicious hub colluding with a trusted-but-unprivileged signer could feed
+  replicas a signed, correctly-chained row the historical RBAC state would
+  have denied (e.g. privilege escalation via `user_roles`). A shared
+  `historical_rbac_check` evaluates each mutating row against the RBAC state
+  at its point in history: `replay_audit` flags denials as failing
+  `rbac_violations` (still replaying, so table diffs stay clean and the
+  violation is the finding), and `sync.pull_and_apply` refuses the row
+  outright, rolling back the batch. Coarse (operation, table) gates —
+  authorizer-depth replica checks remain future work. Also fixes the
+  mid-pull hub-advanced race (benign, no longer raises after commit) and
+  simplifies the head-sidecar bookkeeping. Implemented by the grok agent;
+  reviewed and independently re-tested by Claude.
+
 - **Legacy-prefix checkpoint**: closes the documented gap where rows inside a
   pre-chaining legacy prefix weren't linked to each other, so deleting a
   state-neutral legacy audit row (e.g. a signed read) was undetectable.
