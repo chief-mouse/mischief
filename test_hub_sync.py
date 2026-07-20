@@ -9,10 +9,12 @@ head attestation + sidecar anti-truncation, and datetime replay fidelity.
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 
 sys.path.insert(0, os.path.abspath('src'))
 
@@ -23,7 +25,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from mschf.audit import replay_audit, format_report
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert
 from mschf.hub import MSFHub
-from mschf.storage import MSFStorage, canonical_payload
+from mschf.storage import MSFStorage, PAYLOAD_FMT_V3, canonical_payload, make_json_serializable
 from mschf import sync as msync
 
 
@@ -510,7 +512,6 @@ def run():
         # After apply, built-in datetime('now') returns current time again.
         time.sleep(0.05)
         now_val = spoke_a.conn.execute("SELECT datetime('now')").fetchone()[0]
-        from datetime import datetime
         try:
             parsed = datetime.strptime(now_val, '%Y-%m-%d %H:%M:%S')
             # sqlite datetime('now') is UTC; allow a generous window.
@@ -521,6 +522,99 @@ def run():
             print(f"  [OK] datetime('now') restored → {now_val}")
         except ValueError:
             raise AssertionError(f"datetime('now') returned non-timestamp: {now_val!r}")
+
+        # ------------------------------------------------------------------
+        # 9. Malicious hub: RBAC-violating chained row refused on pull
+        # ------------------------------------------------------------------
+        print('\n=== 9. Malicious hub RBAC row → pull PermissionError ===')
+        # Positive control: clean container has zero rbac_violations.
+        clean_report = replay_audit(spoke_a)
+        assert clean_report['ok']
+        assert not clean_report['transactions'].get('rbac_violations'), (
+            clean_report['transactions'].get('rbac_violations')
+        )
+        print('  [OK] clean spoke has zero rbac_violations')
+
+        pre_head = spoke_a.get_chain_head()
+        pre_roles = list(spoke_a.conn.execute(
+            "SELECT identity, role FROM user_roles ORDER BY identity"
+        ).fetchall())
+
+        # Craft a properly-signed, correctly-chained v3 row by low-priv
+        # sync_user (notes-only writer) that escalates via user_roles.
+        poison_q = (
+            "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)"
+        )
+        poison_params = ['cert:CN=evil', 'admin']
+        next_seq, prev_hash = hub_storage.get_chain_head()
+        payload = canonical_payload(
+            poison_q, poison_params, next_seq, prev_hash,
+            hub_storage.container_uid,
+        )
+        poison_sig = user_private.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+        ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        params_str = json.dumps(make_json_serializable(poison_params))
+        pub_key_val = (
+            user_cert.decode('utf-8') if isinstance(user_cert, bytes) else user_cert
+        )
+
+        # Raw sqlite3 on the hub container: insert ledger row AND execute its
+        # effect so hub tables/ledger stay self-consistent (bypasses
+        # execute_signed / writer-side RBAC — colluding hub scenario).
+        raw_hub = sqlite3.connect(hub_msf)
+        raw_hub.execute(poison_q, poison_params)
+        raw_hub.execute(
+            "INSERT INTO transactions "
+            "(query, params, signature, pub_key, timestamp, seq, prev_hash, "
+            "payload_fmt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (poison_q, params_str, poison_sig, pub_key_val, ts,
+             next_seq, prev_hash, PAYLOAD_FMT_V3),
+        )
+        raw_hub.commit()
+        raw_hub.close()
+
+        # Refresh our assertion handle and the hub's cached storage so both
+        # see the poison (raw write was on a separate connection).
+        hub_storage.close()
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        if container_id in hub._storages:
+            try:
+                hub._storages[container_id].close()
+            except Exception:
+                pass
+            del hub._storages[container_id]
+
+        try:
+            msync.pull_and_apply(
+                spoke_a, hub_url, container_id,
+                expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+            )
+            raise AssertionError(
+                'pull_and_apply should refuse RBAC-violating hub row'
+            )
+        except PermissionError as e:
+            assert 'rbac' in str(e).lower(), e
+            print(f'  [OK] pull refused: {e}')
+
+        assert spoke_a.get_chain_head() == pre_head, (
+            f'replica head changed after rollback: '
+            f'{spoke_a.get_chain_head()} vs {pre_head}'
+        )
+        post_roles = list(spoke_a.conn.execute(
+            "SELECT identity, role FROM user_roles ORDER BY identity"
+        ).fetchall())
+        assert post_roles == pre_roles, (
+            f'user_roles changed: {post_roles} vs {pre_roles}'
+        )
+        assert not any(r[0] == 'cert:CN=evil' for r in post_roles)
+        print('  [OK] replica user_roles and head unchanged (rollback)')
+
+        report = replay_audit(hub_storage)
+        print(format_report(report))
+        assert not report['ok'], 'poisoned hub must fail replay_audit'
+        violations = report['transactions']['rbac_violations']
+        assert violations, 'expected rbac_violations on hub file'
+        print(f'  [OK] hub replay_audit rbac_violations: {violations}')
 
         print('\n=== ALL hub/sync tests passed ===')
         return 0
