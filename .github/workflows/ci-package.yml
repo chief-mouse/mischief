@@ -164,9 +164,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      # No setup-python here ON PURPOSE: Briefcase Linux system packages must
+      # be built with the DISTRO's system python3 (it refuses a mismatched
+      # interpreter). Note the resulting .deb runs on the distro Python, which
+      # may differ from desktop authors' 3.11 — dill-pickled micro-app UIs are
+      # bytecode-version-locked across that gap (declarative specs are not).
 
       - name: Install GTK / Briefcase system build prerequisites
         run: |
@@ -184,8 +186,10 @@ jobs:
             libgdk-pixbuf2.0-dev \
             libffi-dev
 
+      # pipx keeps Briefcase off the PEP 668 externally-managed system env
+      # while still running it under the system python3.
       - name: Install Briefcase
-        run: pip install briefcase
+        run: pipx install briefcase
 
       - name: Create app scaffold
         run: briefcase create linux system

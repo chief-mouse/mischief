@@ -58,3 +58,10 @@ requires = [
     "toml",
     "dill",
 ]
+
+[tool.briefcase.app.mschf.macOS]
+# arm64-only: Briefcase's default universal build also resolves x86_64 wheels,
+# and current cryptography releases no longer ship macOS x86_64 wheels — the
+# Intel half of a universal build cannot install. Intel Macs are unsupported
+# until that changes (or a separate x86_64 build with an older pin is added).
+universal_build = false
