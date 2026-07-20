@@ -126,11 +126,12 @@ def load_admin_identity():
 
 
 def sign_payload(db, private_key, query, params):
-    """Sign against db's current chain head (must execute before the head moves)."""
+    """Sign against db's current chain head + container_uid (must execute before the head moves)."""
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
     next_seq, prev_hash = db.get_chain_head()
-    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
+    payload_bytes = canonical_payload(
+        query, params, next_seq, prev_hash, db.container_uid)
     return private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
 

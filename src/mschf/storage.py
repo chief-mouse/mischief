@@ -5,6 +5,7 @@ import base64
 import dill
 import re
 import hashlib
+import secrets
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
@@ -22,6 +23,11 @@ HOST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 # prev_hash value signed by the first transaction of a fresh ledger.
 GENESIS_PREV_HASH = ''
 
+# transactions.payload_fmt values. NULL + NULL seq = legacy v1; NULL/2 + seq =
+# v2 (chained, no container binding); 3 = chained + container_uid.
+PAYLOAD_FMT_V2 = 2
+PAYLOAD_FMT_V3 = 3
+
 
 def make_json_serializable(obj):
     """Recursively base64-encode bytes so params serialize deterministically."""
@@ -34,7 +40,7 @@ def make_json_serializable(obj):
     return obj
 
 
-def canonical_payload(query, params, seq=None, prev_hash=None):
+def canonical_payload(query, params, seq=None, prev_hash=None, container_uid=None):
     """The exact byte string a signer signs for a ledger transaction.
 
     This is the single source of truth for payload canonicalization — every
@@ -44,15 +50,33 @@ def canonical_payload(query, params, seq=None, prev_hash=None):
 
     With ``seq``/``prev_hash`` the payload is the chained v2 format: the
     signature then binds the transaction to one exact position in one exact
-    ledger history. Without them (seq=None) it is the legacy v1 format, kept
-    only to verify ledger rows signed before chaining existed (their ``seq``
-    column is NULL).
+    ledger history. With ``container_uid`` as well (requires ``seq``) it is
+    the v3 format: the signature additionally binds to a specific container
+    identity, so a genesis-starting chain cannot be transplanted into another
+    empty container. Without ``seq`` it is the legacy v1 format, kept only to
+    verify ledger rows signed before chaining existed (their ``seq`` column
+    is NULL).
     """
     payload = {"query": query, "params": make_json_serializable(params)}
     if seq is not None:
         payload["seq"] = seq
         payload["prev_hash"] = prev_hash if prev_hash is not None else GENESIS_PREV_HASH
+        if container_uid is not None:
+            payload["container"] = container_uid
     return json.dumps(payload, sort_keys=True).encode('utf-8')
+
+
+def payload_from_ledger_row(query, params, seq, prev_hash, payload_fmt, container_uid=None):
+    """Reconstruct signed payload bytes from a row's stored ``payload_fmt``.
+
+    No multi-format guessing: the column decides the form.
+    NULL + NULL seq → v1; NULL/2 + seq → v2; 3 → v3 (needs container_uid).
+    """
+    if seq is None:
+        return canonical_payload(query, params)
+    if payload_fmt == PAYLOAD_FMT_V3:
+        return canonical_payload(query, params, seq, prev_hash, container_uid)
+    return canonical_payload(query, params, seq, prev_hash)
 
 
 def ledger_row_hash(payload_bytes, signature):
@@ -62,7 +86,10 @@ def ledger_row_hash(payload_bytes, signature):
 
 class MSFStorage:
     # Tables owned by the platform itself; writable only by admin identities.
-    SYSTEM_TABLES = frozenset({'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles'})
+    SYSTEM_TABLES = frozenset({
+        'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles',
+        'container_meta',
+    })
 
     def __init__(self, filename, ca_cert_path=None, trust_dir=None):
         self.filename = filename
@@ -111,6 +138,8 @@ class MSFStorage:
         # make the ledger a hash chain: both are embedded in the signed payload,
         # so rows cannot be dropped, reordered, or spliced without breaking
         # replay verification. NULL seq marks legacy (pre-chaining) rows.
+        # payload_fmt records which canonical form the row was signed under
+        # (NULL/2 = v2 chain, 3 = v3 chain+container); NULL seq = v1.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,16 +149,21 @@ class MSFStorage:
                 pub_key BLOB,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 seq INTEGER,
-                prev_hash TEXT
+                prev_hash TEXT,
+                payload_fmt INTEGER
             )
         ''')
-        # Migrate pre-chaining containers in place (their existing rows keep
-        # NULL seq/prev_hash and verify under the legacy payload format).
+        # Migrate older containers in place (existing rows keep NULL
+        # seq/prev_hash/payload_fmt and verify under their original format).
         existing_cols = {r[1] for r in cursor.execute("PRAGMA table_info(transactions)")}
-        for col, decl in (('seq', 'INTEGER'), ('prev_hash', 'TEXT')):
+        for col, decl in (
+            ('seq', 'INTEGER'),
+            ('prev_hash', 'TEXT'),
+            ('payload_fmt', 'INTEGER'),
+        ):
             if col not in existing_cols:
                 cursor.execute(f"ALTER TABLE transactions ADD COLUMN {col} {decl}")
-        
+
         # RBAC table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS rbac_rules (
@@ -148,8 +182,35 @@ class MSFStorage:
                 role TEXT NOT NULL
             )
         ''')
-        
+
+        # Per-container identity metadata. Written unsigned at init (like table
+        # schemas) — not ledgered history. container_uid binds every v3 signed
+        # payload to this container so a genesis chain cannot be transplanted.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS container_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        row = cursor.execute(
+            "SELECT value FROM container_meta WHERE key = 'container_uid'"
+        ).fetchone()
+        if row is None:
+            uid = secrets.token_hex(16)
+            cursor.execute(
+                "INSERT INTO container_meta (key, value) VALUES ('container_uid', ?)",
+                (uid,),
+            )
+
         self.conn.commit()
+
+    @property
+    def container_uid(self):
+        """Stable 32-hex-char id minted once per container (see container_meta)."""
+        row = self.conn.execute(
+            "SELECT value FROM container_meta WHERE key = 'container_uid'"
+        ).fetchone()
+        return row[0] if row else None
 
     def _get_identity(self, pub_key_pem):
         """Extract a stable, readable cryptographic identity string from a PEM Cert/Public Key."""
@@ -195,20 +256,18 @@ class MSFStorage:
         injected row.
         """
         row = self.conn.execute(
-            "SELECT query, params, signature, seq, prev_hash FROM transactions "
-            "ORDER BY id DESC LIMIT 1"
+            "SELECT query, params, signature, seq, prev_hash, payload_fmt "
+            "FROM transactions ORDER BY id DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return 1, GENESIS_PREV_HASH
-        query, params_str, signature, seq, prev_hash = row
+        query, params_str, signature, seq, prev_hash, payload_fmt = row
         try:
             params = json.loads(params_str) if params_str else []
         except json.JSONDecodeError:
             params = []
-        if seq is not None:
-            payload = canonical_payload(query, params, seq, prev_hash)
-        else:
-            payload = canonical_payload(query, params)
+        payload = payload_from_ledger_row(
+            query, params, seq, prev_hash, payload_fmt, self.container_uid)
         max_seq = self.conn.execute(
             "SELECT IFNULL(MAX(seq), 0) FROM transactions").fetchone()[0]
         return max_seq + 1, ledger_row_hash(payload, signature)
@@ -448,11 +507,12 @@ class MSFStorage:
         """Execute a query only if the signature, chain, and RBAC checks pass.
 
         The signed payload must embed the current chain head (``seq`` and
-        ``prev_hash`` from ``get_chain_head``), so every ledger row commits to
-        one exact position in one exact history. This method re-derives the
-        expected head itself and verifies the signature against it — a
-        signature over a stale head (or over the legacy unchained payload)
-        fails closed.
+        ``prev_hash`` from ``get_chain_head``) plus this container's
+        ``container_uid`` (v3), so every ledger row commits to one exact
+        position in one exact history of one exact container. This method
+        re-derives the expected head itself and verifies the signature
+        against it — a signature over a stale head, a different container,
+        or the legacy unchained payload fails closed.
 
         ``allow_bootstrap`` is the ONLY way the first-writer-becomes-admin
         bootstrap can fire; callers that run untrusted code (the sandbox) must
@@ -487,13 +547,15 @@ class MSFStorage:
     def _execute_signed_locked(self, query, params, signature, pub_key_pem, allow_bootstrap):
         """Body of execute_signed; runs inside the connection's write transaction."""
         next_seq, prev_hash = self.get_chain_head()
-        payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
+        uid = self.container_uid
+        payload_bytes = canonical_payload(query, params, next_seq, prev_hash, uid)
 
         if not self.verify_signature(payload_bytes, signature, pub_key_pem):
             raise PermissionError(
                 "Invalid transaction signature: the payload must be signed against "
                 f"the current chain head (expected seq={next_seq}, "
-                f"prev_hash={prev_hash!r}). Re-read get_chain_head() and re-sign."
+                f"prev_hash={prev_hash!r}, container={uid!r}). "
+                "Re-read get_chain_head() and re-sign."
             )
 
         # Cryptographic Chain-of-Trust Check for X.509 Certificates.
@@ -582,13 +644,15 @@ class MSFStorage:
 
         # Log the transaction using a separate cursor so we do not clobber the
         # main query's results. seq/prev_hash are the chain position the
-        # signature was just verified against.
+        # signature was just verified against; payload_fmt=3 records the v3
+        # (chain + container) form used for all newly signed rows.
         audit_cursor = self.conn.cursor()
         audit_cursor.execute('''
-            INSERT INTO transactions (query, params, signature, pub_key, seq, prev_hash)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO transactions
+                (query, params, signature, pub_key, seq, prev_hash, payload_fmt)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (query, json.dumps(make_json_serializable(params)), signature, pub_key_pem,
-              next_seq, prev_hash))
+              next_seq, prev_hash, PAYLOAD_FMT_V3))
 
         return operation, cursor
 
@@ -630,23 +694,23 @@ class MSFStorage:
         """
         try:
             cursor = self.conn.cursor()
-            cursor.execute("SELECT query, params, signature, pub_key, seq, prev_hash FROM transactions WHERE query LIKE 'INSERT OR REPLACE INTO source_code%' ORDER BY id DESC")
+            cursor.execute(
+                "SELECT query, params, signature, pub_key, seq, prev_hash, payload_fmt "
+                "FROM transactions WHERE query LIKE 'INSERT OR REPLACE INTO source_code%' "
+                "ORDER BY id DESC"
+            )
             rows = cursor.fetchall()
 
-            for query, params_str, signature, pub_key_pem, seq, prev_hash in rows:
+            for query, params_str, signature, pub_key_pem, seq, prev_hash, payload_fmt in rows:
                 try:
                     params = json.loads(params_str)
                 except Exception:
                     continue
                 if isinstance(params, list) and len(params) > 0 and params[0] == id_val:
                     # Found the transaction that stored this code blob!
-                    # Reconstruct the payload exactly as it was signed: chained
-                    # rows carry their seq/prev_hash, legacy rows (NULL seq)
-                    # were signed over the unchained v1 payload.
-                    if seq is not None:
-                        payload_bytes = canonical_payload(query, params, seq, prev_hash)
-                    else:
-                        payload_bytes = canonical_payload(query, params)
+                    # Reconstruct from the row's stored payload_fmt — no guessing.
+                    payload_bytes = payload_from_ledger_row(
+                        query, params, seq, prev_hash, payload_fmt, self.container_uid)
 
                     # Verify signature
                     verified = self.verify_signature(payload_bytes, signature, pub_key_pem)

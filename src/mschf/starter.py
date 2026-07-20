@@ -142,9 +142,10 @@ def create_starter_container(dest_path, identity, ca_cert_path):
     db = MSFStorage(dest_path, ca_cert_path=ca_cert_path)
 
     def sign(query, params):
-        # Each signature commits to the ledger's current chain head.
+        # Each signature commits to the ledger's current chain head + container.
         next_seq, prev_hash = db.get_chain_head()
-        payload = canonical_payload(query, params, next_seq, prev_hash)
+        payload = canonical_payload(
+            query, params, next_seq, prev_hash, db.container_uid)
         return private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
 
     try:

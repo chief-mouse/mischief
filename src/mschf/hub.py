@@ -167,6 +167,10 @@ class MSFHub:
             'container': container_id,
             'next_seq': next_seq,
             'prev_hash': prev_hash,
+            # Stable per-.msf identity used in v3 signed transaction payloads.
+            # Spokes sign against this claim (and may refuse a mismatch with
+            # their local replica's uid).
+            'container_uid': storage.container_uid,
             'attestation': {
                 'payload': payload_str,
                 'signature': _b64e(sig),
@@ -201,12 +205,13 @@ class MSFHub:
 
     def transactions_since(self, storage, since_seq: int):
         rows = storage.conn.execute(
-            "SELECT id, query, params, signature, pub_key, timestamp, seq, prev_hash "
-            "FROM transactions WHERE seq IS NOT NULL AND seq > ? ORDER BY seq",
+            "SELECT id, query, params, signature, pub_key, timestamp, seq, prev_hash, "
+            "payload_fmt FROM transactions WHERE seq IS NOT NULL AND seq > ? ORDER BY seq",
             (since_seq,),
         ).fetchall()
         out = []
-        for txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash in rows:
+        for (txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash,
+             payload_fmt) in rows:
             try:
                 params = json.loads(params_str) if params_str else []
             except json.JSONDecodeError:
@@ -220,6 +225,7 @@ class MSFHub:
                 'timestamp': ts,
                 'seq': seq,
                 'prev_hash': prev_hash,
+                'payload_fmt': payload_fmt,
             })
         return out
 

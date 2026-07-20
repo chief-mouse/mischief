@@ -48,7 +48,8 @@ def _load_key(pem_bytes):
 def _sign(db, key_pem, query, params):
     key = _load_key(key_pem)
     next_seq, prev_hash = db.get_chain_head()
-    payload = canonical_payload(query, params, next_seq, prev_hash)
+    payload = canonical_payload(
+        query, params, next_seq, prev_hash, db.container_uid)
     return key.sign(payload, padding.PKCS1v15(), hashes.SHA256()), next_seq, prev_hash
 
 
@@ -329,7 +330,8 @@ def run():
         stale_query = "INSERT INTO notes (body) VALUES (?)"
         stale_params = ['stale-signed note']
         # Sign against current head, then advance the head with another write.
-        payload = canonical_payload(stale_query, stale_params, old_seq, old_prev)
+        payload = canonical_payload(
+            stale_query, stale_params, old_seq, old_prev, hub_storage.container_uid)
         stale_sig = user_private.sign(payload, padding.PKCS1v15(), hashes.SHA256())
 
         msync.sign_and_submit(
@@ -371,7 +373,8 @@ def run():
         q = "INSERT INTO notes (body) VALUES (?)"
         p = ['should not land']
         nseq, nprev = hub_storage.get_chain_head()
-        good_payload = canonical_payload(q, p, nseq, nprev)
+        good_payload = canonical_payload(
+            q, p, nseq, nprev, hub_storage.container_uid)
         good_sig = bytearray(user_private.sign(good_payload, padding.PKCS1v15(), hashes.SHA256()))
         good_sig[-1] ^= 0xFF  # corrupt
         try:
@@ -400,7 +403,8 @@ def run():
         nseq, nprev = hub_storage.get_chain_head()
         rq = "INSERT INTO notes (body) VALUES (?)"
         rp = ['rogue insert']
-        rpayload = canonical_payload(rq, rp, nseq, nprev)
+        rpayload = canonical_payload(
+            rq, rp, nseq, nprev, hub_storage.container_uid)
         rsig = rogue_key.sign(rpayload, padding.PKCS1v15(), hashes.SHA256())
         try:
             msync.submit(

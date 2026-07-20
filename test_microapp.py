@@ -39,7 +39,8 @@ with open(ca_key_path, 'rb') as f:
 # signed transaction, including reads).
 def chained_signature(db, query, params, pem_key_bytes):
     next_seq, prev_hash = db.get_chain_head()
-    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
+    payload_bytes = canonical_payload(
+        query, params, next_seq, prev_hash, db.container_uid)
     private_key = serialization.load_pem_private_key(pem_key_bytes, password=None, backend=default_backend())
     return private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 
