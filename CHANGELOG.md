@@ -13,6 +13,32 @@ entry here.
 
 ### Added
 
+- **Container identity binding (payload format v3)**: every container mints a
+  unique `container_uid` (stored in the new unsigned `container_meta` system
+  table; legacy containers upgrade in place on open), and every newly signed
+  payload embeds it. This closes the last replay vector: a captured signed
+  history starting at genesis can no longer be transplanted into a different
+  empty container — whole-file replicas (which share the uid) remain
+  legitimate. The `transactions` table records each row's `payload_fmt`, so
+  verifiers reconstruct exactly the signed form (v1/v2/v3) with no guessing,
+  and `replay_audit` flags a v2 row after v3 history as a format-downgrade
+  chain break. Hub head responses carry the uid; spoke submits can pin an
+  expected uid. Covered by `test_container_binding.py`. Implemented by the
+  grok agent; protocol diff reviewed line-by-line and independently
+  re-tested by Claude.
+
+- **Declarative UI prototype**: `src/mschf/declarative.py` renders micro-app
+  UI from a pure-data JSON spec (manifest key `ui_spec`) instead of a
+  dill-pickled callable — no exec/eval/pickle anywhere, tables bound to
+  SELECT-only signed queries, actions restricted to parameterized SQL through
+  the sandbox's signed-query path (RBAC and authorizer apply unchanged), and
+  hard errors on unknown constructs. Removes arbitrary-code execution from
+  documents, Python-bytecode version lock-in, and the App Store dynamic-code
+  problem for containers that adopt it. Exploration deliverable — findings
+  and v1 recommendation in `docs/declarative-ui-notes.md`; document-loader
+  integration is future work. Covered by `test_declarative.py`. Implemented
+  by the grok agent; reviewed and integrated by Claude.
+
 - **Identity directory container**: `src/mschf/directory.py` authors a signed
   `.msf` phonebook of org identities — public certificates + metadata
   (CN, DER fingerprint, display name, org, active/revoked status) with

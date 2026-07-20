@@ -39,7 +39,7 @@ from mschf.storage import MSFStorage, canonical_payload
 
 def make_signed_payload(db, query, params, pem_key_bytes):
     next_seq, prev_hash = db.get_chain_head()
-    payload_bytes = canonical_payload(query, params, next_seq, prev_hash)
+    payload_bytes = canonical_payload(query, params, next_seq, prev_hash, db.container_uid)
     private_key = serialization.load_pem_private_key(
         pem_key_bytes, password=None, backend=default_backend()
     )

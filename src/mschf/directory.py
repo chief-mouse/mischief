@@ -195,7 +195,7 @@ def _directory_callable():
 def _sign(db, private_key, query, params):
     """Sign against the container's current chain head (call immediately before execute)."""
     next_seq, prev_hash = db.get_chain_head()
-    payload = canonical_payload(query, params, next_seq, prev_hash)
+    payload = canonical_payload(query, params, next_seq, prev_hash, db.container_uid)
     return private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
 
 

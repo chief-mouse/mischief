@@ -147,7 +147,7 @@ def _signer(db, key_pem):
 
     def sign(query, params):
         next_seq, prev_hash = db.get_chain_head()
-        payload = canonical_payload(query, params, next_seq, prev_hash)
+        payload = canonical_payload(query, params, next_seq, prev_hash, db.container_uid)
         return private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
 
     return sign
