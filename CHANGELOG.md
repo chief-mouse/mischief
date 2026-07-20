@@ -11,6 +11,15 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release CI failure on v0.6.0**: the 0.6.0 version bump rewrote
+  `pyproject.toml` with a UTF-8 BOM (PowerShell `Set-Content -Encoding utf8`),
+  which `toml.load` in the CI version-agreement gate can't parse — failing the
+  workflow before any tests ran and skipping the MSI build. File rewritten
+  BOM-free; the `v0.6.0` tag was retargeted to the fixed commit so the release
+  pipeline could complete.
+
 ## [0.6.0] - 2026-07-20
 
 The hardening release: every security limit documented in 0.5.0's multi-user
