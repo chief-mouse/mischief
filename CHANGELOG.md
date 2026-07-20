@@ -11,6 +11,15 @@ entry here.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-19
+
+The multi-user release: a `.msf` container can now be shared, verified, and
+concurrently edited across machines and organizations — hash-chained signed
+ledgers bound to a container identity, org-CA trust stores, hub-and-spoke
+replication with countersigned heads, an identity directory, per-agent
+identities with engine-enforced attribution, and a pickle-free declarative
+UI prototype.
+
 ### Added
 
 - **Container identity binding (payload format v3)**: every container mints a
