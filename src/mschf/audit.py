@@ -15,9 +15,13 @@ Design notes (each of these prevents a class of false positives):
   ``seq`` and ``prev_hash`` in their signed payload, so dropped, reordered,
   or spliced ledger rows surface as ``chain_breaks`` even though each row's
   own signature still verifies. Legacy pre-chaining rows (NULL ``seq``) are
-  exempt, but must all precede the first chained row. (Inherent limit: pure
-  truncation of the ledger *tail* leaves an intact chain — detecting that
-  needs an external record of the expected head.)
+  exempt, but must all precede the first chained row. (Inherent limits:
+  pure truncation of the ledger *tail* leaves an intact chain — detecting
+  that needs an external record of the expected head — and rows *within* a
+  legacy prefix are not linked to each other, so deleting a legacy row whose
+  absence doesn't change replayed state, e.g. a signed read's audit row,
+  is not detectable; only the last legacy row is anchored by the first
+  chained row.)
 - **Time is replayed, not re-evaluated**: the shadow connection overrides the
   ``datetime`` SQL function so ``datetime('now')`` — in query text, trigger
   bodies, and column defaults — returns the ledger row's own timestamp.

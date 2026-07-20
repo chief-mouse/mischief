@@ -182,6 +182,12 @@ class MSFStorage:
         on an empty ledger). Legacy pre-chaining rows still anchor the chain:
         their hash is computed over their v1 payload, and the first chained row
         after them starts at seq 1.
+
+        next_seq is derived from MAX(seq) over the whole ledger, not from the
+        newest row: an out-of-band NULL-seq row appended after chained history
+        (already flagged by replay_audit) must not reset the sequence to 1 —
+        the chain continues past it and the pollution stays localized to the
+        injected row.
         """
         row = self.conn.execute(
             "SELECT query, params, signature, seq, prev_hash FROM transactions "
@@ -198,7 +204,9 @@ class MSFStorage:
             payload = canonical_payload(query, params, seq, prev_hash)
         else:
             payload = canonical_payload(query, params)
-        return (seq or 0) + 1, ledger_row_hash(payload, signature)
+        max_seq = self.conn.execute(
+            "SELECT IFNULL(MAX(seq), 0) FROM transactions").fetchone()[0]
+        return max_seq + 1, ledger_row_hash(payload, signature)
 
     def _parse_sql_query(self, query):
         """Extract (operation, table_name) from basic SQLite queries."""

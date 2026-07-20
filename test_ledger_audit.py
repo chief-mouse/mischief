@@ -15,6 +15,10 @@ sqlite3 client would, and asserts every class of tampering is flagged:
                       though every remaining row's own signature verifies)
   6. trigger shield  (raw DML on a trigger-guarded table fails outright:
                       current_signer() doesn't exist outside the host)
+  7. OOB NULL-seq injection after chained history -> flagged as a chain
+     break, get_chain_head does NOT reset the sequence (next_seq comes from
+     MAX(seq), not the tip row), and legitimate writes continue the chain
+     with no cascading breaks.
 """
 import sys
 import os
@@ -144,6 +148,47 @@ def run():
 
     db.close()
     os.remove(db_path)
+
+    print("--- 8. OOB NULL-seq tip must not reset the chain sequence ---")
+    db2_path = 'test_ledger_audit_nulltip.msf'
+    if os.path.exists(db2_path):
+        os.remove(db2_path)
+    db2 = MSFStorage(db2_path)
+    db2.conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)")
+    db2.conn.commit()
+
+    def signed2(query, params, bootstrap=False):
+        sig = make_signed_payload(db2, query, params, admin_key)
+        if bootstrap:
+            return db2.bootstrap_admin(query, params, sig, admin_cert)
+        return db2.execute_signed(query, params, sig, admin_cert)
+
+    signed2("INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)", ['entry_point', 'none'], bootstrap=True)
+    signed2("INSERT INTO notes (body) VALUES (?)", ['first'])   # seq 2
+
+    # Attacker appends a raw, unchained ledger row after chained history.
+    raw2 = sqlite3.connect(db2_path)
+    raw2.execute("INSERT INTO transactions (query, params, signature, pub_key) VALUES (?, ?, ?, ?)",
+                 ("INSERT INTO notes (body) VALUES (?)", '["oob"]', b'\x00', 'garbage'))
+    raw2.commit()
+    raw2.close()
+
+    next_seq, _ = db2.get_chain_head()
+    assert next_seq == 3, f"NULL-seq tip must not reset the sequence (got next_seq={next_seq})"
+    signed2("INSERT INTO notes (body) VALUES (?)", ['after pollution'])  # seq 3
+
+    report = replay_audit(db2)
+    breaks = report['transactions']['chain_breaks']
+    assert not report['ok'], "polluted ledger must fail the audit"
+    assert len(breaks) == 1 and 'unchained' in breaks[0]['error'], \
+        f"expected exactly the injected row flagged, got {breaks}"
+    seqs = [r[0] for r in db2.conn.execute(
+        "SELECT seq FROM transactions WHERE seq IS NOT NULL ORDER BY id")]
+    assert seqs == [1, 2, 3], f"chained sequence must stay continuous, got {seqs}"
+    print(f"  [OK] injected row flagged, sequence continued 1..3, no cascade: {breaks[0]['error']}")
+    db2.close()
+    os.remove(db2_path)
+
     print("\n==========================================")
     print("ALL LEDGER AUDIT TESTS PASSED")
     print("==========================================")

@@ -30,6 +30,20 @@ entry here.
   ledger columns), and the chain anchors onto the last legacy row.
   Groundwork for multi-user ledger replication.
 
+### Security
+
+- **Chain-head hardening** (independent-review follow-up): `get_chain_head`
+  now derives `next_seq` from `MAX(seq)` over the whole ledger instead of the
+  newest row, so an out-of-band NULL-seq row appended after chained history
+  (already flagged by `replay_audit`) can no longer reset the sequence to 1 —
+  the chain continues past it and the pollution stays localized to the
+  injected row (regression-tested in `test_ledger_audit.py`). Also documented
+  a second inherent hash-chain limit alongside tail truncation: rows *within*
+  a pre-chaining legacy prefix are not linked to each other, so deleting a
+  legacy audit row that doesn't change replayed state (e.g. a signed read) is
+  undetectable; containers created after chaining are fully protected from
+  genesis.
+
 ### Fixed
 
 - **Window-freeze mitigation**: disable Windows window-ghosting at startup
