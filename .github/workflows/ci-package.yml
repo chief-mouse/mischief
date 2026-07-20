@@ -293,7 +293,7 @@ jobs:
           fi
           echo "Discovered launch binary: $BIN"
 
-          sudo apt-get install -y xvfb imagemagick x11-utils
+          sudo apt-get install -y xvfb imagemagick x11-utils dbus-x11 at-spi2-core
 
           export MSCHF_HOME="${RUNNER_TEMP}/mschf-home"
           mkdir -p "$MSCHF_HOME"
@@ -309,10 +309,20 @@ jobs:
           SCREENSHOT="${GITHUB_WORKSPACE}/smoke-linux.png"
           : > "$LOG_FILE"
 
-          "$BIN" >"$LOG_FILE" 2>&1 &
+          # Forensics for silent native-layer deaths: faulthandler prints a
+          # Python stack on segfault; unbuffered so partial output survives;
+          # dbus-run-session provides the session bus GTK expects on bare
+          # runners.
+          export PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1
+          dbus-run-session -- "$BIN" >"$LOG_FILE" 2>&1 &
           APP_PID=$!
           echo "Launched PID=$APP_PID"
           sleep 25
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            set +e; wait "$APP_PID"; echo "app exit code: $?"; set -e
+            echo "=== dmesg tail (segfault forensics) ==="
+            sudo dmesg 2>/dev/null | tail -n 12 || true
+          fi
 
           # --- assertions ---
           if ! kill -0 "$APP_PID" 2>/dev/null; then
@@ -405,7 +415,9 @@ jobs:
           echo "$ATTACH_OUT"
           # Mount point is a /Volumes/... path in the attach output — do not
           # hardcode the volume name.
-          MOUNT=$(echo "$ATTACH_OUT" | grep -oE '/Volumes/[^[:space:]]+' | tail -n 1)
+          # Volume names contain spaces ("Mischief Workspace Manager 0.6.1"):
+          # capture from /Volumes/ to end of line, then trim trailing whitespace.
+          MOUNT=$(echo "$ATTACH_OUT" | grep -o '/Volumes/.*' | tail -n 1 | sed 's/[[:space:]]*$//')
           if [ -z "$MOUNT" ] || [ ! -d "$MOUNT" ]; then
             echo "ERROR: could not determine DMG mount point from hdiutil output"
             exit 1
