@@ -11,6 +11,14 @@ entry here.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-20
+
+The packaging release: installers for all three desktop platforms (Windows
+MSI, macOS DMG, Linux .deb) built and release-attached by a three-OS CI
+matrix that also proves the crypto/ledger/sync core on Windows, Ubuntu, and
+macOS on every push — plus the packaged-app runtime-paths fix that makes
+installed bundles actually work on first run.
+
 ### Added
 
 - **Cross-platform CI matrix + packaging jobs**: the integration test job now
