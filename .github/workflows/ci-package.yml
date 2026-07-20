@@ -315,18 +315,25 @@ jobs:
           # runners.
           export PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1
 
-          # Iteration-3 probe: the app exits 0 instantly with zero output.
-          # Show what the launcher actually is, then run it FOREGROUND with
-          # GLib debug so the reason lands in this log.
-          echo "=== launcher file ==="
-          file "$BIN"; head -n 40 "$BIN" || true
-          echo "=== foreground probe (20s, G_MESSAGES_DEBUG=all) ==="
+          # Iteration-4: the Briefcase ELF bootstrap exits 0 instantly with
+          # ZERO output (not even its own banner) — Python never starts.
+          # Probe it with BRIEFCASE_MAIN_MODULE + strace for the record, but
+          # launch the app payload DIRECTLY via the system interpreter with
+          # the deb's bundled paths: that answers the real question (does the
+          # packaged app run on GTK) independent of the bootstrap quirk.
+          echo "=== bootstrap probe: BRIEFCASE_MAIN_MODULE + strace ==="
+          sudo apt-get install -y strace >/dev/null
           set +e
-          timeout 20 env G_MESSAGES_DEBUG=all "$BIN"
-          echo "probe rc=$? (124 would mean it stayed alive - good)"
+          timeout 20 env BRIEFCASE_MAIN_MODULE=mschf "$BIN"
+          echo "bootstrap+env probe rc=$?"
+          strace -f -e trace=execve,openat,exit_group -o /tmp/strace.txt timeout 5 "$BIN"
+          echo "--- strace tail ---"; tail -n 25 /tmp/strace.txt
           set -e
 
-          dbus-run-session -- "$BIN" >"$LOG_FILE" 2>&1 &
+          APP_LIB=$(dirname "$(dpkg -L "$PKG_NAME" | grep 'app_packages$' | head -n 1)")
+          echo "APP_LIB=$APP_LIB"
+          LAUNCH_PY="import sys; sys.path.insert(0, '$APP_LIB/app'); sys.path.insert(0, '$APP_LIB/app_packages'); import runpy; runpy.run_module('mschf', run_name='__main__')"
+          dbus-run-session -- python3 -c "$LAUNCH_PY" >"$LOG_FILE" 2>&1 &
           APP_PID=$!
           echo "Launched PID=$APP_PID"
           sleep 25
