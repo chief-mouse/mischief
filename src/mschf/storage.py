@@ -84,6 +84,20 @@ def ledger_row_hash(payload_bytes, signature):
     return hashlib.sha256(payload_bytes + b'\x1f' + bytes(signature)).hexdigest()
 
 
+def set_payload_fmt_floor(storage, value):
+    """Record a minimum payload format in unsigned ``container_meta``.
+
+    Future format bumps can set the floor so older writers that consult it
+    refuse to append rather than silently downgrade the chain. Like
+    ``container_uid``, this is infrastructure metadata — not ledgered history.
+    """
+    storage.conn.execute(
+        "INSERT OR REPLACE INTO container_meta (key, value) VALUES ('payload_fmt_floor', ?)",
+        (str(int(value)),),
+    )
+    storage.conn.commit()
+
+
 class MSFStorage:
     # Tables owned by the platform itself; writable only by admin identities.
     SYSTEM_TABLES = frozenset({
@@ -547,6 +561,25 @@ class MSFStorage:
     def _execute_signed_locked(self, query, params, signature, pub_key_pem, allow_bootstrap):
         """Body of execute_signed; runs inside the connection's write transaction."""
         next_seq, prev_hash = self.get_chain_head()
+        # Optional floor: containers can declare a minimum payload format so
+        # older hosts that know about the key (but not a newer fmt) fail closed
+        # instead of appending a downgraded row. Today's writers use fmt 3, so
+        # a floor of 3 is a no-op; a floor of 4 blocks us — that protects future
+        # containers from today's code.
+        floor_row = self.conn.execute(
+            "SELECT value FROM container_meta WHERE key = 'payload_fmt_floor'"
+        ).fetchone()
+        if floor_row is not None:
+            try:
+                floor = int(floor_row[0])
+            except (TypeError, ValueError):
+                floor = None
+            if floor is not None and floor > PAYLOAD_FMT_V3:
+                raise PermissionError(
+                    f"Container payload_fmt_floor={floor} requires a host that "
+                    f"writes format >= {floor} (this writer uses {PAYLOAD_FMT_V3}); "
+                    "upgrade the Workspace Manager."
+                )
         uid = self.container_uid
         payload_bytes = canonical_payload(query, params, next_seq, prev_hash, uid)
 

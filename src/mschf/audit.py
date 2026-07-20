@@ -54,7 +54,7 @@ import re
 from datetime import datetime, timedelta
 
 from mschf.storage import (
-    MSFStorage, GENESIS_PREV_HASH, PAYLOAD_FMT_V3,
+    MSFStorage, GENESIS_PREV_HASH, PAYLOAD_FMT_V2, PAYLOAD_FMT_V3,
     ledger_row_hash, payload_from_ledger_row,
 )
 
@@ -193,6 +193,9 @@ def replay_audit(storage):
             'total': len(ledger), 'replayed': 0, 'skipped_reads': 0,
             'invalid_signatures': [], 'untrusted_signers': [], 'replay_anomalies': [],
             'chain_breaks': [],
+            # Non-failing: trusted v2 rows from a stale writer amid v3 history
+            # whose prev_hash matches the old (no-container) derivation.
+            'version_skew': [],
         },
         'tables': {},
         'code': {},
@@ -201,10 +204,14 @@ def replay_audit(storage):
 
     # Hash-chain state: every row (legacy or chained) advances running_hash;
     # chained rows must link to it and carry consecutive seq values.
+    # prev_v2view_hash is the preceding row hashed under the pre-v3 payload
+    # view (no container field) — what a stale v2 writer would embed as
+    # prev_hash when computing the tip under old code.
     chained_seen = False
     v3_seen = False
     expected_seq = 1
     running_hash = GENESIS_PREV_HASH
+    prev_v2view_hash = GENESIS_PREV_HASH
     container_uid = storage.container_uid
 
     bootstrapped = False
@@ -224,35 +231,88 @@ def replay_audit(storage):
                     'id': txn_id,
                     'error': 'unchained legacy row after chained history (spliced or downgraded)'})
         else:
-            # Format downgrade: a v2 row (NULL/2 fmt) after a v3 row is a break,
-            # mirroring the legacy-after-chained rule. v2 rows before the
-            # upgrade point remain valid.
+            # Format downgrade / prev_hash mismatch may be benign version skew
+            # (stale writer appending v2 after v3) rather than a splice — see
+            # the four-condition test below.
             is_v3 = payload_fmt == PAYLOAD_FMT_V3
-            if v3_seen and not is_v3:
-                txr['chain_breaks'].append({
-                    'id': txn_id,
-                    'error': 'format downgrade: v2 row after v3 history (spliced or downgraded)'})
+            would_downgrade = v3_seen and not is_v3
             payload = payload_from_ledger_row(
                 query, params, seq, prev_hash, payload_fmt, container_uid)
-            if seq != expected_seq:
+
+            seq_ok = (seq == expected_seq)
+            if not seq_ok:
                 txr['chain_breaks'].append({
                     'id': txn_id,
                     'error': f'seq {seq} where {expected_seq} was expected '
                              '(row dropped, injected, or reordered)'})
                 expected_seq = seq  # resync so one gap doesn't cascade
-            if prev_hash != running_hash:
-                txr['chain_breaks'].append({
-                    'id': txn_id,
-                    'error': 'prev_hash does not match the preceding row (chain broken)'})
+
+            would_prev_break = (prev_hash != running_hash)
+            # Signature + trust needed for the skew classifier; results feed
+            # the shared invalid/untrusted reporting below.
+            sig_ok = storage.verify_signature(payload, signature, pub_key)
+            trusted = bool(sig_ok and storage._signer_is_ca_trusted(pub_key))
+
+            if would_downgrade or would_prev_break:
+                # Benign skew: ALL of (1) v2 after v3, (2) valid + trusted sig
+                # over the v2 payload, (3) seq continuous, (4) prev_hash equals
+                # the previous row hashed under the old no-container view.
+                is_benign_skew = (
+                    would_downgrade
+                    and sig_ok and trusted
+                    and seq_ok
+                    and prev_hash == prev_v2view_hash
+                )
+                if is_benign_skew:
+                    identity = storage._get_identity(pub_key)
+                    txr['version_skew'].append({
+                        'id': txn_id,
+                        'error': (
+                            f'v2 row by {identity} amid v3 history (stale writer)'
+                        ),
+                    })
+                else:
+                    if would_downgrade:
+                        txr['chain_breaks'].append({
+                            'id': txn_id,
+                            'error': (
+                                'format downgrade: v2 row after v3 history '
+                                '(spliced or downgraded)'
+                            ),
+                        })
+                    if would_prev_break:
+                        txr['chain_breaks'].append({
+                            'id': txn_id,
+                            'error': (
+                                'prev_hash does not match the preceding row '
+                                '(chain broken)'
+                            ),
+                        })
+
             chained_seen = True
             if is_v3:
                 v3_seen = True
             expected_seq += 1
-        running_hash = ledger_row_hash(payload, signature)
 
-        if not storage.verify_signature(payload, signature, pub_key):
+        # Advance both hash views. running_hash uses the row's stored fmt
+        # (subsequent v3 writers chain over skew rows this way). prev_v2view
+        # drops the container field so the next row can be classified if a
+        # stale writer hashed the tip without knowing about fmt 3.
+        running_hash = ledger_row_hash(payload, signature)
+        v2view_payload = payload_from_ledger_row(
+            query, params, seq, prev_hash,
+            None if seq is None else PAYLOAD_FMT_V2,
+            None,
+        )
+        prev_v2view_hash = ledger_row_hash(v2view_payload, signature)
+
+        # Reuse early verification for chained rows; legacy path verifies here.
+        if seq is None:
+            sig_ok = storage.verify_signature(payload, signature, pub_key)
+            trusted = bool(sig_ok and storage._signer_is_ca_trusted(pub_key))
+        if not sig_ok:
             txr['invalid_signatures'].append({'id': txn_id, 'query': query[:120]})
-        elif not storage._signer_is_ca_trusted(pub_key):
+        elif not trusted:
             txr['untrusted_signers'].append({'id': txn_id, 'query': query[:120]})
 
         operation, _ = storage._parse_sql_query(query)
@@ -327,6 +387,8 @@ def format_report(report):
         lines.append(f"  [!!] UNTRUSTED SIGNER on txn #{item['id']}: {item['query']}")
     for item in txr['chain_breaks']:
         lines.append(f"  [!!] CHAIN BREAK at txn #{item['id']}: {item['error']}")
+    for item in txr.get('version_skew', []):
+        lines.append(f"  [~] VERSION SKEW at txn #{item['id']}: {item['error']}")
     for item in txr['replay_anomalies']:
         lines.append(f"  [!] replay anomaly on txn #{item['id']}: {item.get('error')}")
     for table, result in report['tables'].items():

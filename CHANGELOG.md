@@ -13,6 +13,21 @@ entry here.
 
 ### Added
 
+- **Version-skew downgrade policy**: `replay_audit` now distinguishes a
+  benign stale-writer row from a malicious downgrade splice. A v2 row amid
+  v3 history is classified as non-failing `version_skew` only when its
+  signature is valid and CA-trusted, seq is continuous, AND its `prev_hash`
+  matches the previous row hashed under the old no-container derivation —
+  the precise fingerprint of a writer running pre-v3 code. Anything else
+  (untrusted signer, modern-derivation or garbage prev_hash, seq gap)
+  remains a failing chain break. Fixes the live incident where an old-code
+  GUI's signed reads amid new-code writes made dev_tracker.msf audit-fail.
+  Also adds a forward guard: an optional `payload_fmt_floor` in
+  `container_meta` makes writers below the floor fail closed, so future
+  format bumps can fence today's code (`set_payload_fmt_floor`).
+  Implemented by the grok agent; reviewed and independently re-tested by
+  Claude.
+
 - **Dev-tracker planning horizons + task links**: tasks now carry a `horizon`
   (`near`/`later`, NULL = near) so near-term plans and someday items stop
   sharing one backlog — new `horizon <id> <near|later>` CLI verb, board
