@@ -11,6 +11,22 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **Dev-tracker planning horizons + task links**: tasks now carry a `horizon`
+  (`near`/`later`, NULL = near) so near-term plans and someday items stop
+  sharing one backlog — new `horizon <id> <near|later>` CLI verb, board
+  ordering in_progress → near → later → done, `◷ Later` styling, defer/return
+  GUI buttons, and horizon counts. Tasks can also be related: an append-only
+  `task_links` table (`from -[kind]-> to`, default `related`, UNIQUE-deduped,
+  `created_by` trigger-stamped from the signing cert, immutability-guarded)
+  with `link <from> <to> [kind]` / `links <id>` CLI verbs, link annotations in
+  the list, and a links section in the GUI detail pane. Both arrive via the
+  signed idempotent `_ensure_schema` migration (admin-run once); the `agent`
+  role gets read/write on `task_links` so claude/grok can relate items.
+  Implemented by the grok agent from a written spec; reviewed and
+  independently re-tested by Claude.
+
 ### Fixed
 
 - **Pin toga to 0.5.4 to dodge the WinForms freeze regression.** toga 0.5.5

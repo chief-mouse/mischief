@@ -20,6 +20,9 @@ Usage:
   python dev_tracker.py list                     # show tasks (signed SELECT)
   python dev_tracker.py add "title" ["detail"]   # add a backlog task (signed INSERT)
   python dev_tracker.py status <id> <backlog|in_progress|done>
+  python dev_tracker.py horizon <id> <near|later>
+  python dev_tracker.py link <from_id> <to_id> [kind]  # directional link (default kind: related)
+  python dev_tracker.py links <id>               # show links to/from a task
   python dev_tracker.py update-app               # hot-deploy the current UI code (keeps task data)
   python dev_tracker.py verify                   # load the .msf and run it through the sandbox
   python dev_tracker.py audit                    # replay the signed ledger; flag out-of-band writes
@@ -27,9 +30,12 @@ Usage:
   Examples:
     python dev_tracker.py --identity grok list
     MSCHF_TRACKER_IDENTITY=grok python dev_tracker.py add "task title"
+    python dev_tracker.py horizon 4 later
+    python dev_tracker.py link 19 4 follow-up-of
 """
 import sys
 import os
+import sqlite3
 
 PROJ_DIR = os.path.abspath(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(PROJ_DIR, 'src'))
@@ -48,6 +54,7 @@ PASSPHRASE = os.environ.get('MSCHF_ADMIN_PASSPHRASE', 'changeit')
 _CLI_IDENTITY = None
 
 VALID_STATUSES = ('backlog', 'in_progress', 'done')
+VALID_HORIZONS = ('near', 'later')
 
 SEED_TASKS = [
     ("Authorizer-hook RBAC enforcement",
@@ -172,6 +179,53 @@ AUDIT_TRIGGERS = [
        END""",
 ]
 
+# task_links stamping + append-only guard. Separate from AUDIT_TRIGGERS so
+# test_ledger_audit (which imports that list) stays unchanged. The immutability
+# trigger allows the insert-audit UPDATE while created_by is still NULL, then
+# rejects every subsequent UPDATE (links are append-only history).
+LINK_TRIGGERS = [
+    """CREATE TRIGGER trg_task_links_insert_audit AFTER INSERT ON task_links
+       BEGIN
+         UPDATE task_links SET
+           created_at = COALESCE(NEW.created_at, datetime('now')),
+           created_by = COALESCE(current_signer(), 'unsigned')
+         WHERE id = NEW.id;
+       END""",
+    """CREATE TRIGGER trg_task_links_no_update BEFORE UPDATE ON task_links
+       WHEN OLD.created_by IS NOT NULL
+       BEGIN
+         SELECT RAISE(ABORT, 'task_links are immutable (append-only)');
+       END""",
+]
+
+TASK_LINKS_DDL = (
+    "CREATE TABLE task_links ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+    "from_id INTEGER NOT NULL, "
+    "to_id INTEGER NOT NULL, "
+    "kind TEXT NOT NULL DEFAULT 'related', "
+    "created_at TEXT DEFAULT (datetime('now')), "
+    "created_by TEXT, "
+    "UNIQUE(from_id, to_id, kind))"
+)
+
+# Object-level rules agents need for task_links (dev_tasks rules are provisioned
+# out-of-band for claude/grok). Checked/added idempotently in _ensure_schema.
+AGENT_TASK_LINKS_RBAC = (
+    ('object', 'task_links', 'agent', 'read'),
+    ('object', 'task_links', 'agent', 'write'),
+)
+
+# Sort key for board list: in_progress → backlog(near) → later → done.
+LIST_ORDER_SQL = (
+    "ORDER BY CASE "
+    "WHEN status = 'in_progress' THEN 0 "
+    "WHEN status = 'backlog' AND COALESCE(horizon, 'near') = 'near' THEN 1 "
+    "WHEN status = 'backlog' AND COALESCE(horizon, 'near') = 'later' THEN 2 "
+    "WHEN status = 'done' THEN 3 "
+    "ELSE 4 END, id"
+)
+
 
 def _cert_cn(cert_pem):
     """CN of the signing identity — stamped on rows as created_by/updated_by."""
@@ -185,7 +239,7 @@ def _cert_cn(cert_pem):
 
 
 def _ensure_schema(db, cert_pem, private_key):
-    """Idempotent, signed migration of dev_tasks to the attribution schema.
+    """Idempotent, signed migration of dev_tasks / task_links schema.
 
     When the schema is already current this performs no signed writes. Pending
     migrations require admin (DDL / system-table-adjacent writes); non-admin
@@ -206,6 +260,11 @@ def _ensure_schema(db, cert_pem, private_key):
                         [identity, identity])
             print(f"Migrated dev_tasks schema (added: {', '.join(added)}).")
 
+        if 'horizon' not in cols:
+            signed_exec(db, cert_pem, private_key,
+                        "ALTER TABLE dev_tasks ADD COLUMN horizon TEXT", [])
+            print("Migrated dev_tasks schema (added: horizon).")
+
         existing = {r[0] for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
         missing = [ddl for ddl in AUDIT_TRIGGERS if ddl.split()[2] not in existing]
         if missing:
@@ -218,6 +277,32 @@ def _ensure_schema(db, cert_pem, private_key):
             for ddl in missing:
                 signed_exec(db, cert_pem, private_key, ddl, [])
             print(f"Installed audit triggers ({len(missing)}); attribution is now engine-enforced.")
+
+        tables = {r[0] for r in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'task_links' not in tables:
+            signed_exec(db, cert_pem, private_key, TASK_LINKS_DDL, [])
+            print("Created task_links table.")
+
+        existing = {r[0] for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+        missing_links = [ddl for ddl in LINK_TRIGGERS if ddl.split()[2] not in existing]
+        if missing_links:
+            for ddl in missing_links:
+                signed_exec(db, cert_pem, private_key, ddl, [])
+            print(f"Installed task_links triggers ({len(missing_links)}).")
+
+        for level, target, role, perm in AGENT_TASK_LINKS_RBAC:
+            row = db.conn.execute(
+                "SELECT 1 FROM rbac_rules WHERE level = ? AND target = ? AND role = ? AND permission = ?",
+                [level, target, role, perm],
+            ).fetchone()
+            if not row:
+                signed_exec(
+                    db, cert_pem, private_key,
+                    "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)",
+                    [level, target, role, perm],
+                )
+                print(f"Added RBAC rule: {level}/{target} {role} {perm}.")
     except PermissionError as e:
         sys.exit(
             f"Schema migration requires admin identity — run once as admin "
@@ -256,8 +341,18 @@ def dev_tracker_app(toga, host_api):
         denied.add(toga.Label(f"Identity cert:CN={cn} has no database-level read permission on the Dev Tracker.", style=P()))
         return denied
 
-    LABELS = {'in_progress': '● In Progress', 'backlog': '○ Backlog', 'done': '✓ Done'}
+    def status_label_text(status, horizon):
+        if status == 'in_progress':
+            return '● In Progress'
+        if status == 'done':
+            return '✓ Done'
+        if status == 'backlog' and (horizon or 'near') == 'later':
+            return '◷ Later'
+        return '○ Backlog'
+
     details = {}   # task id -> detail text, filled by refresh()
+    titles = {}    # task id -> title
+    link_lines = {}  # task id -> list of link description lines
 
     board = toga.Box(id='dev_tracker_board', style=P(direction='column', margin=16, flex=1))
 
@@ -282,7 +377,7 @@ def dev_tracker_app(toga, host_api):
     # A read-only multiline input wraps long detail text; a Label would force
     # the whole window to grow to the text's single-line width.
     detail_view = toga.MultilineTextInput(readonly=True, placeholder="Select a task to see its detail.",
-                                          style=P(height=56, font_size=10, margin_bottom=8))
+                                          style=P(height=80, font_size=10, margin_bottom=8))
     board.add(detail_view)
 
     status_label = toga.Label("Ready.", style=P(font_size=10, font_style='italic', margin_top=8))
@@ -324,24 +419,55 @@ def dev_tracker_app(toga, host_api):
     def refresh(widget=None):
         try:
             cursor = host_api.execute_signed_query(
-                "SELECT id, title, status, created_at, created_by, updated_at, updated_by, detail "
+                "SELECT id, title, status, created_at, created_by, updated_at, updated_by, detail, "
+                "COALESCE(horizon, 'near') "
                 "FROM dev_tasks "
-                "ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'backlog' THEN 1 ELSE 2 END, id"
+                "ORDER BY CASE "
+                "WHEN status = 'in_progress' THEN 0 "
+                "WHEN status = 'backlog' AND COALESCE(horizon, 'near') = 'near' THEN 1 "
+                "WHEN status = 'backlog' AND COALESCE(horizon, 'near') = 'later' THEN 2 "
+                "WHEN status = 'done' THEN 3 "
+                "ELSE 4 END, id"
             )
             rows = cursor.fetchall()
             details.clear()
             details.update({r[0]: (r[7] or "").strip() for r in rows})
+            titles.clear()
+            titles.update({r[0]: r[1] for r in rows})
+            link_lines.clear()
+            try:
+                lcur = host_api.execute_signed_query(
+                    "SELECT from_id, to_id, kind FROM task_links"
+                )
+                for fr, to, kind in lcur.fetchall():
+                    link_lines.setdefault(fr, []).append(
+                        f"  -[{kind}]-> #{to} {titles.get(to, '')}".rstrip())
+                    link_lines.setdefault(to, []).append(
+                        f"  <-[{kind}]- #{fr} {titles.get(fr, '')}".rstrip())
+            except Exception:
+                # Pre-migration containers or missing object read — detail still works.
+                pass
             # Trim timestamps to minute resolution and identities to bare CNs
             # to keep the columns compact.
             who = lambda w: (w or "?").replace('cert:CN=', '')
-            table.data = [(r[0], r[1], LABELS.get(r[2], r[2]),
+            table.data = [(r[0], r[1], status_label_text(r[2], r[8]),
                            (r[3] or "")[:16], who(r[4]), (r[5] or "")[:16], who(r[6]))
                           for r in rows]
             tune_columns()
-            n = {'backlog': 0, 'in_progress': 0, 'done': 0}
+            near = later = in_prog = done = 0
             for r in rows:
-                n[r[2]] = n.get(r[2], 0) + 1
-            counts_label.text = f"{n['backlog']} backlog · {n['in_progress']} in progress · {n['done']} done"
+                st, hz = r[2], (r[8] or 'near')
+                if st == 'done':
+                    done += 1
+                elif st == 'in_progress':
+                    in_prog += 1
+                elif hz == 'later':
+                    later += 1
+                else:
+                    near += 1
+            counts_label.text = (
+                f"{near} near · {later} later · {in_prog} in progress · {done} done"
+            )
             status_label.text = "Ready."
         except Exception as e:
             status_label.text = f"Query blocked: {e}"
@@ -350,8 +476,12 @@ def dev_tracker_app(toga, host_api):
         row = table.selection
         if row is None:
             detail_view.value = ""
-        else:
-            detail_view.value = details.get(row.num) or "(no detail)"
+            return
+        body = details.get(row.num) or "(no detail)"
+        links = link_lines.get(row.num) or []
+        if links:
+            body = body + "\n\nLinks:\n" + "\n".join(links)
+        detail_view.value = body
     table.on_select = on_select
 
     def set_status(new_status):
@@ -371,10 +501,29 @@ def dev_tracker_app(toga, host_api):
                 status_label.text = f"Blocked by RBAC: {e}"
         return handler
 
+    def set_horizon(new_horizon):
+        def handler(widget):
+            row = table.selection
+            if row is None:
+                status_label.text = "Select a task in the table first."
+                return
+            try:
+                host_api.execute_signed_query(
+                    "UPDATE dev_tasks SET horizon = ? WHERE id = ?",
+                    [new_horizon, row.num]
+                )
+                status_label.text = f"Task #{row.num} horizon -> {new_horizon} (signed by {cn})."
+                refresh()
+            except Exception as e:
+                status_label.text = f"Blocked by RBAC: {e}"
+        return handler
+
     actions = toga.Box(style=P(direction='row', margin_bottom=12))
     actions.add(toga.Button("● Mark In Progress", on_press=set_status('in_progress'), style=P(margin_right=8)))
     actions.add(toga.Button("✓ Mark Done", on_press=set_status('done'), style=P(margin_right=8)))
     actions.add(toga.Button("○ Back to Backlog", on_press=set_status('backlog'), style=P(margin_right=8)))
+    actions.add(toga.Button("Defer to Later", on_press=set_horizon('later'), style=P(margin_right=8)))
+    actions.add(toga.Button("Move to Near", on_press=set_horizon('near'), style=P(margin_right=8)))
     actions.add(toga.Box(style=P(flex=1)))
     actions.add(toga.Button("Refresh", on_press=refresh))
     board.add(actions)
@@ -429,6 +578,9 @@ def cmd_init():
     db = MSFStorage(DB_PATH)
 
     # Schema is an authoring step, like test_microapp.py's provisioning.
+    # horizon + task_links are added by _ensure_schema (signed migration) so
+    # existing containers pick them up the same way; first admin CLI command
+    # after init (or after an upgrade) runs that path.
     db.conn.execute(
         "CREATE TABLE IF NOT EXISTS dev_tasks ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, detail TEXT, "
@@ -471,20 +623,52 @@ def _open_for_cli():
     return MSFStorage(DB_PATH), cert_pem, private_key
 
 
+def _list_tag(status, horizon):
+    """4-char status tag for CLI list lines."""
+    if status == 'in_progress':
+        return 'WIP '
+    if status == 'done':
+        return 'DONE'
+    if status == 'backlog' and (horizon or 'near') == 'later':
+        return 'LATR'
+    if status == 'backlog':
+        return 'TODO'
+    return '??? '
+
+
 def cmd_list():
     db, cert_pem, private_key = _open_for_cli()
     _ensure_schema(db, cert_pem, private_key)
-    cursor = signed_exec(db, cert_pem, private_key,
-                         "SELECT id, title, status, created_at, created_by, updated_at, updated_by FROM dev_tasks "
-                         "ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'backlog' THEN 1 ELSE 2 END, id", [])
+    cursor = signed_exec(
+        db, cert_pem, private_key,
+        "SELECT id, title, status, created_at, created_by, updated_at, updated_by, "
+        "COALESCE(horizon, 'near') FROM dev_tasks " + LIST_ORDER_SQL,
+        [],
+    )
     rows = cursor.fetchall()
-    tags = {'in_progress': 'WIP ', 'backlog': 'TODO', 'done': 'DONE'}
+    # Compact outgoing/incoming link counts and first target for annotation.
+    link_annot = {}
+    try:
+        lcur = signed_exec(
+            db, cert_pem, private_key,
+            "SELECT from_id, to_id, kind FROM task_links", [],
+        )
+        for fr, to, kind in lcur.fetchall():
+            link_annot.setdefault(fr, []).append(f"->{to}")
+            link_annot.setdefault(to, []).append(f"<-{fr}")
+    except Exception:
+        pass
     strip = lambda who: (who or '?').replace('cert:CN=', '')
     for r in rows:
-        print(f"  [{tags.get(r[2], '??? ')}] #{r[0]} {r[1]}  "
+        tid, title, status = r[0], r[1], r[2]
+        horizon = r[7]
+        ann = link_annot.get(tid)
+        ann_s = f"  [{','.join(ann)}]" if ann else ""
+        print(f"  [{_list_tag(status, horizon)}] #{tid} {title}{ann_s}  "
               f"(created {r[3]} by {strip(r[4])}; updated {r[5]} by {strip(r[6])})")
     done = sum(1 for r in rows if r[2] == 'done')
-    print(f"\n{len(rows)} tasks, {done} done.")
+    later = sum(1 for r in rows if r[2] == 'backlog' and (r[7] or 'near') == 'later')
+    print(f"\n{len(rows)} tasks, {done} done, {later} later.")
     db.close()
 
 
@@ -509,6 +693,77 @@ def cmd_status(task_id, new_status):
     cursor = signed_exec(db, cert_pem, private_key, "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)])
     row = cursor.fetchone()
     print(f"Task #{task_id} ({row[0] if row else '?'}) -> {new_status}")
+    db.close()
+
+
+def cmd_horizon(task_id, new_horizon):
+    if new_horizon not in VALID_HORIZONS:
+        sys.exit(f"Invalid horizon '{new_horizon}' — use one of {VALID_HORIZONS}")
+    db, cert_pem, private_key = _open_for_cli()
+    _ensure_schema(db, cert_pem, private_key)
+    signed_exec(db, cert_pem, private_key,
+                "UPDATE dev_tasks SET horizon = ? WHERE id = ?",
+                [new_horizon, int(task_id)])
+    cursor = signed_exec(db, cert_pem, private_key, "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)])
+    row = cursor.fetchone()
+    print(f"Task #{task_id} ({row[0] if row else '?'}) horizon -> {new_horizon}")
+    db.close()
+
+
+def cmd_link(from_id, to_id, kind='related'):
+    from_id, to_id = int(from_id), int(to_id)
+    kind = (kind or 'related').strip() or 'related'
+    db, cert_pem, private_key = _open_for_cli()
+    _ensure_schema(db, cert_pem, private_key)
+    for tid, label in ((from_id, 'from_id'), (to_id, 'to_id')):
+        row = signed_exec(
+            db, cert_pem, private_key,
+            "SELECT id FROM dev_tasks WHERE id = ?", [tid],
+        ).fetchone()
+        if not row:
+            db.close()
+            sys.exit(f"No task with id {tid} ({label}).")
+    try:
+        signed_exec(
+            db, cert_pem, private_key,
+            "INSERT INTO task_links (from_id, to_id, kind) VALUES (?, ?, ?)",
+            [from_id, to_id, kind],
+        )
+    except sqlite3.IntegrityError:
+        db.close()
+        sys.exit(f"Link already exists: #{from_id} -[{kind}]-> #{to_id}")
+    print(f"Linked #{from_id} -[{kind}]-> #{to_id}")
+    db.close()
+
+
+def cmd_links(task_id):
+    task_id = int(task_id)
+    db, cert_pem, private_key = _open_for_cli()
+    _ensure_schema(db, cert_pem, private_key)
+    exists = signed_exec(
+        db, cert_pem, private_key,
+        "SELECT title FROM dev_tasks WHERE id = ?", [task_id],
+    ).fetchone()
+    if not exists:
+        db.close()
+        sys.exit(f"No task with id {task_id}.")
+    print(f"Links for #{task_id} ({exists[0]}):")
+    out = signed_exec(
+        db, cert_pem, private_key,
+        "SELECT to_id, kind FROM task_links WHERE from_id = ? ORDER BY id",
+        [task_id],
+    ).fetchall()
+    inn = signed_exec(
+        db, cert_pem, private_key,
+        "SELECT from_id, kind FROM task_links WHERE to_id = ? ORDER BY id",
+        [task_id],
+    ).fetchall()
+    if not out and not inn:
+        print("  (none)")
+    for to_id, kind in out:
+        print(f"  #{task_id} -[{kind}]-> #{to_id}")
+    for from_id, kind in inn:
+        print(f"  #{from_id} -[{kind}]-> #{task_id}")
     db.close()
 
 
@@ -617,6 +872,12 @@ def main():
         cmd_add(args[1], args[2] if len(args) > 2 else "")
     elif cmd == 'status' and len(args) == 3:
         cmd_status(args[1], args[2])
+    elif cmd == 'horizon' and len(args) == 3:
+        cmd_horizon(args[1], args[2])
+    elif cmd == 'link' and len(args) >= 3:
+        cmd_link(args[1], args[2], args[3] if len(args) > 3 else 'related')
+    elif cmd == 'links' and len(args) == 2:
+        cmd_links(args[1])
     elif cmd == 'update-app':
         cmd_update_app()
     elif cmd == 'audit':
