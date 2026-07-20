@@ -24,6 +24,20 @@ entry here.
   and containers without a checkpoint keep today's behavior. Implemented by
   the grok agent; reviewed and independently re-tested by Claude.
 
+- **Tracker validation rules — descriptions required**: dev_tasks items can
+  no longer be saved without a description. Enforced engine-level via the
+  platform's signed-trigger pattern (BEFORE INSERT/UPDATE `RAISE(ABORT)` on
+  NULL/blank detail, installed through the idempotent signed `_ensure_schema`
+  migration), so every writer — CLI, GUI, sandboxed micro-app, raw sqlite —
+  is bound, and replay applies the rule only from its historical point.
+  CLI `add` now requires the detail argument; new `describe <id> "text"`
+  verb; GUI add row gains a required description input, with engine
+  rejections surfaced in the status line. Deliberate strictness on legacy
+  empty-detail rows: the next status/horizon touch requires `describe`
+  first (clean guidance, no traceback). Establishes validation rules as
+  signed, auditable container content. Implemented by the grok agent;
+  reviewed and independently re-tested by Claude.
+
 - **Version-skew downgrade policy**: `replay_audit` now distinguishes a
   benign stale-writer row from a malicious downgrade splice. A v2 row amid
   v3 history is classified as non-failing `version_skew` only when its

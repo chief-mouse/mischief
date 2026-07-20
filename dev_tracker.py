@@ -18,7 +18,8 @@ Usage:
   python dev_tracker.py init                     # (re)create dev_tracker.msf with seeded backlog
                                                  # (always signs as admin; override is ignored)
   python dev_tracker.py list                     # show tasks (signed SELECT)
-  python dev_tracker.py add "title" ["detail"]   # add a backlog task (signed INSERT)
+  python dev_tracker.py add "title" "detail"     # add a backlog task (description required)
+  python dev_tracker.py describe <id> "text"     # set/replace a task's description (required non-blank)
   python dev_tracker.py status <id> <backlog|in_progress|done>
   python dev_tracker.py horizon <id> <near|later>
   python dev_tracker.py link <from_id> <to_id> [kind]  # directional link (default kind: related)
@@ -29,7 +30,8 @@ Usage:
 
   Examples:
     python dev_tracker.py --identity grok list
-    MSCHF_TRACKER_IDENTITY=grok python dev_tracker.py add "task title"
+    MSCHF_TRACKER_IDENTITY=grok python dev_tracker.py add "task title" "why it matters"
+    python dev_tracker.py describe 4 "fill in missing detail"
     python dev_tracker.py horizon 4 later
     python dev_tracker.py link 19 4 follow-up-of
 """
@@ -198,6 +200,45 @@ LINK_TRIGGERS = [
        END""",
 ]
 
+# Engine-level: every dev_tasks row must carry a non-blank description (detail).
+# Separate from AUDIT_TRIGGERS so test_ledger_audit imports stay unchanged.
+# The AFTER INSERT/UPDATE audit triggers stamp only timestamps/identity and
+# leave detail alone; with recursive_triggers off those stamping UPDATEs do not
+# re-enter this guard. A user UPDATE (status/horizon/…) on a legacy row that
+# already has empty detail DOES trip the UPDATE guard — deliberate strictness:
+# the next touch must set a description first (CLI: describe <id> "text").
+DETAIL_REQUIRED_MSG = 'dev_tasks require a description (detail)'
+VALIDATION_TRIGGERS = [
+    f"""CREATE TRIGGER trg_dev_tasks_require_detail_ins BEFORE INSERT ON dev_tasks
+       WHEN NEW.detail IS NULL OR trim(NEW.detail) = ''
+       BEGIN
+         SELECT RAISE(ABORT, '{DETAIL_REQUIRED_MSG}');
+       END""",
+    f"""CREATE TRIGGER trg_dev_tasks_require_detail_upd BEFORE UPDATE ON dev_tasks
+       WHEN NEW.detail IS NULL OR trim(NEW.detail) = ''
+       BEGIN
+         SELECT RAISE(ABORT, '{DETAIL_REQUIRED_MSG}');
+       END""",
+]
+
+
+def _is_detail_required_error(exc):
+    """True when SQLite aborted because detail was empty/blank."""
+    return DETAIL_REQUIRED_MSG in str(exc)
+
+
+def _detail_required_cli_hint(task_id=None):
+    if task_id is not None:
+        return (
+            f"Task #{task_id} has no description — set one first:\n"
+            f'  python dev_tracker.py describe {task_id} "text"'
+        )
+    return (
+        'Tasks require a description (detail). '
+        'Usage: python dev_tracker.py add "title" "detail"'
+    )
+
+
 TASK_LINKS_DDL = (
     "CREATE TABLE task_links ("
     "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -290,6 +331,13 @@ def _ensure_schema(db, cert_pem, private_key):
             for ddl in missing_links:
                 signed_exec(db, cert_pem, private_key, ddl, [])
             print(f"Installed task_links triggers ({len(missing_links)}).")
+
+        existing = {r[0] for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+        missing_val = [ddl for ddl in VALIDATION_TRIGGERS if ddl.split()[2] not in existing]
+        if missing_val:
+            for ddl in missing_val:
+                signed_exec(db, cert_pem, private_key, ddl, [])
+            print(f"Installed validation triggers ({len(missing_val)}): detail required on dev_tasks.")
 
         for level, target, role, perm in AGENT_TASK_LINKS_RBAC:
             row = db.conn.execute(
@@ -498,7 +546,14 @@ def dev_tracker_app(toga, host_api):
                 status_label.text = f"Task #{row.num} -> {new_status} (signed by {cn})."
                 refresh()
             except Exception as e:
-                status_label.text = f"Blocked by RBAC: {e}"
+                err = str(e)
+                if 'require a description' in err:
+                    status_label.text = (
+                        f"Task #{row.num} needs a description before status can change. "
+                        f"Use: describe {row.num} \"text\" ({e})"
+                    )
+                else:
+                    status_label.text = f"Blocked: {e}"
         return handler
 
     def set_horizon(new_horizon):
@@ -515,7 +570,14 @@ def dev_tracker_app(toga, host_api):
                 status_label.text = f"Task #{row.num} horizon -> {new_horizon} (signed by {cn})."
                 refresh()
             except Exception as e:
-                status_label.text = f"Blocked by RBAC: {e}"
+                err = str(e)
+                if 'require a description' in err:
+                    status_label.text = (
+                        f"Task #{row.num} needs a description before horizon can change. "
+                        f"Use: describe {row.num} \"text\" ({e})"
+                    )
+                else:
+                    status_label.text = f"Blocked: {e}"
         return handler
 
     actions = toga.Box(style=P(direction='row', margin_bottom=12))
@@ -531,24 +593,38 @@ def dev_tracker_app(toga, host_api):
     # --- New task ---
     new_row = toga.Box(style=P(direction='row'))
     title_input = toga.TextInput(placeholder="New task title...", style=P(flex=1, margin_right=8))
+    detail_input = toga.TextInput(
+        placeholder="Description (required)...",
+        style=P(flex=1, margin_right=8),
+    )
 
     def add_task(widget):
         title = (title_input.value or "").strip()
+        detail = (detail_input.value or "").strip()
         if not title:
             status_label.text = "Enter a task title first."
+            return
+        if not detail:
+            status_label.text = "Description is required — fill in the description field."
             return
         try:
             host_api.execute_signed_query(
                 "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, 'backlog')",
-                [title, ""]
+                [title, detail]
             )
             title_input.value = ""
+            detail_input.value = ""
             status_label.text = f"Added '{title}' (signed by {cn})."
             refresh()
         except Exception as e:
-            status_label.text = f"Blocked by RBAC: {e}"
+            err = str(e)
+            if 'require a description' in err:
+                status_label.text = f"Description required: {e}"
+            else:
+                status_label.text = f"Blocked: {e}"
 
     new_row.add(title_input)
+    new_row.add(detail_input)
     new_row.add(toga.Button("+ Add Task", on_press=add_task))
     board.add(new_row)
     board.add(status_label)
@@ -673,12 +749,54 @@ def cmd_list():
 
 
 def cmd_add(title, detail=""):
+    # Client gate before any signing/open — engine triggers enforce the same rule.
+    if not (detail or "").strip():
+        sys.exit(_detail_required_cli_hint())
     db, cert_pem, private_key = _open_for_cli()
     _ensure_schema(db, cert_pem, private_key)
-    signed_exec(db, cert_pem, private_key,
-                "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, 'backlog')",
-                [title, detail])
+    try:
+        signed_exec(db, cert_pem, private_key,
+                    "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, 'backlog')",
+                    [title, detail])
+    except Exception as e:
+        db.close()
+        if _is_detail_required_error(e):
+            sys.exit(_detail_required_cli_hint())
+        raise
     print(f"Added backlog task: {title}")
+    db.close()
+
+
+def cmd_describe(task_id, detail):
+    """Set a task's description (detail). Refuses blank text before signing."""
+    if not (detail or "").strip():
+        sys.exit(
+            'Description cannot be blank. '
+            'Usage: python dev_tracker.py describe <id> "text"'
+        )
+    db, cert_pem, private_key = _open_for_cli()
+    _ensure_schema(db, cert_pem, private_key)
+    tid = int(task_id)
+    exists = signed_exec(
+        db, cert_pem, private_key,
+        "SELECT title FROM dev_tasks WHERE id = ?", [tid],
+    ).fetchone()
+    if not exists:
+        db.close()
+        sys.exit(f"No task with id {tid}.")
+    try:
+        signed_exec(db, cert_pem, private_key,
+                    "UPDATE dev_tasks SET detail = ? WHERE id = ?",
+                    [detail, tid])
+    except Exception as e:
+        db.close()
+        if _is_detail_required_error(e):
+            sys.exit(
+                'Description cannot be blank. '
+                'Usage: python dev_tracker.py describe <id> "text"'
+            )
+        raise
+    print(f"Task #{tid} ({exists[0]}) description updated.")
     db.close()
 
 
@@ -687,9 +805,15 @@ def cmd_status(task_id, new_status):
         sys.exit(f"Invalid status '{new_status}' — use one of {VALID_STATUSES}")
     db, cert_pem, private_key = _open_for_cli()
     _ensure_schema(db, cert_pem, private_key)
-    signed_exec(db, cert_pem, private_key,
-                "UPDATE dev_tasks SET status = ? WHERE id = ?",
-                [new_status, int(task_id)])
+    try:
+        signed_exec(db, cert_pem, private_key,
+                    "UPDATE dev_tasks SET status = ? WHERE id = ?",
+                    [new_status, int(task_id)])
+    except Exception as e:
+        db.close()
+        if _is_detail_required_error(e):
+            sys.exit(_detail_required_cli_hint(task_id))
+        raise
     cursor = signed_exec(db, cert_pem, private_key, "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)])
     row = cursor.fetchone()
     print(f"Task #{task_id} ({row[0] if row else '?'}) -> {new_status}")
@@ -701,9 +825,15 @@ def cmd_horizon(task_id, new_horizon):
         sys.exit(f"Invalid horizon '{new_horizon}' — use one of {VALID_HORIZONS}")
     db, cert_pem, private_key = _open_for_cli()
     _ensure_schema(db, cert_pem, private_key)
-    signed_exec(db, cert_pem, private_key,
-                "UPDATE dev_tasks SET horizon = ? WHERE id = ?",
-                [new_horizon, int(task_id)])
+    try:
+        signed_exec(db, cert_pem, private_key,
+                    "UPDATE dev_tasks SET horizon = ? WHERE id = ?",
+                    [new_horizon, int(task_id)])
+    except Exception as e:
+        db.close()
+        if _is_detail_required_error(e):
+            sys.exit(_detail_required_cli_hint(task_id))
+        raise
     cursor = signed_exec(db, cert_pem, private_key, "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)])
     row = cursor.fetchone()
     print(f"Task #{task_id} ({row[0] if row else '?'}) horizon -> {new_horizon}")
@@ -869,7 +999,10 @@ def main():
     elif cmd == 'list':
         cmd_list()
     elif cmd == 'add' and len(args) >= 2:
+        # Missing detail arg is refused cleanly (same as blank detail).
         cmd_add(args[1], args[2] if len(args) > 2 else "")
+    elif cmd == 'describe' and len(args) >= 2:
+        cmd_describe(args[1], args[2] if len(args) > 2 else "")
     elif cmd == 'status' and len(args) == 3:
         cmd_status(args[1], args[2])
     elif cmd == 'horizon' and len(args) == 3:
