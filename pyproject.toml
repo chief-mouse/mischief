@@ -59,6 +59,16 @@ requires = [
     "dill",
 ]
 
+[tool.briefcase.app.mschf.linux.system.debian]
+# The bundled PyGObject is compiled against girepository-2.0 at package-build
+# time, so the .deb must pull its runtime library (plus the GTK3 typelib) on
+# install — without this, `import gi` dies with a silent ENOENT on fresh
+# machines (found by the CI smoke test via strace).
+system_runtime_requires = [
+    "libgirepository-2.0-0",
+    "gir1.2-gtk-3.0",
+]
+
 [tool.briefcase.app.mschf.macOS]
 # arm64-only: Briefcase's default universal build also resolves x86_64 wheels,
 # and current cryptography releases no longer ship macOS x86_64 wheels — the

@@ -315,25 +315,12 @@ jobs:
           # runners.
           export PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1
 
-          # Iteration-4: the Briefcase ELF bootstrap exits 0 instantly with
-          # ZERO output (not even its own banner) — Python never starts.
-          # Probe it with BRIEFCASE_MAIN_MODULE + strace for the record, but
-          # launch the app payload DIRECTLY via the system interpreter with
-          # the deb's bundled paths: that answers the real question (does the
-          # packaged app run on GTK) independent of the bootstrap quirk.
-          echo "=== bootstrap probe: BRIEFCASE_MAIN_MODULE + strace ==="
-          sudo apt-get install -y strace >/dev/null
-          set +e
-          timeout 20 env BRIEFCASE_MAIN_MODULE=mschf "$BIN"
-          echo "bootstrap+env probe rc=$?"
-          strace -f -e trace=execve,openat,exit_group -o /tmp/strace.txt timeout 5 "$BIN"
-          echo "--- strace tail ---"; tail -n 25 /tmp/strace.txt
-          set -e
-
-          APP_LIB=$(dirname "$(dpkg -L "$PKG_NAME" | grep 'app_packages$' | head -n 1)")
-          echo "APP_LIB=$APP_LIB"
-          LAUNCH_PY="import sys; sys.path.insert(0, '$APP_LIB/app'); sys.path.insert(0, '$APP_LIB/app_packages'); import runpy; runpy.run_module('mschf', run_name='__main__')"
-          dbus-run-session -- python3 -c "$LAUNCH_PY" >"$LOG_FILE" 2>&1 &
+          # (Resolved mystery: the bundled PyGObject links girepository-2.0;
+          # without libgirepository-2.0-0 installed, `import gi` died with a
+          # silent ENOENT and the bootstrap exited 0. The .deb now DECLARES
+          # that runtime dependency — apt install above pulls it — so we
+          # launch through the real user path, the ELF bootstrap.)
+          dbus-run-session -- "$BIN" >"$LOG_FILE" 2>&1 &
           APP_PID=$!
           echo "Launched PID=$APP_PID"
           sleep 25
