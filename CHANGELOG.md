@@ -11,6 +11,15 @@ entry here.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-20
+
+The hardening release: every security limit documented in 0.5.0's multi-user
+stack is now closed — replicas re-enforce historical RBAC, pre-chaining
+history is checkpoint-fenced, benign version skew no longer masquerades as
+tampering — plus the package installs headless via pip (`mschf-hub`), the
+tracker gains planning horizons, task links, and description validation, and
+the Windows freeze is resolved by pinning out a toga regression.
+
 ### Added
 
 - **Replica-side RBAC re-enforcement on replay**: closes the hub-sync v1

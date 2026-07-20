@@ -1,11 +1,11 @@
-[build-system]
+﻿[build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mschf"
-version = "0.5.0"
-description = "Workspace Manager for cryptographically signed micro-apps (.msf) — hub, sync, and crypto core"
+version = "0.6.0"
+description = "Workspace Manager for cryptographically signed micro-apps (.msf) â€” hub, sync, and crypto core"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
@@ -33,7 +33,7 @@ where = ["src"]
 [tool.briefcase]
 project_name = "Mschf"
 bundle = "com.mschf"
-version = "0.5.0"
+version = "0.6.0"
 url = "https://github.com/chief-mouse/mischief"
 license = "MIT"
 license-files = ["LICENSE"]
