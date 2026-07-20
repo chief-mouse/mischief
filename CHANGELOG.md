@@ -13,6 +13,19 @@ entry here.
 
 ### Added
 
+- **Identity directory container**: `src/mschf/directory.py` authors a signed
+  `.msf` phonebook of org identities — public certificates + metadata
+  (CN, DER fingerprint, display name, org, active/revoked status) with
+  trigger-stamped attribution and `directory_admin`/`member` roles — so
+  admins can grant roles to identities from other machines without manual
+  cert exchange. `register_identity` refuses certificates that don't chain
+  to the local trust store; `set_identity_status` handles revocation
+  bookkeeping; a read-only browser micro-app ships in the container. HARD
+  RULE (enforced by design and stated in the module): the directory is
+  never a trust anchor — signature verification consults only the host
+  trust store. Covered by `test_directory.py`. Implemented by the grok
+  agent from a written spec; reviewed and integrated by Claude.
+
 - **Hub-and-spoke ledger sync (v1)**: multi-machine collaboration on a shared
   `.msf`. `src/mschf/hub.py` is a small stdlib HTTP server (`python -m
   mschf.hub`) holding the authoritative containers — trusted for ordering and
