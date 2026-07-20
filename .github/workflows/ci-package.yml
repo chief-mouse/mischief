@@ -314,6 +314,18 @@ jobs:
           # dbus-run-session provides the session bus GTK expects on bare
           # runners.
           export PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1
+
+          # Iteration-3 probe: the app exits 0 instantly with zero output.
+          # Show what the launcher actually is, then run it FOREGROUND with
+          # GLib debug so the reason lands in this log.
+          echo "=== launcher file ==="
+          file "$BIN"; head -n 40 "$BIN" || true
+          echo "=== foreground probe (20s, G_MESSAGES_DEBUG=all) ==="
+          set +e
+          timeout 20 env G_MESSAGES_DEBUG=all "$BIN"
+          echo "probe rc=$? (124 would mean it stayed alive - good)"
+          set -e
+
           dbus-run-session -- "$BIN" >"$LOG_FILE" 2>&1 &
           APP_PID=$!
           echo "Launched PID=$APP_PID"
