@@ -13,11 +13,17 @@ import toml
 from mschf.gen_cert import generate_selfsigned_cert, x509, NameOID, default_backend, serialization
 from mschf.msf import MSF
 from mschf.identity import Identity
+from mschf.paths import host_root
 
-PROJ_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Writable host data root for CA/identities/settings/logs. In briefcase dev
+# this is the source checkout (same as the old module-location PROJ_DIR);
+# in an installed bundle it is a per-user directory (see mschf.paths).
+# MSCHF_HOME redirects everything — keep resolution in one place for tests.
+ARTIFACT_ROOT = host_root()
 DEFAULT_TZ_NAME = 'America/New_York'
 FILE_EXT = ".msf"
-SETTINGS_FILE = os.path.join(PROJ_DIR, 'settings.toml')
+SETTINGS_FILE = os.path.join(ARTIFACT_ROOT, 'settings.toml')
+LOG_DIR = os.path.join(ARTIFACT_ROOT, 'logs')
 
 settings = {
     'tz_name': DEFAULT_TZ_NAME,
@@ -226,12 +232,12 @@ class Mschf(toga.App):
         msf_patterns = [
             os.path.join(cwd, f"*{FILE_EXT}"),
         ]
-        
-        # 2. Scan project directory (parent of src)
+
+        # 2. Scan the host artifact root (dev checkout root / MSCHF_HOME /
+        # installed per-user data dir) for .msf files colocated with CA/settings.
         try:
-            proj_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-            if os.path.isdir(proj_dir) and proj_dir != cwd:
-                msf_patterns.append(os.path.join(proj_dir, f"*{FILE_EXT}"))
+            if os.path.isdir(ARTIFACT_ROOT) and ARTIFACT_ROOT != cwd:
+                msf_patterns.append(os.path.join(ARTIFACT_ROOT, f"*{FILE_EXT}"))
         except Exception:
             pass
 
@@ -301,7 +307,7 @@ class Mschf(toga.App):
             log.error(f"Certificate file not found: {path}")
             return
 
-        ca_cert_path = os.path.join(PROJ_DIR, 'ca.crt')
+        ca_cert_path = os.path.join(ARTIFACT_ROOT, 'ca.crt')
         self.active_identity = Identity.load(path, ca_cert_path)
         self.active_identity.key_passphrase = key_passphrase
 
@@ -320,11 +326,13 @@ class Mschf(toga.App):
         log.info("Logged out; active identity cleared.")
 
     def _setup_runtime_log(self):
-        """Attach a rotating file log in the user data dir. Survives across runs
-        and captures the heartbeat trail, so a freeze leaves durable evidence
-        (unlike the stdout log, which vanishes with the dev console)."""
+        """Attach a rotating file log under ARTIFACT_ROOT/logs. Survives across
+        runs and captures the heartbeat trail, so a freeze leaves durable
+        evidence (unlike the stdout log, which vanishes with the dev console).
+        Redirects with MSCHF_HOME / host_root() like other host artifacts."""
         try:
-            log_path = os.path.join(self.data_dir, 'mschf-runtime.log')
+            os.makedirs(LOG_DIR, exist_ok=True)
+            log_path = os.path.join(LOG_DIR, 'mschf-runtime.log')
             handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3, encoding='utf-8')
             handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
             handler.setLevel(logging.INFO)
@@ -453,6 +461,10 @@ class Mschf(toga.App):
         self.on_exit = self.action_exit
         log.info(f"We're running on {host_name}")
         log.info(f"Current working directory: {os.path.abspath(os.getcwd())}")
+        # Ensure the host artifact root exists before any first-run writes
+        # (settings.toml, ca.crt/key, admin identity). Required for installed
+        # bundles where ARTIFACT_ROOT is a per-user dir that may not exist yet.
+        os.makedirs(ARTIFACT_ROOT, exist_ok=True)
         load_settings()
 
         # Keep the real window alive instead of letting Windows ghost it.
@@ -476,9 +488,9 @@ class Mschf(toga.App):
         log.info(f"Time zone is {tzinfo}")
         
         # 1. Verify/Generate Root Certificate Authority (ca.crt / ca.key)
-        ca_cert_path = os.path.join(PROJ_DIR, 'ca.crt')
-        ca_key_path = os.path.join(PROJ_DIR, 'ca.key')
-        self.proj_dir = PROJ_DIR
+        ca_cert_path = os.path.join(ARTIFACT_ROOT, 'ca.crt')
+        ca_key_path = os.path.join(ARTIFACT_ROOT, 'ca.key')
+        self.proj_dir = ARTIFACT_ROOT
         self.ca_cert_path = ca_cert_path  # trust anchor handed to MSFStorage
         
         if not os.path.isfile(ca_cert_path) or not os.path.isfile(ca_key_path):
@@ -497,8 +509,8 @@ class Mschf(toga.App):
         # 2. Verify/Generate default Admin User identity (admin.crt / admin.key) signed by Root CA.
         # The admin key is passphrase-protected so logging in as admin requires a secret.
         # The passphrase comes from MSCHF_ADMIN_PASSPHRASE (demo default "changeit").
-        admin_cert_path = os.path.join(PROJ_DIR, 'admin.crt')
-        admin_key_path = os.path.join(PROJ_DIR, 'admin.key')
+        admin_cert_path = os.path.join(ARTIFACT_ROOT, 'admin.crt')
+        admin_key_path = os.path.join(ARTIFACT_ROOT, 'admin.key')
         admin_passphrase = os.environ.get('MSCHF_ADMIN_PASSPHRASE', 'changeit')
         # Drives the first-run hint: we may tell the user the DEFAULT passphrase
         # in the UI, but never a custom one from the environment.
@@ -511,7 +523,7 @@ class Mschf(toga.App):
             os.makedirs(self.data_dir, exist_ok=True)
         except Exception as data_dir_err:
             log.warning(f"Could not prepare user data dir: {data_dir_err}")
-            self.data_dir = PROJ_DIR
+            self.data_dir = ARTIFACT_ROOT
 
         self._setup_runtime_log()
 

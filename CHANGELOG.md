@@ -11,7 +11,29 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-platform CI matrix + packaging jobs**: the integration test job now
+  runs the 10 headless suites on Windows, Ubuntu, and macOS runners
+  (`test_declarative`/`verify_microapp` excluded — they need toga), proving
+  the crypto/ledger/sync core platform-clean on every push. Packaging gains
+  per-OS jobs: the existing Windows MSI, a macOS `.dmg` (ad-hoc signed —
+  Gatekeeper right-click-open until an Apple Developer ID exists), and a
+  best-effort Linux system package (`continue-on-error` while GTK runner
+  deps stabilize). Implemented by the grok agent; reviewed by Claude;
+  matrix verified on real runners post-merge.
+
 ### Fixed
+
+- **Packaged-app runtime paths**: `app.py` no longer derives its artifact
+  root from its own file location — which in an installed bundle is the
+  read-only application directory, so first-run CA/identity/settings writes
+  would fail (this plausibly affected the shipped v0.6.0 MSI). Runtime
+  artifacts (CA, admin identity, provisioned identities, `settings.toml`,
+  logs, workspace scan root) now root at `mschf.paths.host_root()` —
+  unchanged repo root in dev, per-user data dir when installed,
+  `MSCHF_HOME` override honored — created on demand. Implemented by the
+  grok agent; reviewed and independently re-tested by Claude.
 
 - **Release CI failure on v0.6.0**: the 0.6.0 version bump rewrote
   `pyproject.toml` with a UTF-8 BOM (PowerShell `Set-Content -Encoding utf8`),
