@@ -11,6 +11,22 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pin toga to 0.5.4 to dodge the WinForms freeze regression.** toga 0.5.5
+  introduced a proactor event-loop bug ([beeware/toga#4532](https://github.com/beeware/toga/issues/4532))
+  where, after the app sits idle for minutes, the event loop spins hot on the
+  UI thread (~a full core) and leaks threads, starving Win32 input so the
+  window becomes completely unresponsive (won't even drag) while the Python
+  process stays alive. Root-caused on a live repro with py-spy + CPU sampling;
+  the earlier "window ghosting" diagnosis was wrong (ghost windows drag and
+  burn no CPU — a hot spin keeps the heartbeat's asyncio lag at zero, so the
+  heartbeat never distinguished healthy from runaway). Requirement changed
+  from an unpinned `toga>=0.4.0` (which pulled 0.5.5) to `toga==0.5.4`. The
+  underlying proactor polling design ([beeware/toga#2613](https://github.com/beeware/toga/issues/2613))
+  is unchanged in 0.5.4; reducing our own sustained asyncio timer load remains
+  a tracked follow-up.
+
 ## [0.5.0] - 2026-07-19
 
 The multi-user release: a `.msf` container can now be shared, verified, and

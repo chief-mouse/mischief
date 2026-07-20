@@ -17,7 +17,10 @@ cryptographically signed transactions, verified against a local X.509 CA."""
 icon = "src/mschf/resources/mschf"
 sources = ["src/mschf"]
 requires = [
-    "toga>=0.4.0",
+    # Pinned to 0.5.4: toga 0.5.5 has a WinForms proactor freeze regression
+    # (beeware/toga#4532; hot event-loop spin + thread leak that starves input
+    # after minutes idle). Revisit when that issue is fixed upstream.
+    "toga==0.5.4",
     "cryptography>=3.2",
     "pytz",
     "toml",
