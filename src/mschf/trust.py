@@ -15,9 +15,12 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
 from mschf.gen_cert import is_cert_signed_by_ca
+from mschf.paths import host_root
 
-# Same HOST_ROOT derivation as storage.py (abspath of ../.. from this module).
-HOST_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# Resolved once at import (dev → project root; installed → per-user data dir;
+# MSCHF_HOME overrides). Callers re-resolve anchors per check; the root itself
+# need not be lazy.
+HOST_ROOT = host_root()
 DEFAULT_CA_CERT_PATH = os.path.join(HOST_ROOT, "ca.crt")
 DEFAULT_TRUST_DIR = os.path.join(HOST_ROOT, "trusted_cas")
 

@@ -1,3 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mschf"
+version = "0.5.0"
+description = "Workspace Manager for cryptographically signed micro-apps (.msf) — hub, sync, and crypto core"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Chief Mouse", email = "mouse.cheif@gmail.com" },
+]
+dependencies = [
+    "cryptography>=3.2",
+    "dill",
+    "pytz",
+    "toml",
+]
+
+[project.optional-dependencies]
+# Pinned to 0.5.4: toga 0.5.5 has a WinForms proactor freeze regression
+# (beeware/toga#4532; hot event-loop spin + thread leak that starves input
+# after minutes idle). Revisit when that issue is fixed upstream.
+gui = ["toga==0.5.4"]
+
+[project.scripts]
+mschf-hub = "mschf.hub:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.briefcase]
 project_name = "Mschf"
 bundle = "com.mschf"

@@ -13,6 +13,20 @@ entry here.
 
 ### Added
 
+- **Pip-installable package + `mschf-hub` entry point**: the same `mschf`
+  package now installs via pip with a standard `[project]` table (setuptools,
+  src layout) — headless core dependencies only, with the GUI stack as an
+  extra (`mschf[gui]`, toga pinned at 0.5.4). `pip install mschf` gives a
+  server operator the hub + sync + crypto core and a `mschf-hub` console
+  command with no toga. Path defaults are packaging-aware via the new
+  `mschf.paths.host_root()`: `MSCHF_HOME` env override → source-checkout
+  root in dev mode (behavior unchanged) → per-user data dir when installed
+  (`%APPDATA%\mschf` / `~/Library/Application Support/mschf` /
+  `~/.config/mschf`), so installed builds no longer point cert/trust-store
+  defaults into site-packages. Briefcase config untouched; `briefcase dev`
+  unaffected. Implemented by the grok agent; reviewed and independently
+  re-tested by Claude.
+
 - **Dev-tracker planning horizons + task links**: tasks now carry a `horizon`
   (`near`/`later`, NULL = near) so near-term plans and someday items stop
   sharing one backlog — new `horizon <id> <near|later>` CLI verb, board
