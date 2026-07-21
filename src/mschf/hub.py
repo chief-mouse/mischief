@@ -5,8 +5,10 @@ trusted for ORDERING and AVAILABILITY only — never integrity. Every submitted
 transaction is verified by ``MSFStorage.execute_signed`` (signature, hash-chain
 position, CA trust, RBAC, authorizer).
 
-Single-threaded ``HTTPServer`` on purpose: requests serialize, so no locking is
-needed around the open SQLite connections. Do not switch to ThreadingHTTPServer.
+Uses ``ThreadingHTTPServer`` so long-poll event waits do not block other
+requests. Single-writer is explicit: a per-container ``threading.Lock`` is held
+around the POST-submit ``execute_signed`` path. Reads (head / transactions /
+file / events) do not take that lock.
 """
 from __future__ import annotations
 
@@ -17,7 +19,9 @@ import os
 import sqlite3
 import sys
 import tempfile
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from cryptography.hazmat.backends import default_backend
@@ -26,15 +30,22 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from mschf.storage import MSFStorage
 
+# Long-poll defaults / caps for GET .../events
+_DEFAULT_EVENTS_TIMEOUT = 25
+_MAX_EVENTS_TIMEOUT = 30
 
-def _open_storage(path, ca_cert_path=None, trust_dir=None):
+
+def _open_storage(path, ca_cert_path=None, trust_dir=None, allow_homed_writes=True):
     """Open MSFStorage with check_same_thread=False.
 
-    The hub's request handlers run on the server thread; callers (tests, admin
-    tools) may also touch the same process. Request serialization still makes
-    concurrent SQLite use safe; we only relax the thread-affinity guard.
-    MSFStorage does not expose the connect flag, so we temporarily wrap
-    ``sqlite3.connect`` for this construction only.
+    The hub's request handlers run on server threads; callers (tests, admin
+    tools) may also touch the same process. Per-container write locks make
+    concurrent SQLite use safe on the submit path; we only relax the
+    thread-affinity guard. MSFStorage does not expose the connect flag, so we
+    temporarily wrap ``sqlite3.connect`` for this construction only.
+
+    Hub storages always pass ``allow_homed_writes=True`` — the hub *is* the
+    chain serializer for homed containers.
     """
     orig = sqlite3.connect
 
@@ -44,7 +55,12 @@ def _open_storage(path, ca_cert_path=None, trust_dir=None):
 
     sqlite3.connect = _connect
     try:
-        return MSFStorage(path, ca_cert_path=ca_cert_path, trust_dir=trust_dir)
+        return MSFStorage(
+            path,
+            ca_cert_path=ca_cert_path,
+            trust_dir=trust_dir,
+            allow_homed_writes=allow_homed_writes,
+        )
     finally:
         sqlite3.connect = orig
 
@@ -90,6 +106,11 @@ class MSFHub:
         self.ca_cert_path = ca_cert_path
         self.trust_dir = trust_dir
         self._storages = {}  # container_id -> MSFStorage
+        self._storages_lock = threading.Lock()
+        self._write_locks = {}  # container_id -> Lock (POST submit path)
+        self._write_locks_guard = threading.Lock()
+        self._conditions = {}  # container_id -> Condition (events long-poll)
+        self._conditions_guard = threading.Lock()
 
         with open(hub_cert_path, 'rb') as f:
             self._hub_cert_pem = f.read()
@@ -104,7 +125,8 @@ class MSFHub:
         self._hub_cert_pem_str = self._hub_cert_pem.decode('utf-8')
 
         handler = self._make_handler()
-        self.httpd = HTTPServer((host, port), handler)
+        self.httpd = ThreadingHTTPServer((host, port), handler)
+        self.httpd.daemon_threads = True
 
     # ------------------------------------------------------------------
     # Container access
@@ -134,13 +156,31 @@ class MSFHub:
         path = self.container_path(container_id)
         if path is None:
             return None
-        if container_id not in self._storages:
-            self._storages[container_id] = _open_storage(
-                path,
-                ca_cert_path=self.ca_cert_path,
-                trust_dir=self.trust_dir,
-            )
-        return self._storages[container_id]
+        with self._storages_lock:
+            if container_id not in self._storages:
+                self._storages[container_id] = _open_storage(
+                    path,
+                    ca_cert_path=self.ca_cert_path,
+                    trust_dir=self.trust_dir,
+                    allow_homed_writes=True,
+                )
+            return self._storages[container_id]
+
+    def _write_lock(self, container_id):
+        with self._write_locks_guard:
+            lock = self._write_locks.get(container_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._write_locks[container_id] = lock
+            return lock
+
+    def _condition(self, container_id):
+        with self._conditions_guard:
+            cond = self._conditions.get(container_id)
+            if cond is None:
+                cond = threading.Condition()
+                self._conditions[container_id] = cond
+            return cond
 
     # ------------------------------------------------------------------
     # Head + attestation
@@ -229,6 +269,31 @@ class MSFHub:
             })
         return out
 
+    def wait_for_events(self, container_id, storage, since_seq: int, timeout: float):
+        """Long-poll helper: return rows with seq > since_seq, waiting up to timeout.
+
+        Empty list on timeout is a normal response (not an error). Check-and-wait
+        under the per-container Condition so a submit that commits between the
+        empty check and wait cannot lose its notify.
+        """
+        cond = self._condition(container_id)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with cond:
+            while True:
+                rows = self.transactions_since(storage, since_seq)
+                if rows:
+                    return rows
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                cond.wait(timeout=remaining)
+
+    def notify_events(self, container_id):
+        """Wake all long-poll waiters after a successful submit commit."""
+        cond = self._condition(container_id)
+        with cond:
+            cond.notify_all()
+
     # ------------------------------------------------------------------
     # HTTP handler
     # ------------------------------------------------------------------
@@ -296,6 +361,33 @@ class MSFHub:
                         self._send_json(200, {'rows': rows})
                         return
 
+                    if len(parts) == 3 and parts[2] == 'events':
+                        qs = parse_qs(parsed.query)
+                        try:
+                            since_seq = int(qs.get('since_seq', ['0'])[0])
+                        except (TypeError, ValueError):
+                            self._send_json(400, {
+                                'error': 'bad_request',
+                                'detail': 'since_seq must be int',
+                            })
+                            return
+                        try:
+                            timeout = float(qs.get('timeout', [str(_DEFAULT_EVENTS_TIMEOUT)])[0])
+                        except (TypeError, ValueError):
+                            self._send_json(400, {
+                                'error': 'bad_request',
+                                'detail': 'timeout must be a number',
+                            })
+                            return
+                        if timeout < 0:
+                            timeout = 0.0
+                        if timeout > _MAX_EVENTS_TIMEOUT:
+                            timeout = float(_MAX_EVENTS_TIMEOUT)
+                        rows = hub.wait_for_events(
+                            container_id, storage, since_seq, timeout)
+                        self._send_json(200, {'rows': rows})
+                        return
+
                     if len(parts) == 3 and parts[2] == 'file':
                         data = hub.serialize_container_file(storage)
                         self._send_bytes(200, data)
@@ -350,53 +442,71 @@ class MSFHub:
                     # crypto check inside execute_signed.
                     client_seq = body.get('seq', None)
                     client_prev = body.get('prev_hash', None)
-                    cur_seq, cur_prev = storage.get_chain_head()
-                    if client_seq is not None:
-                        try:
-                            client_seq = int(client_seq)
-                        except (TypeError, ValueError):
-                            self._send_json(400, {'error': 'bad_request', 'detail': 'seq must be int'})
-                            return
-                        if client_seq != cur_seq or client_prev != cur_prev:
-                            head = hub.build_head_response(container_id, storage)
-                            resp = {
-                                'error': 'stale_head',
-                                'detail': (
-                                    f'payload signed against seq={client_seq}, '
-                                    f'prev_hash={client_prev!r}; current head is '
-                                    f'seq={cur_seq}, prev_hash={cur_prev!r}'
-                                ),
-                            }
-                            resp.update(head)
-                            self._send_json(409, resp)
-                            return
 
-                    try:
-                        storage.execute_signed(query, params, signature, pub_key)
-                    except PermissionError as e:
-                        msg = str(e)
-                        head = hub.build_head_response(container_id, storage)
-                        # Signature failure against current head: if the client
-                        # declared a matching head, this is a bad signature (403);
-                        # otherwise treat as potentially stale (409) so clients
-                        # can re-sign and retry.
-                        if 'signed against the current chain head' in msg or (
-                            'current chain head' in msg and 'signature' in msg.lower()
-                        ):
-                            if client_seq is not None:
-                                self._send_json(403, {'error': 'forbidden', 'detail': msg})
-                            else:
-                                resp = {'error': 'stale_head', 'detail': msg}
+                    write_lock = hub._write_lock(container_id)
+                    with write_lock:
+                        cur_seq, cur_prev = storage.get_chain_head()
+                        if client_seq is not None:
+                            try:
+                                client_seq = int(client_seq)
+                            except (TypeError, ValueError):
+                                self._send_json(400, {
+                                    'error': 'bad_request',
+                                    'detail': 'seq must be int',
+                                })
+                                return
+                            if client_seq != cur_seq or client_prev != cur_prev:
+                                head = hub.build_head_response(container_id, storage)
+                                resp = {
+                                    'error': 'stale_head',
+                                    'detail': (
+                                        f'payload signed against seq={client_seq}, '
+                                        f'prev_hash={client_prev!r}; current head is '
+                                        f'seq={cur_seq}, prev_hash={cur_prev!r}'
+                                    ),
+                                }
                                 resp.update(head)
                                 self._send_json(409, resp)
-                            return
-                        self._send_json(403, {'error': 'forbidden', 'detail': msg})
-                        return
-                    except Exception as e:
-                        self._send_json(400, {'error': 'bad_request', 'detail': str(e)})
-                        return
+                                return
 
-                    self._send_json(200, hub.build_head_response(container_id, storage))
+                        try:
+                            storage.execute_signed(query, params, signature, pub_key)
+                        except PermissionError as e:
+                            msg = str(e)
+                            head = hub.build_head_response(container_id, storage)
+                            # Signature failure against current head: if the client
+                            # declared a matching head, this is a bad signature (403);
+                            # otherwise treat as potentially stale (409) so clients
+                            # can re-sign and retry.
+                            if 'signed against the current chain head' in msg or (
+                                'current chain head' in msg and 'signature' in msg.lower()
+                            ):
+                                if client_seq is not None:
+                                    self._send_json(403, {
+                                        'error': 'forbidden',
+                                        'detail': msg,
+                                    })
+                                else:
+                                    resp = {'error': 'stale_head', 'detail': msg}
+                                    resp.update(head)
+                                    self._send_json(409, resp)
+                                return
+                            self._send_json(403, {'error': 'forbidden', 'detail': msg})
+                            return
+                        except Exception as e:
+                            self._send_json(400, {
+                                'error': 'bad_request',
+                                'detail': str(e),
+                            })
+                            return
+
+                        head_resp = hub.build_head_response(container_id, storage)
+
+                    # Wake long-poll waiters after the write lock is released
+                    # (committed state is visible; Condition serializes notify
+                    # with waiters' empty-check).
+                    hub.notify_events(container_id)
+                    self._send_json(200, head_resp)
                     return
 
                 self._send_json(404, {'error': 'not_found', 'detail': self.path})

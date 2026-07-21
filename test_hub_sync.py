@@ -151,15 +151,9 @@ def run():
         for ddl in NOTES_TRIGGERS:
             _signed_exec(db, admin_cert, admin_key, ddl, [])
 
-        # Homing keys (manifest).
-        _signed_exec(
-            db, admin_cert, admin_key,
-            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
-            ['sync_hub_cn', 'hub_svc'],
-        )
-        # sync_hub_url filled after we know the port.
-
         # RBAC: role writer with db read/write + object rules on notes.
+        # Author these *before* sync_hub_cn so the homed-write guard does not
+        # block offline authoring (guard fires once the hub CN is set).
         for level, target, role, perm in [
             ('database', '*', 'writer', 'read'),
             ('database', '*', 'writer', 'write'),
@@ -181,6 +175,12 @@ def run():
             db, admin_cert, admin_key,
             "INSERT INTO notes (body) VALUES (?)",
             ['seed note from admin'],
+        )
+        # Homing keys last (manifest). sync_hub_url filled after we know the port.
+        _signed_exec(
+            db, admin_cert, admin_key,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['sync_hub_cn', 'hub_svc'],
         )
         db.close()
 
@@ -672,6 +672,710 @@ def run():
         violations = report['transactions']['rbac_violations']
         assert violations, 'expected rbac_violations on hub file'
         print(f'  [OK] hub replay_audit rbac_violations: {violations}')
+
+        # ------------------------------------------------------------------
+        # 10–15 below need a clean hub again. Rebuild a fresh container + hub
+        # so the poison above does not pollute event/outbox/guard tests.
+        # ------------------------------------------------------------------
+        print('\n=== Rebuild clean hub for event-driven / outbox tests ===')
+        for s in (spoke_a, spoke_b, hub_storage):
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        spoke_a = spoke_b = hub_storage = None
+        try:
+            hub.shutdown()
+        except Exception:
+            pass
+        try:
+            hub.server_close()
+        except Exception:
+            pass
+        if hub_thread is not None:
+            hub_thread.join(timeout=2)
+
+        hub_dir2 = tempfile.mkdtemp(prefix='mschf_hub2_')
+        tmp_dirs.append(hub_dir2)
+        container_id = 'sync_notes'
+        hub_msf = os.path.join(hub_dir2, f'{container_id}.msf')
+
+        db = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        db.conn.execute(
+            "CREATE TABLE notes ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "body TEXT NOT NULL, "
+            "created_at TEXT DEFAULT (datetime('now')), "
+            "created_by TEXT)"
+        )
+        db.conn.commit()
+        _signed_exec(
+            db, admin_cert, admin_key,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['entry_point', 'none'],
+            bootstrap=True,
+        )
+        for ddl in NOTES_TRIGGERS:
+            _signed_exec(db, admin_cert, admin_key, ddl, [])
+        for level, target, role, perm in [
+            ('database', '*', 'writer', 'read'),
+            ('database', '*', 'writer', 'write'),
+            ('object', 'notes', 'writer', 'write'),
+            ('object', 'notes', 'writer', 'read'),
+        ]:
+            _signed_exec(
+                db, admin_cert, admin_key,
+                "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)",
+                [level, target, role, perm],
+            )
+        _signed_exec(
+            db, admin_cert, admin_key,
+            "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)",
+            ['cert:CN=sync_user', 'writer'],
+        )
+        _signed_exec(
+            db, admin_cert, admin_key,
+            "INSERT INTO notes (body) VALUES (?)",
+            ['seed note from admin'],
+        )
+        _signed_exec(
+            db, admin_cert, admin_key,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['sync_hub_cn', 'hub_svc'],
+        )
+        db.close()
+
+        hub = MSFHub(
+            hub_dir2,
+            hub_cert_path,
+            hub_key_path,
+            host='127.0.0.1',
+            port=0,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
+        hub_thread.start()
+        for _ in range(50):
+            if hub.httpd.server_port:
+                break
+            time.sleep(0.02)
+        hub_url = hub.url
+        hub_cn = 'hub_svc'
+        print(f'  Clean hub at {hub_url}')
+
+        msync.sign_and_submit(
+            hub_url, container_id, admin_private, admin_cert,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['sync_hub_url', hub_url],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+
+        spoke_a_dir = tempfile.mkdtemp(prefix='mschf_spoke_a2_')
+        tmp_dirs.append(spoke_a_dir)
+        spoke_a_path = os.path.join(spoke_a_dir, f'{container_id}.msf')
+        spoke_a = msync.bootstrap(
+            hub_url, container_id, spoke_a_path,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        spoke_b_dir = tempfile.mkdtemp(prefix='mschf_spoke_b2_')
+        tmp_dirs.append(spoke_b_dir)
+        spoke_b_path = os.path.join(spoke_b_dir, f'{container_id}.msf')
+        spoke_b = msync.bootstrap(
+            hub_url, container_id, spoke_b_path,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+
+        # ==================================================================
+        # 10. Long-poll events
+        # ==================================================================
+        print('\n=== 10. Long-poll events ===')
+        # (a) events with since_seq behind returns immediately
+        local_max = hub_storage.conn.execute(
+            "SELECT IFNULL(MAX(seq), 0) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        t0 = time.monotonic()
+        code, data = msync._http_json(
+            'GET',
+            msync._url(
+                hub_url, 'containers', container_id, 'events',
+                query={'since_seq': 0, 'timeout': 25},
+            ),
+            timeout=30,
+        )
+        elapsed_a = time.monotonic() - t0
+        assert code == 200, data
+        assert data.get('rows'), 'expected rows when since_seq behind'
+        assert elapsed_a < 2.0, f'behind since_seq should return immediately, took {elapsed_a:.2f}s'
+        print(f'  [OK] (a) since_seq behind → immediate rows ({len(data["rows"])}) in {elapsed_a:.3f}s')
+
+        # (b) parked events answered within ~2s of concurrent submit
+        since_now = hub_storage.get_chain_head()[0] - 1  # max seq = next-1
+        # Use actual max seq as since_seq so wait is empty until new submit
+        since_now = hub_storage.conn.execute(
+            "SELECT IFNULL(MAX(seq), 0) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        result_box = {}
+
+        def _parked_events():
+            t_start = time.monotonic()
+            c, d = msync._http_json(
+                'GET',
+                msync._url(
+                    hub_url, 'containers', container_id, 'events',
+                    query={'since_seq': since_now, 'timeout': 25},
+                ),
+                timeout=35,
+            )
+            result_box['code'] = c
+            result_box['data'] = d
+            result_box['elapsed'] = time.monotonic() - t_start
+
+        park_thread = threading.Thread(target=_parked_events, daemon=True)
+        park_thread.start()
+        time.sleep(0.3)  # ensure the long-poll is waiting
+        msync.sign_and_submit(
+            hub_url, container_id, user_private, user_cert,
+            "INSERT INTO notes (body) VALUES (?)",
+            ['wake long-poll'],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        park_thread.join(timeout=10)
+        assert park_thread.is_alive() is False, 'parked events request did not complete'
+        assert result_box.get('code') == 200, result_box
+        assert result_box.get('data', {}).get('rows'), result_box
+        assert result_box['elapsed'] < 5.0, (
+            f'parked request should wake on submit, elapsed={result_box["elapsed"]:.2f}s'
+        )
+        print(f'  [OK] (b) parked events woke in {result_box["elapsed"]:.3f}s '
+              f'({len(result_box["data"]["rows"])} row(s))')
+
+        # (c) timeout returns empty rows, HTTP 200
+        since_tip = hub_storage.conn.execute(
+            "SELECT IFNULL(MAX(seq), 0) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        # Refresh hub assertion handle after concurrent submit
+        hub_storage.close()
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        since_tip = hub_storage.conn.execute(
+            "SELECT IFNULL(MAX(seq), 0) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        t0 = time.monotonic()
+        code, data = msync._http_json(
+            'GET',
+            msync._url(
+                hub_url, 'containers', container_id, 'events',
+                query={'since_seq': since_tip, 'timeout': 1},
+            ),
+            timeout=10,
+        )
+        elapsed_c = time.monotonic() - t0
+        assert code == 200, data
+        assert data.get('rows') == [], data
+        assert elapsed_c >= 0.8, f'timeout should wait ~1s, got {elapsed_c:.2f}s'
+        print(f'  [OK] (c) timeout → empty rows HTTP 200 in {elapsed_c:.3f}s')
+
+        # ==================================================================
+        # 11. Threaded-hub serialization
+        # ==================================================================
+        print('\n=== 11. Threaded concurrent sign_and_submit ===')
+        n_threads = 6
+        before_max = hub_storage.conn.execute(
+            "SELECT IFNULL(MAX(seq), 0) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        errors = []
+        barrier = threading.Barrier(n_threads)
+
+        def _concurrent_submit(i):
+            try:
+                barrier.wait(timeout=10)
+                msync.sign_and_submit(
+                    hub_url, container_id, user_private, user_cert,
+                    "INSERT INTO notes (body) VALUES (?)",
+                    [f'concurrent-{i}'],
+                    expected_hub_cn=hub_cn,
+                    ca_cert_path=ca_cert_path,
+                    max_retries=12,
+                )
+            except Exception as e:
+                errors.append((i, e))
+
+        threads = [
+            threading.Thread(target=_concurrent_submit, args=(i,), daemon=True)
+            for i in range(n_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        assert not errors, f'concurrent submits failed: {errors}'
+        hub_storage.close()
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        seqs = [
+            r[0] for r in hub_storage.conn.execute(
+                "SELECT seq FROM transactions WHERE seq IS NOT NULL AND seq > ? ORDER BY seq",
+                (before_max,),
+            ).fetchall()
+        ]
+        assert len(seqs) == n_threads, f'expected {n_threads} new rows, got {seqs}'
+        assert seqs == list(range(before_max + 1, before_max + 1 + n_threads)), seqs
+        report = replay_audit(hub_storage)
+        assert report['ok'], format_report(report)
+        print(f'  [OK] {n_threads} concurrent submits → sequential seqs {seqs}; audit clean')
+
+        # ==================================================================
+        # 12. Subscribe
+        # ==================================================================
+        print('\n=== 12. Subscribe long-poll propagation ===')
+        msync.pull_and_apply(
+            spoke_b, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        # Close main handle so the subscriber thread owns the only writer.
+        spoke_b.close()
+        spoke_b = None
+        applied_events = []
+        stop_event = threading.Event()
+
+        def _on_applied(result):
+            applied_events.append(result)
+
+        def _sub_loop():
+            # Open MSFStorage in this thread (sqlite thread-affinity).
+            sub = MSFStorage(spoke_b_path, ca_cert_path=ca_cert_path)
+            try:
+                msync.subscribe(
+                    sub,
+                    hub_url,
+                    container_id,
+                    stop_event,
+                    expected_hub_cn=hub_cn,
+                    on_applied=_on_applied,
+                    ca_cert_path=ca_cert_path,
+                    timeout=5,
+                )
+            finally:
+                try:
+                    sub.close()
+                except Exception:
+                    pass
+
+        sub_thread = threading.Thread(target=_sub_loop, daemon=True)
+        sub_thread.start()
+        time.sleep(0.4)
+        msync.sign_and_submit(
+            hub_url, container_id, user_private, user_cert,
+            "INSERT INTO notes (body) VALUES (?)",
+            ['subscribe-propagation'],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and not applied_events:
+            time.sleep(0.1)
+        assert applied_events, 'on_applied never fired'
+        stop_event.set()
+        sub_thread.join(timeout=8)
+        assert not sub_thread.is_alive(), 'subscribe thread did not stop'
+        # Re-open and confirm the write landed.
+        spoke_b = MSFStorage(spoke_b_path, ca_cert_path=ca_cert_path)
+        row = spoke_b.conn.execute(
+            "SELECT body FROM notes WHERE body = ?",
+            ['subscribe-propagation'],
+        ).fetchone()
+        assert row is not None, 'subscribe did not apply write to replica'
+        print(f'  [OK] subscribe applied write; on_applied fired '
+              f'({len(applied_events)} time(s)); stop_event clean')
+
+        # ==================================================================
+        # 13. Homed-write guard
+        # ==================================================================
+        print('\n=== 13. Homed-write guard ===')
+        msync.pull_and_apply(
+            spoke_a, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        try:
+            _signed_exec(
+                spoke_a, user_cert, user_key,
+                "INSERT INTO notes (body) VALUES (?)",
+                ['local-fork-attempt'],
+            )
+            raise AssertionError('homed replica should refuse local execute_signed')
+        except PermissionError as e:
+            assert 'hub_svc' in str(e) or 'hub' in str(e).lower(), str(e)
+            assert 'MSCHF_ALLOW_LOCAL_WRITES' in str(e), str(e)
+            print(f'  [OK] direct execute_signed → PermissionError: {e}')
+
+        # Escape hatch: env allows local append (then discard that container).
+        fork_dir = tempfile.mkdtemp(prefix='mschf_fork_')
+        tmp_dirs.append(fork_dir)
+        fork_path = os.path.join(fork_dir, f'{container_id}.msf')
+        import shutil as _shutil
+        _shutil.copy2(spoke_a_path, fork_path)
+        prev_env = os.environ.get('MSCHF_ALLOW_LOCAL_WRITES')
+        os.environ['MSCHF_ALLOW_LOCAL_WRITES'] = '1'
+        try:
+            fork_db = MSFStorage(fork_path, ca_cert_path=ca_cert_path)
+            _signed_exec(
+                fork_db, user_cert, user_key,
+                "INSERT INTO notes (body) VALUES (?)",
+                ['forced-local-append'],
+            )
+            body = fork_db.conn.execute(
+                "SELECT body FROM notes WHERE body = ?",
+                ['forced-local-append'],
+            ).fetchone()
+            assert body is not None
+            fork_db.close()
+            print('  [OK] MSCHF_ALLOW_LOCAL_WRITES=1 allows local append')
+        finally:
+            if prev_env is None:
+                os.environ.pop('MSCHF_ALLOW_LOCAL_WRITES', None)
+            else:
+                os.environ['MSCHF_ALLOW_LOCAL_WRITES'] = prev_env
+
+        # Hub's own storage (allow_homed_writes=True) still accepts submits.
+        msync.sign_and_submit(
+            hub_url, container_id, user_private, user_cert,
+            "INSERT INTO notes (body) VALUES (?)",
+            ['hub-still-accepts'],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_storage.close()
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        assert hub_storage.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE body = ?",
+            ['hub-still-accepts'],
+        ).fetchone()[0] == 1
+        print('  [OK] hub storage still accepts submits via execute_signed path')
+
+        # ==================================================================
+        # 14. Outbox
+        # ==================================================================
+        print('\n=== 14. Outbox offline queue + flush ===')
+        msync.pull_and_apply(
+            spoke_a, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        pre_ledger = hub_storage.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        spoke_pre_ledger = spoke_a.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+
+        # Stop hub → hub_write queues.
+        try:
+            hub.shutdown()
+        except Exception:
+            pass
+        try:
+            hub.server_close()
+        except Exception:
+            pass
+        if hub_thread is not None:
+            hub_thread.join(timeout=2)
+        hub = None
+        hub_thread = None
+        time.sleep(0.15)
+
+        qw = msync.hub_write(
+            spoke_a, hub_url, container_id,
+            user_private, user_cert, 'sync_user',
+            "INSERT INTO notes (body) VALUES (?)",
+            ['offline-queued-note'],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        assert qw['status'] == 'queued', qw
+        box = msync.list_outbox(spoke_a)
+        assert any(
+            r['status'] == 'pending' and 'offline-queued-note' in json.dumps(r['params'])
+            for r in box
+        ), box
+        spoke_post = spoke_a.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        assert spoke_post == spoke_pre_ledger, (
+            'queued write must not append a local ledger row'
+        )
+        print(f'  [OK] hub down → hub_write queued (id={qw.get("outbox_id")}); '
+              f'no local ledger growth')
+
+        # Restart hub on same dir/port? Port was ephemeral — rebind and update
+        # hub_url. Outbox flush takes explicit hub_url.
+        hub = MSFHub(
+            hub_dir2,
+            hub_cert_path,
+            hub_key_path,
+            host='127.0.0.1',
+            port=0,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
+        hub_thread.start()
+        for _ in range(50):
+            if hub.httpd.server_port:
+                break
+            time.sleep(0.02)
+        hub_url = hub.url
+        print(f'  Hub restarted at {hub_url}')
+
+        summary = msync.flush_outbox(
+            spoke_a, hub_url, container_id,
+            user_private, user_cert, 'sync_user',
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        assert summary['flushed'] >= 1, summary
+        assert summary['remaining'] == 0, summary
+        assert not any(r['status'] == 'pending' for r in msync.list_outbox(spoke_a))
+        hub_storage.close()
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        assert hub_storage.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE body = ?",
+            ['offline-queued-note'],
+        ).fetchone()[0] == 1
+        assert spoke_a.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE body = ?",
+            ['offline-queued-note'],
+        ).fetchone()[0] == 1
+        print(f'  [OK] flush_outbox → {summary}; note on hub + replica; outbox empty')
+
+        # Ordering: two intents flush in id order.
+        try:
+            hub.shutdown()
+        except Exception:
+            pass
+        try:
+            hub.server_close()
+        except Exception:
+            pass
+        if hub_thread is not None:
+            hub_thread.join(timeout=2)
+        hub = None
+        hub_thread = None
+        time.sleep(0.1)
+
+        id1 = msync.queue_intent(
+            spoke_a, 'sync_user',
+            "INSERT INTO notes (body) VALUES (?)",
+            ['order-first'],
+        )
+        id2 = msync.queue_intent(
+            spoke_a, 'sync_user',
+            "INSERT INTO notes (body) VALUES (?)",
+            ['order-second'],
+        )
+        assert id1 < id2
+
+        hub = MSFHub(
+            hub_dir2,
+            hub_cert_path,
+            hub_key_path,
+            host='127.0.0.1',
+            port=0,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
+        hub_thread.start()
+        for _ in range(50):
+            if hub.httpd.server_port:
+                break
+            time.sleep(0.02)
+        hub_url = hub.url
+
+        summary = msync.flush_outbox(
+            spoke_a, hub_url, container_id,
+            user_private, user_cert, 'sync_user',
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        assert summary['flushed'] == 2, summary
+        hub_storage.close()
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        # Confirm both landed; ordering via ledger seq of matching inserts.
+        seq_first = hub_storage.conn.execute(
+            "SELECT seq FROM transactions WHERE params LIKE ? ORDER BY seq LIMIT 1",
+            ['%order-first%'],
+        ).fetchone()[0]
+        seq_second = hub_storage.conn.execute(
+            "SELECT seq FROM transactions WHERE params LIKE ? ORDER BY seq LIMIT 1",
+            ['%order-second%'],
+        ).fetchone()[0]
+        assert seq_first < seq_second, (seq_first, seq_second)
+        print(f'  [OK] two intents flushed in id order '
+              f'(seq {seq_first} < {seq_second})')
+
+        # Failure: RBAC-denied intent + valid behind it → first failed, second not submitted.
+        try:
+            hub.shutdown()
+        except Exception:
+            pass
+        try:
+            hub.server_close()
+        except Exception:
+            pass
+        if hub_thread is not None:
+            hub_thread.join(timeout=2)
+        hub = None
+        hub_thread = None
+        time.sleep(0.1)
+
+        msync.queue_intent(
+            spoke_a, 'sync_user',
+            "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)",
+            ['object', 'notes', 'hacker', 'write'],
+        )
+        msync.queue_intent(
+            spoke_a, 'sync_user',
+            "INSERT INTO notes (body) VALUES (?)",
+            ['should-not-submit-yet'],
+        )
+
+        hub = MSFHub(
+            hub_dir2,
+            hub_cert_path,
+            hub_key_path,
+            host='127.0.0.1',
+            port=0,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
+        hub_thread.start()
+        for _ in range(50):
+            if hub.httpd.server_port:
+                break
+            time.sleep(0.02)
+        hub_url = hub.url
+
+        pre_should = hub_storage.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE body = ?",
+            ['should-not-submit-yet'],
+        ).fetchone()[0]
+        # Close assertion handle so hub can open exclusive-ish; reopen after.
+        hub_storage.close()
+        hub_storage = None
+
+        summary = msync.flush_outbox(
+            spoke_a, hub_url, container_id,
+            user_private, user_cert, 'sync_user',
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        assert summary['failed'] == 1, summary
+        assert summary['remaining'] >= 1, summary
+        assert summary['stopped_on'] == 'permission', summary
+        box = msync.list_outbox(spoke_a)
+        failed_rows = [r for r in box if r['status'] == 'failed']
+        pending_rows = [r for r in box if r['status'] == 'pending']
+        assert failed_rows and failed_rows[0]['error'], failed_rows
+        assert any(
+            'should-not-submit-yet' in json.dumps(r['params']) for r in pending_rows
+        ), pending_rows
+
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        post_should = hub_storage.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE body = ?",
+            ['should-not-submit-yet'],
+        ).fetchone()[0]
+        assert post_should == pre_should, 'second intent must not have been submitted'
+        report = replay_audit(spoke_a)
+        assert report['ok'], format_report(report)
+        print(f'  [OK] RBAC failure marks intent failed, stops flush; '
+              f'audit clean (outbox excluded): {summary}')
+
+        # Clear remaining pending so status counts stay sane.
+        spoke_a.conn.execute(
+            "DELETE FROM sync_outbox WHERE status = 'pending'"
+        )
+        spoke_a.conn.commit()
+
+        # ==================================================================
+        # 15. sync_status
+        # ==================================================================
+        print('\n=== 15. sync_status ===')
+        # Unhomed container
+        unhomed_path = os.path.join(
+            tempfile.mkdtemp(prefix='mschf_unhomed_'), 'plain.msf')
+        tmp_dirs.append(os.path.dirname(unhomed_path))
+        unhomed = MSFStorage(unhomed_path, ca_cert_path=ca_cert_path)
+        st = msync.sync_status(unhomed)
+        assert st['homed'] is False
+        assert st['hub_cn'] is None or st['hub_cn'] == ''
+        assert st['reachable'] is None
+        assert st['in_sync'] is None
+        unhomed.close()
+        print('  [OK] unhomed: homed=False, no probe fields')
+
+        # Homed + in-sync (probe)
+        msync.pull_and_apply(
+            spoke_a, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        st = msync.sync_status(
+            spoke_a, probe_hub_url=hub_url, expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        assert st['homed'] is True
+        assert st['hub_cn'] == 'hub_svc'
+        assert st['reachable'] is True
+        assert st['in_sync'] is True
+        assert st['local_next_seq'] is not None
+        print(f'  [OK] homed+in-sync: {st}')
+
+        # Homed + behind: advance hub without pulling
+        msync.sign_and_submit(
+            hub_url, container_id, user_private, user_cert,
+            "INSERT INTO notes (body) VALUES (?)",
+            ['status-behind-marker'],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        st = msync.sync_status(
+            spoke_a, probe_hub_url=hub_url, expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        assert st['reachable'] is True
+        assert st['in_sync'] is False
+        print(f'  [OK] homed+behind: in_sync=False')
+
+        # Pending outbox count
+        msync.queue_intent(
+            spoke_a, 'sync_user',
+            "INSERT INTO notes (body) VALUES (?)",
+            ['status-pending'],
+        )
+        st = msync.sync_status(spoke_a)
+        assert st['outbox_pending'] >= 1
+        print(f'  [OK] outbox_pending={st["outbox_pending"]}')
+
+        # Homed + unreachable (stop hub)
+        try:
+            hub.shutdown()
+        except Exception:
+            pass
+        try:
+            hub.server_close()
+        except Exception:
+            pass
+        if hub_thread is not None:
+            hub_thread.join(timeout=2)
+        hub = None
+        hub_thread = None
+        time.sleep(0.1)
+        st = msync.sync_status(
+            spoke_a, probe_hub_url=hub_url, expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        assert st['reachable'] is False
+        assert st['in_sync'] is None
+        print(f'  [OK] hub stopped → reachable=False: {st}')
 
         print('\n=== ALL hub/sync tests passed ===')
         return 0

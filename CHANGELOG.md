@@ -11,6 +11,27 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **Event-driven sync engine** — restores the originally agreed hub-and-spoke
+  design (write → hub verifies → propagates to spokes), which v1 had quietly
+  downgraded to manual pull. The hub is now threaded with an explicit
+  per-container write lock (the single-serializer guarantee made deliberate
+  instead of accidental) and serves a long-poll `GET .../events` endpoint —
+  parked requests are answered the instant a submit commits. Spokes gain
+  `subscribe()` (background loop feeding `pull_and_apply` with backoff),
+  `hub_write()` (local-feeling writes: flush pending → submit → pull back),
+  an **in-container outbox** (`sync_outbox` infrastructure table, audit-
+  excluded, no sidecar files) that captures writes as pending intents when
+  the hub is unreachable and flushes them in order on reconnect with
+  per-intent failure surfacing, `sync_status()`, and a
+  `python -m mschf.sync <status|pull|flush>` CLI. Direct local appends on
+  homed containers are now guarded (clear error naming the hub;
+  `MSCHF_ALLOW_LOCAL_WRITES=1` escape hatch) — the silent-replica-fork
+  footgun is closed. Implemented by the grok agent from a spec carrying the
+  user-approved decisions as acceptance criteria; reviewed and independently
+  re-tested by Claude.
+
 ### Fixed
 
 - **Hub head attestation moved into the container — `.head` sidecar files

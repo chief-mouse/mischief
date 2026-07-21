@@ -60,8 +60,12 @@ from mschf.storage import (
 
 # Tables never diffed: transactions is the replay input, source_code is
 # verified via signatures (see module docstring), sqlite_sequence is engine
-# bookkeeping, container_meta is unsigned infrastructure (minted at open).
-EXCLUDED_TABLES = {'transactions', 'source_code', 'sqlite_sequence', 'container_meta'}
+# bookkeeping, container_meta / sync_outbox are unsigned infrastructure
+# (minted at open / on demand; never ledgered).
+EXCLUDED_TABLES = {
+    'transactions', 'source_code', 'sqlite_sequence', 'container_meta',
+    'sync_outbox',
+}
 
 # Replay errors that only mean "the pre-seeded live schema already contains
 # this DDL's end state" — safe to skip.
@@ -240,9 +244,11 @@ def replay_audit(storage):
     shadow.create_function('datetime', -1, _replay_datetime)
 
     # Pre-seed table schemas (NOT triggers — see module docstring).
+    # sync_outbox is unsigned infrastructure (like container_meta) — never
+    # pre-seeded into the shadow and never row-diffed (EXCLUDED_TABLES).
     system = {
         'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles',
-        'container_meta',
+        'container_meta', 'sync_outbox',
     }
     for (sql,) in live.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL "

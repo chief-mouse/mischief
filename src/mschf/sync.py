@@ -5,9 +5,16 @@ Spokes hold full replicas. They submit intended transactions to the hub
 them locally. Spokes never append via ``execute_signed`` for synced writes —
 the hub is the single serializer of the chain; local appends happen only through
 replay-apply of hub-accepted ledger rows.
+
+Also provides:
+- long-poll ``subscribe`` for event-driven pull
+- in-container ``sync_outbox`` for offline write intents
+- ``hub_write`` (product-facing online/offline write path)
+- ``sync_status`` and a small CLI (``python -m mschf.sync``)
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -21,6 +28,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.x509.oid import NameOID
 
 from mschf.audit import historical_rbac_check, replay_audit
@@ -36,6 +44,25 @@ from mschf.storage import (
 from mschf.trust import is_cert_trusted, resolve_trust_anchors
 
 _TS_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+# Long-poll / reconnect defaults
+_DEFAULT_EVENTS_TIMEOUT = 25
+_EVENTS_HTTP_SLOP = 10  # HTTP client timeout = poll timeout + slop
+_BACKOFF_START = 1.0
+_BACKOFF_CAP = 30.0
+
+_OUTBOX_DDL = """
+CREATE TABLE IF NOT EXISTS sync_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity_cn TEXT NOT NULL,
+    query TEXT NOT NULL,
+    params TEXT NOT NULL,
+    created_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'failed')),
+    error TEXT
+)
+"""
 
 
 class StaleHead(Exception):
@@ -654,3 +681,583 @@ def bootstrap(
     # legacy record with the verified hub head for this bootstrap snapshot).
     store_attested_head(storage, head)
     return storage
+
+
+# ---------------------------------------------------------------------------
+# Connection-error helpers
+# ---------------------------------------------------------------------------
+
+def _is_connection_error(exc):
+    """True for network/unreachable failures (not HTTP 4xx/5xx app errors)."""
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError, OSError)):
+        # HTTPError is a subclass of URLError but carries an HTTP status —
+        # those are application-level, not "hub unreachable".
+        if isinstance(exc, urllib.error.HTTPError):
+            return False
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Event-driven subscribe (long-poll)
+# ---------------------------------------------------------------------------
+
+def subscribe(
+    storage,
+    hub_url,
+    container_id,
+    stop_event,
+    expected_hub_cn=None,
+    on_applied=None,
+    ca_cert_path=None,
+    trust_dir=None,
+    timeout=None,
+):
+    """Long-poll the hub for new ledger rows and pull_and_apply them.
+
+    Loop until ``stop_event`` is set. Safe to run in a thread with its own
+    ``MSFStorage`` connection (do not share ``storage`` with other threads).
+
+    The events payload is a wake-up signal only — every applied row is still
+    re-verified by ``pull_and_apply``. On connection errors, exponential
+    backoff from 1s to 30s; the loop keeps running until stopped.
+    """
+    ca = ca_cert_path if ca_cert_path is not None else storage._ca_cert_path_arg
+    td = trust_dir if trust_dir is not None else storage.trust_dir
+    poll_timeout = (
+        _DEFAULT_EVENTS_TIMEOUT if timeout is None else float(timeout)
+    )
+    backoff = _BACKOFF_START
+
+    while not stop_event.is_set():
+        since_seq = _local_max_seq(storage)
+        try:
+            code, data = _http_json(
+                'GET',
+                _url(
+                    hub_url,
+                    'containers',
+                    container_id,
+                    'events',
+                    query={
+                        'since_seq': since_seq,
+                        'timeout': poll_timeout,
+                    },
+                ),
+                timeout=poll_timeout + _EVENTS_HTTP_SLOP,
+            )
+            if code != 200:
+                raise PermissionError(
+                    f'subscribe: events failed ({code}): {data}'
+                )
+            # Wake-up only — always re-verify via pull_and_apply (idempotent).
+            result = pull_and_apply(
+                storage,
+                hub_url,
+                container_id,
+                expected_hub_cn=expected_hub_cn,
+                ca_cert_path=ca,
+                trust_dir=td,
+            )
+            backoff = _BACKOFF_START
+            if result.get('applied', 0) > 0 and on_applied is not None:
+                try:
+                    on_applied(result)
+                except Exception:
+                    pass
+        except Exception as e:
+            if stop_event.is_set():
+                break
+            if _is_connection_error(e) or isinstance(e, TimeoutError):
+                # Back off and keep looping.
+                stop_event.wait(timeout=backoff)
+                backoff = min(backoff * 2, _BACKOFF_CAP)
+                continue
+            # Application / crypto errors: brief pause then continue so a
+            # transient 403/audit glitch does not kill the subscriber.
+            stop_event.wait(timeout=min(backoff, 5.0))
+            backoff = min(backoff * 2, _BACKOFF_CAP)
+            continue
+
+
+# ---------------------------------------------------------------------------
+# In-container outbox (unsigned infrastructure, like container_meta)
+# ---------------------------------------------------------------------------
+
+def _ensure_outbox(storage):
+    """Create ``sync_outbox`` if missing (direct unsigned DDL; not ledgered)."""
+    storage.conn.execute(_OUTBOX_DDL)
+    storage.conn.commit()
+
+
+def queue_intent(storage, identity_cn, query, params):
+    """Append a pending write intent; returns the new outbox row id."""
+    _ensure_outbox(storage)
+    params_json = json.dumps(
+        make_json_serializable(params if params is not None else []),
+        sort_keys=True,
+    )
+    created = datetime.utcnow().strftime(_TS_FORMAT)
+    cur = storage.conn.execute(
+        "INSERT INTO sync_outbox (identity_cn, query, params, created_at, status) "
+        "VALUES (?, ?, ?, ?, 'pending')",
+        (identity_cn, query, params_json, created),
+    )
+    storage.conn.commit()
+    return cur.lastrowid
+
+
+def list_outbox(storage):
+    """Return outbox rows as dicts ordered by id (creates table if needed)."""
+    _ensure_outbox(storage)
+    rows = storage.conn.execute(
+        "SELECT id, identity_cn, query, params, created_at, status, error "
+        "FROM sync_outbox ORDER BY id"
+    ).fetchall()
+    out = []
+    for (oid, cn, query, params_str, created_at, status, error) in rows:
+        try:
+            params = json.loads(params_str) if params_str else []
+        except json.JSONDecodeError:
+            params = []
+        out.append({
+            'id': oid,
+            'identity_cn': cn,
+            'query': query,
+            'params': params,
+            'created_at': created_at,
+            'status': status,
+            'error': error,
+        })
+    return out
+
+
+def flush_outbox(
+    storage,
+    hub_url,
+    container_id,
+    private_key,
+    cert_pem,
+    identity_cn,
+    expected_hub_cn=None,
+    ca_cert_path=None,
+    trust_dir=None,
+    max_retries=3,
+):
+    """Submit pending outbox intents for ``identity_cn`` in id order.
+
+    Success → delete the row. On ``StaleHead`` exhaustion or ``PermissionError``
+    → mark that intent ``failed`` with the error text and STOP (later intents
+    may depend on earlier ones). On connection error → stop, leave remaining
+    pending. After any successful submit, ``pull_and_apply``.
+
+    Returns ``{'flushed': int, 'failed': int, 'remaining': int,
+    'stopped_on': None|'connection'|'permission'|'stale_head'|str}``.
+    """
+    _ensure_outbox(storage)
+    ca = ca_cert_path if ca_cert_path is not None else storage._ca_cert_path_arg
+    td = trust_dir if trust_dir is not None else storage.trust_dir
+    if isinstance(cert_pem, bytes):
+        cert_pem = cert_pem.decode('utf-8')
+
+    pending = storage.conn.execute(
+        "SELECT id, query, params FROM sync_outbox "
+        "WHERE identity_cn = ? AND status = 'pending' ORDER BY id",
+        (identity_cn,),
+    ).fetchall()
+
+    flushed = 0
+    failed = 0
+    stopped_on = None
+    submitted_any = False
+
+    for oid, query, params_str in pending:
+        try:
+            params = json.loads(params_str) if params_str else []
+        except json.JSONDecodeError:
+            params = []
+
+        try:
+            sign_and_submit(
+                hub_url,
+                container_id,
+                private_key,
+                cert_pem,
+                query,
+                params,
+                max_retries=max_retries,
+                expected_hub_cn=expected_hub_cn,
+                ca_cert_path=ca,
+                trust_dir=td,
+                expected_container_uid=storage.container_uid,
+            )
+        except StaleHead as e:
+            storage.conn.execute(
+                "UPDATE sync_outbox SET status = 'failed', error = ? WHERE id = ?",
+                (str(e), oid),
+            )
+            storage.conn.commit()
+            failed += 1
+            stopped_on = 'stale_head'
+            break
+        except PermissionError as e:
+            storage.conn.execute(
+                "UPDATE sync_outbox SET status = 'failed', error = ? WHERE id = ?",
+                (str(e), oid),
+            )
+            storage.conn.commit()
+            failed += 1
+            stopped_on = 'permission'
+            break
+        except Exception as e:
+            if _is_connection_error(e):
+                stopped_on = 'connection'
+                break
+            # Unexpected non-network error: treat like permission (stop chain).
+            storage.conn.execute(
+                "UPDATE sync_outbox SET status = 'failed', error = ? WHERE id = ?",
+                (str(e), oid),
+            )
+            storage.conn.commit()
+            failed += 1
+            stopped_on = type(e).__name__
+            break
+
+        storage.conn.execute("DELETE FROM sync_outbox WHERE id = ?", (oid,))
+        storage.conn.commit()
+        flushed += 1
+        submitted_any = True
+
+    if submitted_any:
+        try:
+            pull_and_apply(
+                storage,
+                hub_url,
+                container_id,
+                expected_hub_cn=expected_hub_cn,
+                ca_cert_path=ca,
+                trust_dir=td,
+            )
+        except Exception:
+            # Flush already landed on the hub; pull can retry later.
+            pass
+
+    remaining = storage.conn.execute(
+        "SELECT COUNT(*) FROM sync_outbox "
+        "WHERE identity_cn = ? AND status = 'pending'",
+        (identity_cn,),
+    ).fetchone()[0]
+
+    return {
+        'flushed': flushed,
+        'failed': failed,
+        'remaining': remaining,
+        'stopped_on': stopped_on,
+    }
+
+
+def hub_write(
+    storage,
+    hub_url,
+    container_id,
+    private_key,
+    cert_pem,
+    identity_cn,
+    query,
+    params,
+    expected_hub_cn=None,
+    ca_cert_path=None,
+    trust_dir=None,
+    max_retries=3,
+):
+    """Product-facing write: online submit or queue offline intent.
+
+    1. If this identity has pending outbox intents, flush them first (ordering).
+       If flush stops on a connection error, queue the new intent and return
+       ``{'status': 'queued', ...}``.
+    2. Otherwise ``sign_and_submit``; on connection failure queue
+       (``'queued'``); on success ``pull_and_apply`` and return
+       ``{'status': 'committed', 'seq': ...}``.
+    """
+    ca = ca_cert_path if ca_cert_path is not None else storage._ca_cert_path_arg
+    td = trust_dir if trust_dir is not None else storage.trust_dir
+    if isinstance(cert_pem, bytes):
+        cert_pem = cert_pem.decode('utf-8')
+    params = params if params is not None else []
+
+    _ensure_outbox(storage)
+    pending_count = storage.conn.execute(
+        "SELECT COUNT(*) FROM sync_outbox "
+        "WHERE identity_cn = ? AND status = 'pending'",
+        (identity_cn,),
+    ).fetchone()[0]
+
+    if pending_count > 0:
+        summary = flush_outbox(
+            storage,
+            hub_url,
+            container_id,
+            private_key,
+            cert_pem,
+            identity_cn,
+            expected_hub_cn=expected_hub_cn,
+            ca_cert_path=ca,
+            trust_dir=td,
+            max_retries=max_retries,
+        )
+        if summary.get('stopped_on') == 'connection' or summary.get('remaining', 0) > 0:
+            oid = queue_intent(storage, identity_cn, query, params)
+            return {
+                'status': 'queued',
+                'outbox_id': oid,
+                'flush': summary,
+            }
+        if summary.get('failed', 0) > 0:
+            # Prior intent failed; still queue the new one behind failed/pending
+            # so the operator can inspect — but do not attempt online submit
+            # out of order. Spec: flush stops on failure; queue new behind.
+            oid = queue_intent(storage, identity_cn, query, params)
+            return {
+                'status': 'queued',
+                'outbox_id': oid,
+                'flush': summary,
+            }
+
+    try:
+        resp = sign_and_submit(
+            hub_url,
+            container_id,
+            private_key,
+            cert_pem,
+            query,
+            params,
+            max_retries=max_retries,
+            expected_hub_cn=expected_hub_cn,
+            ca_cert_path=ca,
+            trust_dir=td,
+            expected_container_uid=storage.container_uid,
+        )
+    except Exception as e:
+        if _is_connection_error(e):
+            oid = queue_intent(storage, identity_cn, query, params)
+            return {
+                'status': 'queued',
+                'outbox_id': oid,
+                'error': str(e),
+            }
+        raise
+
+    try:
+        pull_and_apply(
+            storage,
+            hub_url,
+            container_id,
+            expected_hub_cn=expected_hub_cn,
+            ca_cert_path=ca,
+            trust_dir=td,
+        )
+    except Exception:
+        pass
+
+    # next_seq in the head response is the *next* free seq; the committed
+    # row is next_seq - 1 when the hub advanced by one.
+    next_seq = resp.get('next_seq')
+    committed_seq = (next_seq - 1) if isinstance(next_seq, int) and next_seq > 0 else next_seq
+    return {
+        'status': 'committed',
+        'seq': committed_seq,
+        'head': resp,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
+def sync_status(storage, probe_hub_url=None, expected_hub_cn=None,
+                ca_cert_path=None, trust_dir=None):
+    """Return a dict describing local sync state (optionally probe the hub).
+
+    Keys: ``homed``, ``hub_cn``, ``attested_seq``, ``local_next_seq``,
+    ``outbox_pending``, ``outbox_failed``, ``reachable`` (True/False/None),
+    ``in_sync`` (bool|None). ``reachable`` / ``in_sync`` only set when probing.
+    """
+    hub_url, hub_cn = homing(storage)
+    attested = load_attested_head(storage)
+    local_next, _ = storage.get_chain_head()
+    attested_seq = attested.get('next_seq') if attested else None
+
+    _ensure_outbox(storage)
+    pending = storage.conn.execute(
+        "SELECT COUNT(*) FROM sync_outbox WHERE status = 'pending'"
+    ).fetchone()[0]
+    failed = storage.conn.execute(
+        "SELECT COUNT(*) FROM sync_outbox WHERE status = 'failed'"
+    ).fetchone()[0]
+
+    status = {
+        'homed': bool(hub_cn),
+        'hub_cn': hub_cn,
+        'attested_seq': attested_seq,
+        'local_next_seq': local_next,
+        'outbox_pending': pending,
+        'outbox_failed': failed,
+        'reachable': None,
+        'in_sync': None,
+    }
+
+    probe = probe_hub_url or hub_url
+    if probe:
+        ca = ca_cert_path if ca_cert_path is not None else storage._ca_cert_path_arg
+        td = trust_dir if trust_dir is not None else storage.trust_dir
+        # Need a container id for the head endpoint — use filename stem.
+        container_id = os.path.splitext(os.path.basename(storage.filename))[0]
+        cn = expected_hub_cn if expected_hub_cn is not None else hub_cn
+        try:
+            hub_next, hub_prev, _head = fetch_head(
+                probe,
+                container_id,
+                expected_hub_cn=cn,
+                ca_cert_path=ca,
+                trust_dir=td,
+            )
+            status['reachable'] = True
+            local_next_now, local_prev = storage.get_chain_head()
+            status['in_sync'] = (
+                local_next_now == hub_next and local_prev == hub_prev
+            )
+        except Exception as e:
+            if _is_connection_error(e):
+                status['reachable'] = False
+                status['in_sync'] = None
+            else:
+                # Hub answered but attestation/CN failed — still "reachable"
+                # at the transport layer; treat as reachable but not in_sync.
+                status['reachable'] = True
+                status['in_sync'] = False
+
+    return status
+
+
+# ---------------------------------------------------------------------------
+# CLI: python -m mschf.sync <status|pull|flush> <file> ...
+# ---------------------------------------------------------------------------
+
+def _cli_load_identity(cn, project_root=None):
+    """Load ``<cn>.crt`` / ``<cn>.key`` from host root (passphrase env / plaintext)."""
+    root = project_root or os.getcwd()
+    cert_path = os.path.join(root, f'{cn}.crt')
+    key_path = os.path.join(root, f'{cn}.key')
+    if not (os.path.isfile(cert_path) and os.path.isfile(key_path)):
+        raise SystemExit(
+            f'{cn}.crt/{cn}.key not found in {root} — provision the identity first'
+        )
+    passphrase = os.environ.get('MSCHF_ADMIN_PASSPHRASE', 'changeit')
+    with open(cert_path, 'rb') as f:
+        cert_pem = f.read()
+    with open(key_path, 'rb') as f:
+        key_pem = f.read()
+    try:
+        private_key = load_pem_private_key(
+            key_pem, password=passphrase.encode('utf-8'), backend=default_backend()
+        )
+    except (TypeError, ValueError):
+        private_key = load_pem_private_key(
+            key_pem, password=None, backend=default_backend()
+        )
+    return cert_pem, private_key
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='mschf hub-spoke sync client')
+    parser.add_argument(
+        'command',
+        choices=['status', 'pull', 'flush'],
+        help='status | pull | flush',
+    )
+    parser.add_argument('file', help='Path to local .msf replica')
+    parser.add_argument('--hub', default=None, help='Hub base URL (default: manifest)')
+    parser.add_argument('--cn', default=None, help='Expected hub CN (default: manifest)')
+    parser.add_argument(
+        '--identity',
+        default='admin',
+        help='Identity CN for flush (loads <cn>.crt/.key; default admin)',
+    )
+    parser.add_argument('--ca-cert', default=None, help='Host CA cert path')
+    parser.add_argument('--trust-dir', default=None, help='Extra trust-store directory')
+    args = parser.parse_args(argv)
+
+    storage = MSFStorage(
+        args.file, ca_cert_path=args.ca_cert, trust_dir=args.trust_dir,
+    )
+    try:
+        manifest_url, manifest_cn = homing(storage)
+        hub_url = args.hub or manifest_url
+        hub_cn = args.cn if args.cn is not None else manifest_cn
+        container_id = os.path.splitext(os.path.basename(args.file))[0]
+
+        if args.command == 'status':
+            st = sync_status(
+                storage,
+                probe_hub_url=hub_url,
+                expected_hub_cn=hub_cn,
+                ca_cert_path=args.ca_cert,
+                trust_dir=args.trust_dir,
+            )
+            print(f"homed: {st['homed']}")
+            print(f"hub_cn: {st['hub_cn']}")
+            print(f"attested_seq: {st['attested_seq']}")
+            print(f"local_next_seq: {st['local_next_seq']}")
+            print(f"outbox_pending: {st['outbox_pending']}")
+            print(f"outbox_failed: {st['outbox_failed']}")
+            print(f"reachable: {st['reachable']}")
+            print(f"in_sync: {st['in_sync']}")
+            return 0
+
+        if not hub_url:
+            raise SystemExit(
+                'no hub URL: set --hub or store sync_hub_url in the manifest'
+            )
+
+        if args.command == 'pull':
+            result = pull_and_apply(
+                storage,
+                hub_url,
+                container_id,
+                expected_hub_cn=hub_cn,
+                ca_cert_path=args.ca_cert,
+                trust_dir=args.trust_dir,
+            )
+            print(
+                f"applied={result['applied']} "
+                f"local_next_seq={result['local_next_seq']}"
+            )
+            return 0
+
+        if args.command == 'flush':
+            cert_pem, private_key = _cli_load_identity(args.identity)
+            summary = flush_outbox(
+                storage,
+                hub_url,
+                container_id,
+                private_key,
+                cert_pem,
+                args.identity,
+                expected_hub_cn=hub_cn,
+                ca_cert_path=args.ca_cert,
+                trust_dir=args.trust_dir,
+            )
+            print(
+                f"flushed={summary['flushed']} failed={summary['failed']} "
+                f"remaining={summary['remaining']} "
+                f"stopped_on={summary['stopped_on']}"
+            )
+            return 0 if summary['failed'] == 0 else 1
+
+        return 1
+    finally:
+        storage.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main() or 0)

@@ -204,9 +204,12 @@ class MSFStorage:
     SYSTEM_TABLES = frozenset({
         'manifest', 'source_code', 'transactions', 'rbac_rules', 'user_roles',
         'container_meta',
+        # In-container offline-write outbox (unsigned infrastructure; see sync.py).
+        'sync_outbox',
     })
 
-    def __init__(self, filename, ca_cert_path=None, trust_dir=None):
+    def __init__(self, filename, ca_cert_path=None, trust_dir=None,
+                 allow_homed_writes=False):
         self.filename = filename
         # Keep the original constructor arg (may be None) so resolve_trust_anchors
         # applies its own defaulting consistently at check time. Do not cache
@@ -214,6 +217,10 @@ class MSFStorage:
         self._ca_cert_path_arg = ca_cert_path
         self.ca_cert_path = ca_cert_path or DEFAULT_CA_CERT_PATH
         self.trust_dir = trust_dir
+        # When False (default), containers with manifest sync_hub_cn refuse
+        # local execute_signed appends unless MSCHF_ALLOW_LOCAL_WRITES=1.
+        # The hub opens with allow_homed_writes=True (it is the serializer).
+        self.allow_homed_writes = allow_homed_writes
         self.conn = sqlite3.connect(filename)
         self.conn.execute("PRAGMA foreign_keys = ON")
         # current_signer(): SQL function returning the verified identity string
@@ -662,6 +669,26 @@ class MSFStorage:
     def _execute_signed_locked(self, query, params, signature, pub_key_pem, allow_bootstrap):
         """Body of execute_signed; runs inside the connection's write transaction."""
         next_seq, prev_hash = self.get_chain_head()
+
+        # Homed-container guard: local appends on a replica that declares a hub
+        # would silently fork the chain. Refuse unless this storage is the hub
+        # serializer (allow_homed_writes) or the operator opts in via env.
+        # Setting sync_hub_cn itself happens before the key exists, so authoring
+        # that first write is unaffected; bootstrap / pull_and_apply do not use
+        # execute_signed.
+        hub_cn = self.get_manifest_item('sync_hub_cn')
+        if (
+            hub_cn
+            and not self.allow_homed_writes
+            and os.environ.get('MSCHF_ALLOW_LOCAL_WRITES') != '1'
+        ):
+            raise PermissionError(
+                f"Container is homed on hub {hub_cn!r}; writes must go through "
+                f"hub sync (see mschf.sync.hub_write). Set "
+                f"MSCHF_ALLOW_LOCAL_WRITES=1 to force a local append "
+                f"(may fork the replica)."
+            )
+
         # Optional floor: containers can declare a minimum payload format so
         # older hosts that know about the key (but not a newer fmt) fail closed
         # instead of appending a downgraded row. Today's writers use fmt 3, so
