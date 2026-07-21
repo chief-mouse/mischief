@@ -1377,6 +1377,572 @@ def run():
         assert st['in_sync'] is None
         print(f'  [OK] hub stopped → reachable=False: {st}')
 
+        # ==================================================================
+        # 16. HostAPI product routing on a homed replica
+        # ==================================================================
+        print('\n=== 16. HostAPI on homed replica (unsigned read + hub_write) ===')
+        # Restart hub for product-path tests (section 15 left it stopped).
+        hub = MSFHub(
+            hub_dir2,
+            hub_cert_path,
+            hub_key_path,
+            host='127.0.0.1',
+            port=0,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
+        hub_thread.start()
+        for _ in range(50):
+            if hub.httpd.server_port:
+                break
+            time.sleep(0.02)
+        hub_url = hub.url
+        # Refresh spoke so sync_hub_url may be stale; pull first, then rewrite URL
+        # via hub so the replica's manifest matches the new port.
+        msync.sign_and_submit(
+            hub_url, container_id, admin_private, admin_cert,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['sync_hub_url', hub_url],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=ca_cert_path,
+        )
+        msync.pull_and_apply(
+            spoke_a, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        # Write user key to a temp file for HostAPI key_path.
+        user_key_path = track(os.path.join(spoke_a_dir, 'sync_user.key'))
+        with open(user_key_path, 'wb') as f:
+            f.write(user_key)
+        user_cert_str = (
+            user_cert.decode('utf-8') if isinstance(user_cert, bytes) else user_cert
+        )
+
+        from mschf.sandbox import HostAPI, HubWriteResult
+
+        api = HostAPI(
+            spoke_a_dir,
+            db=spoke_a,
+            current_user_cn='sync_user',
+            current_user_cert_pem=user_cert_str,
+            key_path=user_key_path,
+            key_passphrase=None,
+        )
+
+        # (a) SELECT works unsigned — no new local ledger row.
+        pre_ledger = spoke_a.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        cur = api.execute_signed_query("SELECT body FROM notes ORDER BY id")
+        bodies = [r[0] for r in cur.fetchall()]
+        assert bodies, 'SELECT should return rows'
+        post_ledger = spoke_a.conn.execute(
+            "SELECT COUNT(*) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+        assert post_ledger == pre_ledger, (
+            'homed SELECT must not append a local ledger row'
+        )
+        print(f'  [OK] unsigned SELECT returned {len(bodies)} row(s); ledger unchanged')
+
+        # (b) Viewer without object read → PermissionError
+        viewer_cert, viewer_key = generate_user_cert(
+            'sync_viewer', ca_cert_pem, ca_key_pem
+        )
+        # Grant database read only (no object read on notes) via hub.
+        msync.sign_and_submit(
+            hub_url, container_id, admin_private, admin_cert,
+            "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)",
+            ['database', '*', 'viewer', 'read'],
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        msync.sign_and_submit(
+            hub_url, container_id, admin_private, admin_cert,
+            "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)",
+            ['cert:CN=sync_viewer', 'viewer'],
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        msync.pull_and_apply(
+            spoke_a, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        viewer_key_path = track(os.path.join(spoke_a_dir, 'sync_viewer.key'))
+        with open(viewer_key_path, 'wb') as f:
+            f.write(viewer_key)
+        viewer_api = HostAPI(
+            spoke_a_dir,
+            db=spoke_a,
+            current_user_cn='sync_viewer',
+            current_user_cert_pem=(
+                viewer_cert.decode('utf-8')
+                if isinstance(viewer_cert, bytes) else viewer_cert
+            ),
+            key_path=viewer_key_path,
+            key_passphrase=None,
+        )
+        try:
+            viewer_api.execute_signed_query("SELECT body FROM notes")
+            raise AssertionError('viewer without object read should raise')
+        except PermissionError as e:
+            assert 'notes' in str(e).lower() or 'read' in str(e).lower(), str(e)
+            print(f'  [OK] viewer without object read → PermissionError: {e}')
+
+        # (c) Mutation returns committed; row arrives via pull.
+        pre_bodies = set(
+            r[0] for r in spoke_a.conn.execute("SELECT body FROM notes").fetchall()
+        )
+        wr = api.execute_signed_query(
+            "INSERT INTO notes (body) VALUES (?)",
+            ['hostapi-committed-note'],
+        )
+        assert isinstance(wr, HubWriteResult), type(wr)
+        assert wr.status == 'committed', wr
+        assert wr.seq is not None
+        post_bodies = set(
+            r[0] for r in spoke_a.conn.execute("SELECT body FROM notes").fetchall()
+        )
+        assert 'hostapi-committed-note' in post_bodies - pre_bodies
+        print(f'  [OK] mutation committed (seq={wr.seq}); row on replica')
+
+        # (d) Hub stopped → queued; outbox holds it; flush after restart commits.
+        try:
+            hub.shutdown()
+        except Exception:
+            pass
+        try:
+            hub.server_close()
+        except Exception:
+            pass
+        if hub_thread is not None:
+            hub_thread.join(timeout=2)
+        hub = None
+        hub_thread = None
+        time.sleep(0.15)
+
+        qw = api.execute_signed_query(
+            "INSERT INTO notes (body) VALUES (?)",
+            ['hostapi-queued-note'],
+        )
+        assert isinstance(qw, HubWriteResult)
+        assert qw.status == 'queued', qw
+        assert qw.seq is None
+        box = msync.list_outbox(spoke_a)
+        assert any(
+            r['status'] == 'pending'
+            and 'hostapi-queued-note' in json.dumps(r['params'])
+            for r in box
+        ), box
+        print(f'  [OK] hub down → HostAPI mutation queued; outbox holds it')
+
+        hub = MSFHub(
+            hub_dir2,
+            hub_cert_path,
+            hub_key_path,
+            host='127.0.0.1',
+            port=0,
+            ca_cert_path=ca_cert_path,
+        )
+        hub_thread = threading.Thread(target=hub.serve_forever, daemon=True)
+        hub_thread.start()
+        for _ in range(50):
+            if hub.httpd.server_port:
+                break
+            time.sleep(0.02)
+        hub_url = hub.url
+        # Flush with the new URL (manifest may still have old port; flush takes url).
+        summary = msync.flush_outbox(
+            spoke_a, hub_url, container_id,
+            user_private, user_cert, 'sync_user',
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        assert summary['flushed'] >= 1, summary
+        assert spoke_a.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE body = ?",
+            ['hostapi-queued-note'],
+        ).fetchone()[0] == 1
+        print(f'  [OK] flush after restart → committed; note on replica: {summary}')
+
+        # ==================================================================
+        # 17. msf.py headless: status-line builder + subscriber own-connection
+        # ==================================================================
+        print('\n=== 17. msf format_sync_status_line + subscriber own-connection ===')
+        from mschf.msf import format_sync_status_line, _sync_subscriber_main
+
+        # Status-line combinations (no network).
+        assert format_sync_status_line({'homed': False}, True) is None
+        assert format_sync_status_line(None, False) is None
+        line = format_sync_status_line(
+            {'homed': True, 'hub_cn': 'hub_svc', 'local_next_seq': 12,
+             'outbox_pending': 3},
+            connected=True,
+        )
+        assert line == 'SYNC: hub hub_svc — live · head 12 · 3 pending', line
+        line = format_sync_status_line(
+            {'homed': True, 'hub_cn': 'hub_svc', 'local_next_seq': 5,
+             'outbox_pending': 0},
+            connected=False,
+        )
+        assert line == 'SYNC: hub hub_svc — offline · head 5 · 0 pending', line
+        line = format_sync_status_line(
+            {'homed': True, 'hub_cn': 'hub_svc', 'local_next_seq': 1,
+             'outbox_pending': 0},
+            connected=False,
+            has_hub_url=False,
+        )
+        assert line == 'SYNC: hub hub_svc — no url configured', line
+        print('  [OK] format_sync_status_line combinations')
+
+        # Subscriber start/stop against local hub; own connection.
+        msync.pull_and_apply(
+            spoke_a, hub_url, container_id,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        doc_conn_id = id(spoke_a.conn)
+        stop_ev = threading.Event()
+        state = threading.Thread(target=lambda: None)  # dummy for attrs
+        state.connected = False
+        state.last_applied_at = None
+        state.storage_conn_id = None
+
+        sub_thr = threading.Thread(
+            target=_sync_subscriber_main,
+            args=(
+                spoke_a_path, hub_url, container_id, stop_ev, hub_cn,
+                ca_cert_path, None, state, 1.0,  # short poll for the test
+            ),
+            daemon=True,
+        )
+        sub_thr.start()
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and not state.connected:
+            time.sleep(0.1)
+        assert state.connected, 'subscriber never reported connected'
+        assert state.storage_conn_id is not None
+        assert state.storage_conn_id != doc_conn_id, (
+            'subscriber must open its own MSFStorage connection, not the '
+            f'document connection (doc={doc_conn_id} sub={state.storage_conn_id})'
+        )
+        # Document connection still usable.
+        n = spoke_a.conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        assert n >= 1
+        stop_ev.set()
+        sub_thr.join(timeout=8)
+        assert not sub_thr.is_alive(), 'subscriber did not stop'
+        print(f'  [OK] subscriber connected with own conn '
+              f'(doc={doc_conn_id} sub={state.storage_conn_id}); stopped cleanly')
+
+        # ==================================================================
+        # 18. dev_tracker CLI hub mode
+        # ==================================================================
+        print('\n=== 18. dev_tracker hub mode ===')
+        import dev_tracker as tracker_mod
+
+        # Author a minimal tracker container on a fresh hub.
+        tr_hub_dir = tempfile.mkdtemp(prefix='mschf_tr_hub_')
+        tmp_dirs.append(tr_hub_dir)
+        tr_id = 'dev_tracker'
+        tr_hub_msf = os.path.join(tr_hub_dir, f'{tr_id}.msf')
+
+        # Provision agent identity files in a temp "project" dir for the CLI.
+        tr_proj = tempfile.mkdtemp(prefix='mschf_tr_proj_')
+        tmp_dirs.append(tr_proj)
+        agent_cert, agent_key = generate_user_cert(
+            'tr_agent', ca_cert_pem, ca_key_pem
+        )
+        admin_c, admin_k = generate_user_cert(
+            'tr_admin', ca_cert_pem, ca_key_pem
+        )
+        # Write identities as plaintext keys (load_identity accepts plaintext).
+        for cn, cert, key in (
+            ('tr_admin', admin_c, admin_k),
+            ('tr_agent', agent_cert, agent_key),
+            ('admin', admin_c, admin_k),  # init always uses admin
+        ):
+            with open(os.path.join(tr_proj, f'{cn}.crt'), 'wb') as f:
+                f.write(cert)
+            with open(os.path.join(tr_proj, f'{cn}.key'), 'wb') as f:
+                f.write(key)
+
+        tr_db = MSFStorage(tr_hub_msf, ca_cert_path=ca_cert_path)
+        tr_db.conn.execute(
+            "CREATE TABLE IF NOT EXISTS dev_tasks ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, detail TEXT, "
+            "status TEXT NOT NULL DEFAULT 'backlog' "
+            "CHECK(status IN ('backlog','in_progress','done')), "
+            "created_at TEXT DEFAULT (datetime('now')), created_by TEXT, "
+            "updated_at TEXT DEFAULT (datetime('now')), updated_by TEXT, "
+            "horizon TEXT)"
+        )
+        tr_db.conn.execute(tracker_mod.TASK_LINKS_DDL)
+        tr_db.conn.commit()
+        admin_priv = _load_key(admin_k)
+        _signed_exec(
+            tr_db, admin_c, admin_k,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['entry_point', 'main_app'],
+            bootstrap=True,
+        )
+        for ddl in tracker_mod.AUDIT_TRIGGERS + tracker_mod.LINK_TRIGGERS + tracker_mod.VALIDATION_TRIGGERS:
+            _signed_exec(tr_db, admin_c, admin_k, ddl, [])
+        for level, target, role, perm in [
+            ('database', '*', 'agent', 'read'),
+            ('database', '*', 'agent', 'write'),
+            ('object', 'dev_tasks', 'agent', 'read'),
+            ('object', 'dev_tasks', 'agent', 'write'),
+            ('object', 'task_links', 'agent', 'read'),
+            ('object', 'task_links', 'agent', 'write'),
+        ]:
+            _signed_exec(
+                tr_db, admin_c, admin_k,
+                "INSERT INTO rbac_rules (level, target, role, permission) VALUES (?, ?, ?, ?)",
+                [level, target, role, perm],
+            )
+        _signed_exec(
+            tr_db, admin_c, admin_k,
+            "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)",
+            ['cert:CN=tr_agent', 'agent'],
+        )
+        _signed_exec(
+            tr_db, admin_c, admin_k,
+            "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, ?)",
+            ['seed hub task', 'from fixture', 'backlog'],
+        )
+        _signed_exec(
+            tr_db, admin_c, admin_k,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['sync_hub_cn', 'hub_svc'],
+        )
+        tr_db.close()
+
+        # Stop the notes hub; start tracker hub (reuse hub_svc cert).
+        try:
+            hub.shutdown()
+        except Exception:
+            pass
+        try:
+            hub.server_close()
+        except Exception:
+            pass
+        if hub_thread is not None:
+            hub_thread.join(timeout=2)
+        hub = None
+        hub_thread = None
+
+        tr_hub = MSFHub(
+            tr_hub_dir, hub_cert_path, hub_key_path,
+            host='127.0.0.1', port=0, ca_cert_path=ca_cert_path,
+        )
+        hub = tr_hub  # for finally cleanup
+        hub_thread = threading.Thread(target=tr_hub.serve_forever, daemon=True)
+        hub_thread.start()
+        for _ in range(50):
+            if tr_hub.httpd.server_port:
+                break
+            time.sleep(0.02)
+        tr_hub_url = tr_hub.url
+        msync.sign_and_submit(
+            tr_hub_url, tr_id, admin_priv, admin_c,
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ['sync_hub_url', tr_hub_url],
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+
+        # Bootstrap spoke replica into tr_proj as dev_tracker.msf
+        tr_spoke_path = os.path.join(tr_proj, 'dev_tracker.msf')
+        tr_spoke = msync.bootstrap(
+            tr_hub_url, tr_id, tr_spoke_path,
+            expected_hub_cn=hub_cn, ca_cert_path=ca_cert_path,
+        )
+        tr_spoke.close()
+        tr_spoke = None
+
+        # Point the CLI at this fixture.
+        old_db = tracker_mod.DB_PATH
+        old_proj = tracker_mod.PROJ_DIR
+        old_cli = tracker_mod._CLI_IDENTITY
+        tracker_mod.DB_PATH = tr_spoke_path
+        tracker_mod.PROJ_DIR = tr_proj
+        tracker_mod._CLI_IDENTITY = 'tr_agent'
+        # Plaintext keys: load_identity tries passphrase then falls back to plaintext.
+
+        import io
+        from contextlib import redirect_stdout
+
+        try:
+            # add → committed + visible in list
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_add('hub-mode task', 'via hub_write')
+            out = buf.getvalue()
+            assert 'committed' in out.lower() or 'Added backlog task' in out, out
+            assert 'hub-mode task' in out or 'Added' in out
+            print(f'  [OK] add → {out.strip()}')
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_list()
+            list_out = buf.getvalue()
+            assert 'hub-mode task' in list_out, list_out
+            print('  [OK] list shows hub-mode task')
+
+            # Stop hub → add → queued
+            try:
+                tr_hub.shutdown()
+            except Exception:
+                pass
+            try:
+                tr_hub.server_close()
+            except Exception:
+                pass
+            if hub_thread is not None:
+                hub_thread.join(timeout=2)
+            hub = None
+            hub_thread = None
+            time.sleep(0.15)
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_add('offline task', 'queued while hub down')
+            qout = buf.getvalue()
+            assert 'queued' in qout.lower(), qout
+            print(f'  [OK] hub down add → {qout.strip()}')
+
+            # list offline works with [offline] note
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_list()
+            loff = buf.getvalue()
+            assert '[offline]' in loff or 'hub-mode task' in loff, loff
+            assert 'seed hub task' in loff or 'hub-mode task' in loff
+            print('  [OK] list offline shows local data')
+
+            # Restart hub + flush
+            tr_hub = MSFHub(
+                tr_hub_dir, hub_cert_path, hub_key_path,
+                host='127.0.0.1', port=0, ca_cert_path=ca_cert_path,
+            )
+            hub = tr_hub
+            hub_thread = threading.Thread(target=tr_hub.serve_forever, daemon=True)
+            hub_thread.start()
+            for _ in range(50):
+                if tr_hub.httpd.server_port:
+                    break
+                time.sleep(0.02)
+            tr_hub_url = tr_hub.url
+            # Manifest still has old URL — patch spoke manifest via raw write of
+            # sync_hub_url is blocked by homed guard; flush takes explicit URL
+            # but cmd_flush reads from manifest. Update hub_url in spoke via
+            # temporary escape hatch so flush / list pull work.
+            prev_env = os.environ.get('MSCHF_ALLOW_LOCAL_WRITES')
+            os.environ['MSCHF_ALLOW_LOCAL_WRITES'] = '1'
+            try:
+                fix = MSFStorage(tr_spoke_path, ca_cert_path=ca_cert_path)
+                # Direct unsigned manifest update for test plumbing only.
+                fix.conn.execute(
+                    "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+                    ['sync_hub_url', tr_hub_url],
+                )
+                fix.conn.commit()
+                fix.close()
+            finally:
+                if prev_env is None:
+                    os.environ.pop('MSCHF_ALLOW_LOCAL_WRITES', None)
+                else:
+                    os.environ['MSCHF_ALLOW_LOCAL_WRITES'] = prev_env
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_flush()
+            fout = buf.getvalue()
+            assert 'flushed=' in fout, fout
+            print(f'  [OK] flush after restart → {fout.strip()}')
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_list()
+            assert 'offline task' in buf.getvalue()
+            print('  [OK] offline task visible after flush')
+
+            # init / update-app refuse on homed replica
+            try:
+                tracker_mod.cmd_update_app()
+                raise AssertionError('update-app should refuse on homed replica')
+            except SystemExit as e:
+                assert 'homed' in str(e).lower() or 'hub' in str(e).lower(), e
+                print(f'  [OK] update-app refuses on homed: {e}')
+
+            # Unhomed fixture: classic list/add still works (byte-compatible path).
+            unhomed_path = os.path.join(tr_proj, 'unhomed_tracker.msf')
+            udb = MSFStorage(unhomed_path, ca_cert_path=ca_cert_path)
+            udb.conn.execute(
+                "CREATE TABLE IF NOT EXISTS dev_tasks ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, detail TEXT, "
+                "status TEXT NOT NULL DEFAULT 'backlog' "
+                "CHECK(status IN ('backlog','in_progress','done')), "
+                "created_at TEXT DEFAULT (datetime('now')), created_by TEXT, "
+                "updated_at TEXT DEFAULT (datetime('now')), updated_by TEXT, "
+                "horizon TEXT)"
+            )
+            udb.conn.execute(tracker_mod.TASK_LINKS_DDL)
+            udb.conn.commit()
+            _signed_exec(
+                udb, admin_c, admin_k,
+                "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+                ['entry_point', 'main_app'],
+                bootstrap=True,
+            )
+            for ddl in (
+                tracker_mod.AUDIT_TRIGGERS
+                + tracker_mod.LINK_TRIGGERS
+                + tracker_mod.VALIDATION_TRIGGERS
+            ):
+                _signed_exec(udb, admin_c, admin_k, ddl, [])
+            for level, target, role, perm in [
+                ('database', '*', 'agent', 'read'),
+                ('database', '*', 'agent', 'write'),
+                ('object', 'dev_tasks', 'agent', 'read'),
+                ('object', 'dev_tasks', 'agent', 'write'),
+                ('object', 'task_links', 'agent', 'read'),
+                ('object', 'task_links', 'agent', 'write'),
+            ]:
+                _signed_exec(
+                    udb, admin_c, admin_k,
+                    "INSERT INTO rbac_rules (level, target, role, permission) "
+                    "VALUES (?, ?, ?, ?)",
+                    [level, target, role, perm],
+                )
+            _signed_exec(
+                udb, admin_c, admin_k,
+                "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)",
+                ['cert:CN=tr_agent', 'agent'],
+            )
+            _signed_exec(
+                udb, admin_c, admin_k,
+                "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, ?)",
+                ['local only', 'unhomed', 'backlog'],
+            )
+            udb.close()
+
+            tracker_mod.DB_PATH = unhomed_path
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_add('unhomed add', 'still local signed')
+            uout = buf.getvalue()
+            # Unhomed: no committed/queued tag — classic message only.
+            assert 'Added backlog task: unhomed add' in uout, uout
+            assert 'committed' not in uout.lower()
+            assert 'queued' not in uout.lower()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                tracker_mod.cmd_list()
+            assert 'unhomed add' in buf.getvalue()
+            assert 'local only' in buf.getvalue()
+            print('  [OK] unhomed tracker: classic add/list unchanged')
+
+        finally:
+            tracker_mod.DB_PATH = old_db
+            tracker_mod.PROJ_DIR = old_proj
+            tracker_mod._CLI_IDENTITY = old_cli
+
         print('\n=== ALL hub/sync tests passed ===')
         return 0
 

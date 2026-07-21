@@ -13,6 +13,22 @@ entry here.
 
 ### Added
 
+- **Hub-mode product wiring — homed containers are now live, usable apps**:
+  the GUI shows a sync-status line beside the crypto banner
+  (`SYNC: hub <cn> — live|offline · head N · M pending`) and runs a
+  background subscriber per homed document (own connection; applied rows
+  surface through the existing reactive redraw — a write on one spoke
+  updates other spokes' windows). `HostAPI.execute_signed_query` is
+  homing-aware: replica reads are local, RBAC-checked, and unsigned (reads
+  no longer append audit rows on replicas — offline reading works and the
+  read-chatter that caused the version-skew incident is gone), while
+  mutations route through `sync.hub_write` and report
+  `committed`/`queued`. The dev-tracker CLI gains hub mode: pull-then-read
+  for `list`/`links` (with an `[offline]` note when unreachable), mutations
+  via the hub with queued feedback, a `flush` verb for the outbox, and
+  `init`/`update-app` refusing on homed replicas. Implemented by the grok
+  agent; reviewed and independently re-tested by Claude.
+
 - **Event-driven sync engine** — restores the originally agreed hub-and-spoke
   design (write → hub verifies → propagates to spokes), which v1 had quietly
   downgraded to manual pull. The hub is now threaded with an explicit

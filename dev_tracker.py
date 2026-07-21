@@ -25,6 +25,7 @@ Usage:
   python dev_tracker.py link <from_id> <to_id> [kind]  # directional link (default kind: related)
   python dev_tracker.py links <id>               # show links to/from a task
   python dev_tracker.py update-app               # hot-deploy the current UI code (keeps task data)
+  python dev_tracker.py flush                    # flush pending sync_outbox intents (homed only)
   python dev_tracker.py verify                   # load the .msf and run it through the sandbox
   python dev_tracker.py audit                    # replay the signed ledger; flag out-of-band writes
 
@@ -149,6 +150,99 @@ def signed_exec(db, cert_pem, private_key, query, params, bootstrap=False):
     if bootstrap:
         return db.bootstrap_admin(query, params, signature, cert_pem)
     return db.execute_signed(query, params, signature, cert_pem)
+
+
+def local_read(db, cert_pem, query, params=None):
+    """RBAC-checked local SELECT (no ledger row) — used on homed replicas.
+
+    Signed reads advance the chain and are refused on containers whose
+    manifest names a hub; product reads therefore run unsigned after the
+    same coarse database- + object-level gates as execute_signed.
+    """
+    params = params if params is not None else []
+    identity = db._get_identity(cert_pem)
+    operation, table_name = db._parse_sql_query(query)
+    if operation != 'read':
+        raise PermissionError(
+            f"local_read is SELECT-only; got operation={operation!r}"
+        )
+    if not db.check_permission(identity, 'database', '*', 'read'):
+        raise PermissionError(
+            f"Access denied: Identity '{identity}' does not have database-level "
+            f"read permissions ('No Access' active)."
+        )
+    if table_name != '*':
+        if table_name in db.SYSTEM_TABLES:
+            row = db.conn.execute(
+                "SELECT role FROM user_roles WHERE identity = ?", (identity,)
+            ).fetchone()
+            role = row[0] if row else 'guest'
+            if role != 'admin':
+                raise PermissionError(
+                    f"Access denied: System table '{table_name}' can only be "
+                    f"modified by admin."
+                )
+        else:
+            if not db.check_permission(identity, 'object', table_name, 'read'):
+                raise PermissionError(
+                    f"Access denied: Identity '{identity}' does not have "
+                    f"'read' permission on table '{table_name}'."
+                )
+    cursor = db.conn.cursor()
+    if params:
+        cursor.execute(query, params)
+    else:
+        cursor.execute(query)
+    return cursor
+
+
+def _print_write_result(result, action_msg):
+    """Print committed/queued feedback after a hub or local write."""
+    if result is None:
+        print(action_msg)
+        return
+    status = result.get('status') if isinstance(result, dict) else getattr(result, 'status', None)
+    seq = result.get('seq') if isinstance(result, dict) else getattr(result, 'seq', None)
+    if status == 'queued':
+        print(f"{action_msg}  [queued (hub unreachable — will flush on reconnect)]")
+    elif status == 'committed' and seq is not None:
+        print(f"{action_msg}  [committed (seq {seq})]")
+    else:
+        print(action_msg)
+
+
+def hub_or_local_write(db, cert_pem, private_key, query, params, hub_url, hub_cn):
+    """Route a mutation: hub_write when homed, signed_exec when unhomed.
+
+    Returns a result dict ``{'status': 'committed'|'queued', 'seq': ...}`` for
+    homed paths, or ``None`` for unhomed (caller prints the classic message).
+    """
+    if hub_cn:
+        from mschf import sync as msync
+        container_id = os.path.splitext(os.path.basename(db.filename))[0]
+        cert = cert_pem.decode('utf-8') if isinstance(cert_pem, bytes) else cert_pem
+        return msync.hub_write(
+            db,
+            hub_url or '',
+            container_id,
+            private_key,
+            cert,
+            _active_cn(),
+            query,
+            params if params is not None else [],
+            expected_hub_cn=hub_cn,
+            ca_cert_path=getattr(db, '_ca_cert_path_arg', None),
+            trust_dir=getattr(db, 'trust_dir', None),
+        )
+    signed_exec(db, cert_pem, private_key, query, params)
+    return None
+
+
+def cli_read(db, cert_pem, private_key, query, params, hub_cn):
+    """SELECT path: unsigned local read when homed, signed_exec when unhomed."""
+    if hub_cn:
+        return local_read(db, cert_pem, query, params)
+    return signed_exec(db, cert_pem, private_key, query, params)
 
 
 # Audit fields are stamped by triggers from current_signer() — the SQL function
@@ -647,6 +741,23 @@ def cmd_init():
     override = _active_cn()
     if override != 'admin':
         print(f"Note: identity override '{override}' ignored for init (always uses admin).")
+    if os.path.exists(DB_PATH):
+        # Refuse re-init of a homed replica — admin authors on the hub copy.
+        try:
+            probe = MSFStorage(DB_PATH)
+            from mschf import sync as msync
+            _url, hub_cn = msync.homing(probe)
+            probe.close()
+            if hub_cn:
+                sys.exit(
+                    f"Refuse init: {DB_PATH} is a homed replica (hub {hub_cn!r}). "
+                    "Author/admin on the hub's copy, or set MSCHF_ALLOW_LOCAL_WRITES=1 "
+                    "only for orphan recovery (may fork)."
+                )
+        except SystemExit:
+            raise
+        except Exception:
+            pass
     cert_pem, private_key = load_admin_identity()
 
     if os.path.exists(DB_PATH):
@@ -693,10 +804,39 @@ def cmd_init():
 
 
 def _open_for_cli():
+    """Open the tracker container; return (db, cert, key, hub_url, hub_cn).
+
+    When the container is homed, schema migrations are skipped (schema arrives
+    via hub pull) and callers must use local_read / hub_or_local_write.
+    """
     cert_pem, private_key = load_identity()
     if not os.path.exists(DB_PATH):
         sys.exit("dev_tracker.msf not found — run: python dev_tracker.py init")
-    return MSFStorage(DB_PATH), cert_pem, private_key
+    db = MSFStorage(DB_PATH)
+    from mschf import sync as msync
+    hub_url, hub_cn = msync.homing(db)
+    return db, cert_pem, private_key, hub_url, hub_cn
+
+
+def _maybe_pull(db, hub_url, hub_cn):
+    """Best-effort pull_and_apply for list/links. Prints one [offline] note on failure."""
+    if not hub_cn or not hub_url:
+        return
+    from mschf import sync as msync
+    container_id = os.path.splitext(os.path.basename(db.filename))[0]
+    try:
+        msync.pull_and_apply(
+            db, hub_url, container_id,
+            expected_hub_cn=hub_cn,
+            ca_cert_path=getattr(db, '_ca_cert_path_arg', None),
+            trust_dir=getattr(db, 'trust_dir', None),
+        )
+    except Exception as e:
+        if msync._is_connection_error(e) or isinstance(e, (TimeoutError, OSError)):
+            print(f"[offline] hub unreachable — showing local data ({e})")
+        else:
+            # Non-network (attestation etc.): still continue with local data.
+            print(f"[offline] pull failed — showing local data ({e})")
 
 
 def _list_tag(status, horizon):
@@ -713,21 +853,26 @@ def _list_tag(status, horizon):
 
 
 def cmd_list():
-    db, cert_pem, private_key = _open_for_cli()
-    _ensure_schema(db, cert_pem, private_key)
-    cursor = signed_exec(
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        _ensure_schema(db, cert_pem, private_key)
+    else:
+        _maybe_pull(db, hub_url, hub_cn)
+    cursor = cli_read(
         db, cert_pem, private_key,
         "SELECT id, title, status, created_at, created_by, updated_at, updated_by, "
         "COALESCE(horizon, 'near') FROM dev_tasks " + LIST_ORDER_SQL,
         [],
+        hub_cn,
     )
     rows = cursor.fetchall()
     # Compact outgoing/incoming link counts and first target for annotation.
     link_annot = {}
     try:
-        lcur = signed_exec(
+        lcur = cli_read(
             db, cert_pem, private_key,
             "SELECT from_id, to_id, kind FROM task_links", [],
+            hub_cn,
         )
         for fr, to, kind in lcur.fetchall():
             link_annot.setdefault(fr, []).append(f"->{to}")
@@ -752,18 +897,22 @@ def cmd_add(title, detail=""):
     # Client gate before any signing/open — engine triggers enforce the same rule.
     if not (detail or "").strip():
         sys.exit(_detail_required_cli_hint())
-    db, cert_pem, private_key = _open_for_cli()
-    _ensure_schema(db, cert_pem, private_key)
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        _ensure_schema(db, cert_pem, private_key)
     try:
-        signed_exec(db, cert_pem, private_key,
-                    "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, 'backlog')",
-                    [title, detail])
+        result = hub_or_local_write(
+            db, cert_pem, private_key,
+            "INSERT INTO dev_tasks (title, detail, status) VALUES (?, ?, 'backlog')",
+            [title, detail],
+            hub_url, hub_cn,
+        )
     except Exception as e:
         db.close()
         if _is_detail_required_error(e):
             sys.exit(_detail_required_cli_hint())
         raise
-    print(f"Added backlog task: {title}")
+    _print_write_result(result, f"Added backlog task: {title}")
     db.close()
 
 
@@ -774,20 +923,25 @@ def cmd_describe(task_id, detail):
             'Description cannot be blank. '
             'Usage: python dev_tracker.py describe <id> "text"'
         )
-    db, cert_pem, private_key = _open_for_cli()
-    _ensure_schema(db, cert_pem, private_key)
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        _ensure_schema(db, cert_pem, private_key)
     tid = int(task_id)
-    exists = signed_exec(
+    exists = cli_read(
         db, cert_pem, private_key,
         "SELECT title FROM dev_tasks WHERE id = ?", [tid],
+        hub_cn,
     ).fetchone()
     if not exists:
         db.close()
         sys.exit(f"No task with id {tid}.")
     try:
-        signed_exec(db, cert_pem, private_key,
-                    "UPDATE dev_tasks SET detail = ? WHERE id = ?",
-                    [detail, tid])
+        result = hub_or_local_write(
+            db, cert_pem, private_key,
+            "UPDATE dev_tasks SET detail = ? WHERE id = ?",
+            [detail, tid],
+            hub_url, hub_cn,
+        )
     except Exception as e:
         db.close()
         if _is_detail_required_error(e):
@@ -796,97 +950,125 @@ def cmd_describe(task_id, detail):
                 'Usage: python dev_tracker.py describe <id> "text"'
             )
         raise
-    print(f"Task #{tid} ({exists[0]}) description updated.")
+    _print_write_result(result, f"Task #{tid} ({exists[0]}) description updated.")
     db.close()
 
 
 def cmd_status(task_id, new_status):
     if new_status not in VALID_STATUSES:
         sys.exit(f"Invalid status '{new_status}' — use one of {VALID_STATUSES}")
-    db, cert_pem, private_key = _open_for_cli()
-    _ensure_schema(db, cert_pem, private_key)
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        _ensure_schema(db, cert_pem, private_key)
     try:
-        signed_exec(db, cert_pem, private_key,
-                    "UPDATE dev_tasks SET status = ? WHERE id = ?",
-                    [new_status, int(task_id)])
+        result = hub_or_local_write(
+            db, cert_pem, private_key,
+            "UPDATE dev_tasks SET status = ? WHERE id = ?",
+            [new_status, int(task_id)],
+            hub_url, hub_cn,
+        )
     except Exception as e:
         db.close()
         if _is_detail_required_error(e):
             sys.exit(_detail_required_cli_hint(task_id))
         raise
-    cursor = signed_exec(db, cert_pem, private_key, "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)])
+    cursor = cli_read(
+        db, cert_pem, private_key,
+        "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)],
+        hub_cn,
+    )
     row = cursor.fetchone()
-    print(f"Task #{task_id} ({row[0] if row else '?'}) -> {new_status}")
+    _print_write_result(result, f"Task #{task_id} ({row[0] if row else '?'}) -> {new_status}")
     db.close()
 
 
 def cmd_horizon(task_id, new_horizon):
     if new_horizon not in VALID_HORIZONS:
         sys.exit(f"Invalid horizon '{new_horizon}' — use one of {VALID_HORIZONS}")
-    db, cert_pem, private_key = _open_for_cli()
-    _ensure_schema(db, cert_pem, private_key)
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        _ensure_schema(db, cert_pem, private_key)
     try:
-        signed_exec(db, cert_pem, private_key,
-                    "UPDATE dev_tasks SET horizon = ? WHERE id = ?",
-                    [new_horizon, int(task_id)])
+        result = hub_or_local_write(
+            db, cert_pem, private_key,
+            "UPDATE dev_tasks SET horizon = ? WHERE id = ?",
+            [new_horizon, int(task_id)],
+            hub_url, hub_cn,
+        )
     except Exception as e:
         db.close()
         if _is_detail_required_error(e):
             sys.exit(_detail_required_cli_hint(task_id))
         raise
-    cursor = signed_exec(db, cert_pem, private_key, "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)])
+    cursor = cli_read(
+        db, cert_pem, private_key,
+        "SELECT title FROM dev_tasks WHERE id = ?", [int(task_id)],
+        hub_cn,
+    )
     row = cursor.fetchone()
-    print(f"Task #{task_id} ({row[0] if row else '?'}) horizon -> {new_horizon}")
+    _print_write_result(
+        result,
+        f"Task #{task_id} ({row[0] if row else '?'}) horizon -> {new_horizon}",
+    )
     db.close()
 
 
 def cmd_link(from_id, to_id, kind='related'):
     from_id, to_id = int(from_id), int(to_id)
     kind = (kind or 'related').strip() or 'related'
-    db, cert_pem, private_key = _open_for_cli()
-    _ensure_schema(db, cert_pem, private_key)
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        _ensure_schema(db, cert_pem, private_key)
     for tid, label in ((from_id, 'from_id'), (to_id, 'to_id')):
-        row = signed_exec(
+        row = cli_read(
             db, cert_pem, private_key,
             "SELECT id FROM dev_tasks WHERE id = ?", [tid],
+            hub_cn,
         ).fetchone()
         if not row:
             db.close()
             sys.exit(f"No task with id {tid} ({label}).")
     try:
-        signed_exec(
+        result = hub_or_local_write(
             db, cert_pem, private_key,
             "INSERT INTO task_links (from_id, to_id, kind) VALUES (?, ?, ?)",
             [from_id, to_id, kind],
+            hub_url, hub_cn,
         )
     except sqlite3.IntegrityError:
         db.close()
         sys.exit(f"Link already exists: #{from_id} -[{kind}]-> #{to_id}")
-    print(f"Linked #{from_id} -[{kind}]-> #{to_id}")
+    _print_write_result(result, f"Linked #{from_id} -[{kind}]-> #{to_id}")
     db.close()
 
 
 def cmd_links(task_id):
     task_id = int(task_id)
-    db, cert_pem, private_key = _open_for_cli()
-    _ensure_schema(db, cert_pem, private_key)
-    exists = signed_exec(
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        _ensure_schema(db, cert_pem, private_key)
+    else:
+        _maybe_pull(db, hub_url, hub_cn)
+    exists = cli_read(
         db, cert_pem, private_key,
         "SELECT title FROM dev_tasks WHERE id = ?", [task_id],
+        hub_cn,
     ).fetchone()
     if not exists:
         db.close()
         sys.exit(f"No task with id {task_id}.")
     print(f"Links for #{task_id} ({exists[0]}):")
-    out = signed_exec(
+    out = cli_read(
         db, cert_pem, private_key,
         "SELECT to_id, kind FROM task_links WHERE from_id = ? ORDER BY id",
         [task_id],
+        hub_cn,
     ).fetchall()
-    inn = signed_exec(
+    inn = cli_read(
         db, cert_pem, private_key,
         "SELECT from_id, kind FROM task_links WHERE to_id = ? ORDER BY id",
         [task_id],
+        hub_cn,
     ).fetchall()
     if not out and not inn:
         print("  (none)")
@@ -902,7 +1084,7 @@ def cmd_verify():
     from mschf.sandbox import execute_micro_app
     import toga
 
-    db, cert_pem, private_key = _open_for_cli()
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
     entry_point = db.get_manifest_item('entry_point')
     assert entry_point == 'main_app', f"Expected entry_point 'main_app', got {entry_point!r}"
     print(f"Manifest entry point: {entry_point}")
@@ -916,10 +1098,11 @@ def cmd_verify():
 
     cn = _active_cn()
     key_path = os.path.join(PROJ_DIR, f'{cn}.key')
+    cert_str = cert_pem.decode('utf-8') if isinstance(cert_pem, bytes) else cert_pem
     widget = execute_micro_app(
         code_func, PROJ_DIR, db,
         current_user_cn=cn,
-        current_user_cert_pem=cert_pem.decode('utf-8'),
+        current_user_cert_pem=cert_str,
         key_path=key_path,
         key_passphrase=_identity_passphrase(),
     )
@@ -940,8 +1123,16 @@ def cmd_update_app():
     and appended to the audit log, and get_code_signature_status() verifies the
     newest deployment. Reopen the document in the GUI to load the new UI.
     Non-admin identities are denied by RBAC (source_code is a system table).
+    Homed replicas refuse update-app — operate on the hub copy.
     """
-    db, cert_pem, private_key = _open_for_cli()
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if hub_cn:
+        db.close()
+        sys.exit(
+            f"Refuse update-app: container is a homed replica (hub {hub_cn!r}). "
+            "Deploy on the hub's copy, or use MSCHF_ALLOW_LOCAL_WRITES=1 only "
+            "for orphan recovery (may fork)."
+        )
     _ensure_schema(db, cert_pem, private_key)
     pickled = __import__('dill').dumps(dev_tracker_app)
     try:
@@ -957,10 +1148,38 @@ def cmd_update_app():
     print("Reopen the document in the GUI to load the new UI.")
 
 
+def cmd_flush():
+    """Flush pending sync_outbox intents for the active identity (homed only)."""
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
+    if not hub_cn:
+        db.close()
+        sys.exit("flush requires a homed container (manifest sync_hub_cn).")
+    if not hub_url:
+        db.close()
+        sys.exit("flush requires sync_hub_url in the container manifest.")
+    from mschf import sync as msync
+    container_id = os.path.splitext(os.path.basename(db.filename))[0]
+    cert = cert_pem.decode('utf-8') if isinstance(cert_pem, bytes) else cert_pem
+    summary = msync.flush_outbox(
+        db, hub_url, container_id,
+        private_key, cert, _active_cn(),
+        expected_hub_cn=hub_cn,
+        ca_cert_path=getattr(db, '_ca_cert_path_arg', None),
+        trust_dir=getattr(db, 'trust_dir', None),
+    )
+    db.close()
+    print(
+        f"flush: flushed={summary['flushed']} failed={summary['failed']} "
+        f"remaining={summary['remaining']} stopped_on={summary['stopped_on']}"
+    )
+    if summary['failed'] or summary['remaining']:
+        sys.exit(1)
+
+
 def cmd_audit():
     """Replay the signed ledger into a shadow DB and diff against live tables."""
     from mschf.audit import replay_audit, format_report
-    db, cert_pem, private_key = _open_for_cli()
+    db, cert_pem, private_key, hub_url, hub_cn = _open_for_cli()
     report = replay_audit(db)
     print(format_report(report))
     db.close()
@@ -1013,6 +1232,8 @@ def main():
         cmd_links(args[1])
     elif cmd == 'update-app':
         cmd_update_app()
+    elif cmd == 'flush':
+        cmd_flush()
     elif cmd == 'audit':
         cmd_audit()
     elif cmd == 'verify':
