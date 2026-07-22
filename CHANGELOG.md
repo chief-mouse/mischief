@@ -24,6 +24,23 @@ entry here.
 
 ### Added
 
+- **Owner attestation for agent identities** (directory containers): a signed
+  owner→agent delegation record, adapted from block/buzz's NIP-OA. New
+  `agent_attestations` table with `attest_agent` / `revoke_attestation` /
+  `lookup_attestations` / `verify_attestation` APIs: the owner's key signs a
+  canonical payload (agent + owner fingerprints, conditions, expiry); the
+  record is authorization evidence only — it never overrides authorship and
+  nothing in signature verification or trust-anchor resolution consults it
+  (the directory remains a non-anchor). Verification checks the owner cert
+  against the host trust store, expiry, and revocation. Status changes are
+  enforced in-engine by signed triggers (owner or directory_admin only,
+  NULL/unsigned signers refused, signed-core columns frozen — corrections are
+  revoke + re-attest), via an `attestation_authz` mirror of privileged roles
+  because the authorizer denies non-admin reads of `user_roles` inside
+  trigger bodies. Implemented by the grok agent across three review rounds
+  (engine-gate bypass and a trigger-ordering bug caught and fixed in review);
+  independently re-tested by Claude.
+
 - **Hub-mode product wiring — homed containers are now live, usable apps**:
   the GUI shows a sync-status line beside the crypto banner
   (`SYNC: hub <cn> — live|offline · head N · M pending`) and runs a

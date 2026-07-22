@@ -20,12 +20,18 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from mschf.audit import replay_audit, format_report
+from datetime import datetime, timedelta, timezone
+
 from mschf.directory import (
     create_directory_container,
     register_identity,
     set_identity_status,
     lookup,
     cert_fingerprint,
+    attest_agent,
+    revoke_attestation,
+    lookup_attestations,
+    verify_attestation,
 )
 from mschf.gen_cert import (
     generate_selfsigned_cert,
@@ -353,9 +359,496 @@ def run():
             raw.close()
 
         # ------------------------------------------------------------------
-        # 7. Final replay_audit + cleanup
+        # 7. Owner→agent attestations
         # ------------------------------------------------------------------
-        print("\n--- 7. Final replay_audit ---")
+        print("\n--- 7. Owner→agent attestations ---")
+
+        # Human owner + agent certs (host CA)
+        owner_cert, owner_key_pem = generate_user_cert(
+            "human_owner", host_ca_cert, host_ca_key
+        )
+        agent_cert, agent_key_pem = generate_user_cert(
+            "claude", host_ca_cert, host_ca_key
+        )
+        other_member_cert, other_member_key_pem = generate_user_cert(
+            "other_member", host_ca_cert, host_ca_key
+        )
+        owner_pk = load_key(owner_key_pem)
+        other_member_pk = load_key(other_member_key_pem)
+
+        fp_owner = register_identity(
+            db, dir_admin_cert, admin_pk, owner_cert, org="Host Org"
+        )
+        fp_agent = register_identity(
+            db, dir_admin_cert, admin_pk, agent_cert, org="Host Org"
+        )
+        fp_other = register_identity(
+            db, dir_admin_cert, admin_pk, other_member_cert, org="Host Org"
+        )
+        assert fp_owner == cert_fingerprint(owner_cert)
+        assert fp_agent == cert_fingerprint(agent_cert)
+
+        # Grant member role so owners can INSERT attestations
+        for cert_pem, key_pem in (
+            (owner_cert, owner_key_pem),
+            (other_member_cert, other_member_key_pem),
+            (partner_user_cert, partner_user_key),
+        ):
+            mid = db._get_identity(cert_pem)
+            q = "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)"
+            sig = make_signed_payload(db, q, [mid, "member"], dir_admin_key)
+            db.assign_user_role(mid, "member", sig, dir_admin_cert)
+
+        # 7a. Happy path
+        print("  --- 7a. Happy path ---")
+        att_id = attest_agent(
+            db,
+            owner_cert,
+            owner_pk,
+            owner_pk,
+            owner_cert,
+            "claude",
+            conditions="scope:dev-tracker",
+            expires_at=None,
+        )
+        assert att_id is not None
+        found = lookup_attestations(db, agent_cn="claude")
+        assert len(found) == 1, found
+        assert found[0]["owner_cn"] == "human_owner"
+        assert found[0]["agent_fingerprint"] == fp_agent
+        assert found[0]["owner_fingerprint"] == fp_owner
+        assert found[0]["conditions"] == "scope:dev-tracker"
+        assert found[0]["status"] == "active"
+        assert found[0]["added_by"] == "cert:CN=human_owner"
+        verdict = verify_attestation(db, found[0])
+        assert verdict["valid"] is True, verdict
+        print(f"  [OK] attest + lookup + verify valid (id={att_id})")
+
+        # 7b. Refusals: self-attest, unregistered agent, revoked owner
+        print("  --- 7b. Refusals ---")
+        try:
+            attest_agent(
+                db, owner_cert, owner_pk, owner_pk, owner_cert, "human_owner"
+            )
+            raise AssertionError("self-attestation must be refused")
+        except ValueError as e:
+            assert "self" in str(e).lower(), e
+            print(f"  [OK] self-attestation refused: {e}")
+
+        try:
+            attest_agent(
+                db, owner_cert, owner_pk, owner_pk, owner_cert, "no_such_agent"
+            )
+            raise AssertionError("unregistered agent must be refused")
+        except ValueError as e:
+            assert "not registered" in str(e).lower() or "no_such" in str(e).lower(), e
+            print(f"  [OK] unregistered agent refused: {e}")
+
+        set_identity_status(db, dir_admin_cert, admin_pk, fp_owner, "revoked")
+        try:
+            attest_agent(
+                db, dir_admin_cert, admin_pk, owner_pk, owner_cert, "claude"
+            )
+            raise AssertionError("revoked owner must be refused")
+        except ValueError as e:
+            assert "active" in str(e).lower() or "revoked" in str(e).lower(), e
+            print(f"  [OK] revoked-registration owner refused: {e}")
+        # Restore owner for later tests
+        set_identity_status(db, dir_admin_cert, admin_pk, fp_owner, "active")
+
+        # 7c. Tampered row (side container so main db stays audit-clean)
+        print("  --- 7c. Tamper → verify invalid + replay_audit flags ---")
+        tamper_dest = track("test_directory_tamper.msf")
+        if os.path.exists(tamper_dest):
+            os.remove(tamper_dest)
+        create_directory_container(
+            tamper_dest, identity, ca_cert_path=ca_cert_path, trust_dir=trust_dir
+        )
+        tdb = MSFStorage(tamper_dest, ca_cert_path=ca_cert_path, trust_dir=trust_dir)
+        t_admin_pk = load_key(dir_admin_key)
+        register_identity(tdb, dir_admin_cert, t_admin_pk, owner_cert)
+        register_identity(tdb, dir_admin_cert, t_admin_pk, agent_cert)
+        mid = tdb._get_identity(owner_cert)
+        q = "INSERT OR REPLACE INTO user_roles (identity, role) VALUES (?, ?)"
+        sig = make_signed_payload(tdb, q, [mid, "member"], dir_admin_key)
+        tdb.assign_user_role(mid, "member", sig, dir_admin_cert)
+        attest_agent(
+            tdb, owner_cert, owner_pk, owner_pk, owner_cert, "claude",
+            conditions="original-conditions",
+        )
+        trow = lookup_attestations(tdb, agent_cn="claude")[0]
+        assert verify_attestation(tdb, trow)["valid"] is True
+        # Out-of-band edit via the storage connection (bypasses execute_signed /
+        # ledger). Core-column freeze aborts a plain UPDATE of conditions, so
+        # drop that guard first to simulate a raw page-level / pre-freeze
+        # mutation; still a ledger-skipping change that verify + audit catch.
+        tdb.conn.execute(
+            "DROP TRIGGER IF EXISTS trg_agent_attestations_core_immutable"
+        )
+        tdb.conn.execute(
+            "UPDATE agent_attestations SET conditions = ? WHERE id = ?",
+            ("TAMPERED", trow["id"]),
+        )
+        tdb.conn.commit()
+        trow2 = lookup_attestations(tdb, agent_cn="claude")[0]
+        assert trow2["conditions"] == "TAMPERED"
+        v_bad = verify_attestation(tdb, trow2)
+        assert v_bad["valid"] is False, v_bad
+        assert "signature" in v_bad["reason"].lower() or "mismatch" in v_bad["reason"].lower(), v_bad
+        print(f"  [OK] tampered conditions → verify invalid: {v_bad['reason']}")
+        treport = replay_audit(tdb)
+        assert not treport["ok"], "tampered container must fail replay_audit"
+        print("  [OK] replay_audit flags out-of-band tamper")
+        tdb.close()
+
+        # 7d. Expiry
+        print("  --- 7d. Expiry ---")
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        future = (datetime.now(timezone.utc) + timedelta(days=30)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        # Use partner_user as a second owner attesting the same agent (fresh pair)
+        partner_pk = load_key(partner_user_key)
+        # partner already registered and active from section 2
+        exp_id = attest_agent(
+            db,
+            partner_user_cert,
+            partner_pk,
+            partner_pk,
+            partner_user_cert,
+            "claude",
+            conditions="time-bound",
+            expires_at=past,
+        )
+        exp_rows = [
+            r for r in lookup_attestations(db, agent_cn="claude")
+            if r["id"] == exp_id
+        ]
+        assert len(exp_rows) == 1
+        v_exp = verify_attestation(db, exp_rows[0])
+        assert v_exp["valid"] is False, v_exp
+        assert "expir" in v_exp["reason"].lower(), v_exp
+        print(f"  [OK] past expires_at → invalid: {v_exp['reason']}")
+
+        before_expiry = datetime.now(timezone.utc) - timedelta(hours=2)
+        v_early = verify_attestation(db, exp_rows[0], at_time=before_expiry)
+        assert v_early["valid"] is True, v_early
+        print("  [OK] at_time before expiry → valid")
+
+        # Non-expired attestation for later clean audit
+        attest_agent(
+            db,
+            owner_cert,
+            owner_pk,
+            owner_pk,
+            owner_cert,
+            "claude",
+            conditions="still-good",
+            expires_at=future,
+        )
+
+        # 7e. Revocation
+        print("  --- 7e. Revocation ---")
+        # directory_admin revokes the original happy-path attestation
+        role_pk = load_key(role_admin_key)
+        revoke_attestation(db, role_admin_cert, role_pk, att_id)
+        rev_row = [
+            r for r in lookup_attestations(db, agent_cn="claude", include_revoked=True)
+            if r["id"] == att_id
+        ][0]
+        assert rev_row["status"] == "revoked"
+        v_rev = verify_attestation(db, rev_row)
+        assert v_rev["valid"] is False, v_rev
+        assert "revok" in v_rev["reason"].lower() or "status" in v_rev["reason"].lower(), v_rev
+        print(f"  [OK] directory_admin revoke → verify invalid: {v_rev['reason']}")
+
+        # Owner creates a fresh attestation and revokes it themselves
+        own_id = attest_agent(
+            db, owner_cert, owner_pk, owner_pk, owner_cert, "claude",
+            conditions="owner-will-revoke",
+        )
+        revoke_attestation(db, owner_cert, owner_pk, own_id)
+        own_row = [
+            r for r in lookup_attestations(db, include_revoked=True) if r["id"] == own_id
+        ][0]
+        assert own_row["status"] == "revoked"
+        print("  [OK] owner revokes own attestation")
+
+        # Unrelated member cannot revoke someone else's attestation
+        # Re-attest so there is an active row owned by human_owner
+        live_id = attest_agent(
+            db, owner_cert, owner_pk, owner_pk, owner_cert, "claude",
+            conditions="live-for-refuse",
+        )
+        try:
+            revoke_attestation(db, other_member_cert, other_member_pk, live_id)
+            raise AssertionError("unrelated member must not revoke")
+        except PermissionError as e:
+            print(f"  [OK] unrelated member revoke refused: {e}")
+        still_live = [
+            r for r in lookup_attestations(db, agent_cn="claude") if r["id"] == live_id
+        ]
+        assert len(still_live) == 1 and still_live[0]["status"] == "active"
+
+        # 7f. Verification consults trust store, not directory membership
+        print("  --- 7f. Trust store fail-closed ---")
+        # partner_user already attested with past expiry; make a non-expired one
+        partner_att = attest_agent(
+            db,
+            partner_user_cert,
+            partner_pk,
+            partner_pk,
+            partner_user_cert,
+            "claude",
+            conditions="partner-owned",
+            expires_at=future,
+        )
+        p_row = [
+            r for r in lookup_attestations(db, agent_cn="claude") if r["id"] == partner_att
+        ][0]
+        assert verify_attestation(db, p_row)["valid"] is True
+
+        # Remove partner CA from trust dir → verify must fail closed
+        os.remove(partner_ca_path)
+        v_untrusted = verify_attestation(
+            db, p_row, ca_cert_path=ca_cert_path, trust_dir=trust_dir
+        )
+        assert v_untrusted["valid"] is False, v_untrusted
+        assert (
+            "trust" in v_untrusted["reason"].lower()
+            or "chain" in v_untrusted["reason"].lower()
+        ), v_untrusted
+        print(f"  [OK] owner CA removed from trust dir → invalid: {v_untrusted['reason']}")
+        # Restore partner CA for any remaining checks / audit of partner-signed ledger rows
+        with open(partner_ca_path, "wb") as f:
+            f.write(partner_ca_cert)
+        assert verify_attestation(db, p_row)["valid"] is True
+        print("  [OK] restoring partner CA restores verify")
+
+        # Predates-attestations behavior (empty lookup / clear error)
+        print("  --- 7g. Predates-attestations guard ---")
+        bare = track("test_directory_bare.msf")
+        if os.path.exists(bare):
+            os.remove(bare)
+        # Minimal: create container then drop the table out-of-band to simulate legacy
+        create_directory_container(
+            bare, identity, ca_cert_path=ca_cert_path, trust_dir=trust_dir
+        )
+        bdb = MSFStorage(bare, ca_cert_path=ca_cert_path, trust_dir=trust_dir)
+        # Simulate pre-feature directory by renaming table away
+        bdb.conn.execute("ALTER TABLE agent_attestations RENAME TO _agent_attestations_gone")
+        bdb.conn.commit()
+        assert lookup_attestations(bdb) == []
+        try:
+            attest_agent(
+                bdb, dir_admin_cert, admin_pk, owner_pk, owner_cert, "claude"
+            )
+            raise AssertionError("must raise directory predates attestations")
+        except RuntimeError as e:
+            assert "predate" in str(e).lower() or "attestations" in str(e).lower(), e
+            print(f"  [OK] predates guard: {e}")
+        bdb.close()
+
+        # Engine-level status / core-column guards (bypass API, use execute_signed)
+        print("  --- 7h. Engine status + core-column guards ---")
+        gate_id = attest_agent(
+            db, owner_cert, owner_pk, owner_pk, owner_cert, "claude",
+            conditions="engine-gate-target",
+        )
+        # Ensure an active row we can also revoke then try to re-activate
+        gate_revoked_id = attest_agent(
+            db, owner_cert, owner_pk, owner_pk, owner_cert, "claude",
+            conditions="engine-gate-reactivate",
+        )
+        revoke_attestation(db, owner_cert, owner_pk, gate_revoked_id)
+
+        def signed_status_update(cert_pem, key_pem, att_id, new_status):
+            q = "UPDATE agent_attestations SET status = ? WHERE id = ?"
+            params = [new_status, att_id]
+            sig = make_signed_payload(db, q, params, key_pem)
+            return db.execute_signed(q, params, sig, cert_pem)
+
+        # 1. Non-owner member: active→revoked and revoked→active both refused
+        for att_id, new_st, label in (
+            (gate_id, "revoked", "active→revoked"),
+            (gate_revoked_id, "active", "revoked→active"),
+        ):
+            try:
+                signed_status_update(
+                    other_member_cert, other_member_key_pem, att_id, new_st
+                )
+                raise AssertionError(
+                    f"non-owner member status flip ({label}) must be refused"
+                )
+            except Exception as e:
+                msg = str(e).lower()
+                assert (
+                    "status" in msg
+                    or "owner" in msg
+                    or "admin" in msg
+                    or "unauthorized" in msg
+                    or "denied" in msg
+                ), e
+                print(f"  [OK] non-owner member {label} refused: {e}")
+
+        still_active = db.conn.execute(
+            "SELECT status FROM agent_attestations WHERE id = ?", (gate_id,)
+        ).fetchone()[0]
+        assert still_active == "active", still_active
+        still_revoked = db.conn.execute(
+            "SELECT status FROM agent_attestations WHERE id = ?", (gate_revoked_id,)
+        ).fetchone()[0]
+        assert still_revoked == "revoked", still_revoked
+
+        # 2. Owner-signed direct status UPDATE allowed (parity with API path)
+        signed_status_update(owner_cert, owner_key_pem, gate_id, "revoked")
+        assert (
+            db.conn.execute(
+                "SELECT status FROM agent_attestations WHERE id = ?", (gate_id,)
+            ).fetchone()[0]
+            == "revoked"
+        )
+        print("  [OK] owner-signed direct status UPDATE allowed")
+        # restore a live row for any later checks
+        signed_status_update(owner_cert, owner_key_pem, gate_id, "active")
+
+        # 3. Raw unsigned UPDATE of status (NULL current_signer) aborted
+        try:
+            db.conn.execute(
+                "UPDATE agent_attestations SET status = ? WHERE id = ?",
+                ("revoked", gate_id),
+            )
+            db.conn.commit()
+            raise AssertionError("raw unsigned status UPDATE must abort")
+        except Exception as e:
+            db.conn.rollback()
+            msg = str(e).lower()
+            assert (
+                "status" in msg
+                or "owner" in msg
+                or "admin" in msg
+                or "current_signer" in msg
+            ), e
+            print(f"  [OK] raw unsigned status UPDATE aborted: {e}")
+        assert (
+            db.conn.execute(
+                "SELECT status FROM agent_attestations WHERE id = ?", (gate_id,)
+            ).fetchone()[0]
+            == "active"
+        )
+
+        # 4. Signed UPDATE of frozen core column refused even for directory_admin
+        q_core = "UPDATE agent_attestations SET conditions = ? WHERE id = ?"
+        core_params = ["FORGED-CONDITIONS", gate_id]
+        sig_core = make_signed_payload(db, q_core, core_params, role_admin_key)
+        try:
+            db.execute_signed(q_core, core_params, sig_core, role_admin_cert)
+            raise AssertionError("core-column UPDATE must be refused for directory_admin")
+        except Exception as e:
+            msg = str(e).lower()
+            assert "immutable" in msg or "core" in msg or "conditions" in msg, e
+            print(f"  [OK] directory_admin core-column UPDATE refused: {e}")
+        cond_now = db.conn.execute(
+            "SELECT conditions FROM agent_attestations WHERE id = ?", (gate_id,)
+        ).fetchone()[0]
+        assert cond_now == "engine-gate-target", cond_now
+
+        # 7i. attestation_authz mirror stays correct across user_roles UPDATEs
+        # (single sequenced trigger — sibling DELETE/INSERT order is undefined).
+        print("  --- 7i. attestation_authz UPDATE-mirror ordering ---")
+        promote_id = db._get_identity(other_member_cert)
+        # Start as member (from 7 setup); mirror must not list them yet.
+        in_mirror = db.conn.execute(
+            "SELECT 1 FROM attestation_authz WHERE identity = ?", (promote_id,)
+        ).fetchone()
+        assert in_mirror is None, "member must not be in attestation_authz before promote"
+
+        def signed_role_update(identity, new_role):
+            q = "UPDATE user_roles SET role = ? WHERE identity = ?"
+            params = [new_role, identity]
+            sig = make_signed_payload(db, q, params, dir_admin_key)
+            return db.execute_signed(q, params, sig, dir_admin_cert)
+
+        # 1. Promote member → directory_admin via UPDATE → mirror + engine gate
+        signed_role_update(promote_id, "directory_admin")
+        in_mirror = db.conn.execute(
+            "SELECT 1 FROM attestation_authz WHERE identity = ?", (promote_id,)
+        ).fetchone()
+        assert in_mirror is not None, (
+            "promoted directory_admin must appear in attestation_authz after UPDATE"
+        )
+        print("  [OK] promote via UPDATE → mirror contains identity")
+
+        signed_status_update(
+            other_member_cert, other_member_key_pem, gate_id, "revoked"
+        )
+        assert (
+            db.conn.execute(
+                "SELECT status FROM agent_attestations WHERE id = ?", (gate_id,)
+            ).fetchone()[0]
+            == "revoked"
+        )
+        print("  [OK] promoted directory_admin status-flip on others' row succeeds")
+        # restore for subsequent checks
+        signed_status_update(
+            other_member_cert, other_member_key_pem, gate_id, "active"
+        )
+
+        # 2. No-op re-grant (directory_admin → directory_admin) keeps mirror
+        signed_role_update(promote_id, "directory_admin")
+        in_mirror = db.conn.execute(
+            "SELECT 1 FROM attestation_authz WHERE identity = ?", (promote_id,)
+        ).fetchone()
+        assert in_mirror is not None, (
+            "no-op role UPDATE must not strip identity from attestation_authz"
+        )
+        # Same for bootstrap admin → admin
+        admin_id = db._get_identity(dir_admin_cert)
+        signed_role_update(admin_id, "admin")
+        assert (
+            db.conn.execute(
+                "SELECT 1 FROM attestation_authz WHERE identity = ?", (admin_id,)
+            ).fetchone()
+            is not None
+        ), "no-op admin→admin UPDATE must leave admin in mirror"
+        print("  [OK] no-op re-grant UPDATE leaves privileged identities in mirror")
+
+        # 3. Demote directory_admin → member → mirror gone → status-flip refused
+        signed_role_update(promote_id, "member")
+        in_mirror = db.conn.execute(
+            "SELECT 1 FROM attestation_authz WHERE identity = ?", (promote_id,)
+        ).fetchone()
+        assert in_mirror is None, "demoted member must leave attestation_authz"
+        try:
+            signed_status_update(
+                other_member_cert, other_member_key_pem, gate_id, "revoked"
+            )
+            raise AssertionError(
+                "demoted member status flip on others' row must be refused"
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            assert (
+                "status" in msg
+                or "owner" in msg
+                or "admin" in msg
+                or "unauthorized" in msg
+                or "denied" in msg
+            ), e
+            print(f"  [OK] demote via UPDATE → mirror empty; status-flip refused: {e}")
+        assert (
+            db.conn.execute(
+                "SELECT status FROM agent_attestations WHERE id = ?", (gate_id,)
+            ).fetchone()[0]
+            == "active"
+        )
+
+        # ------------------------------------------------------------------
+        # 8. Final replay_audit (main directory, all clean ops)
+        # ------------------------------------------------------------------
+        print("\n--- 8. Final replay_audit ---")
         report = replay_audit(db)
         print(format_report(report))
         assert report["ok"], f"final replay_audit must pass: {report}"
@@ -366,6 +859,7 @@ def run():
         print("ALL DIRECTORY TESTS PASSED")
         print("==========================================")
     finally:
+
         # Cleanup everything we created (never touch ca.crt/ca.key if pre-existing
         # reuse; only remove tracked artifacts and temp trust dir).
         for path in artifacts:
