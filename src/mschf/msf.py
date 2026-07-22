@@ -30,6 +30,44 @@ def format_sync_status_line(status, connected, has_hub_url=True):
     return f"SYNC: hub {cn} — {live} · head {head} · {pending} pending"
 
 
+def record_sync_render_facts(status, connected):
+    """Snapshot of sync facts that drove the status line (for staleness checks).
+
+    Headless-testable. Call once per redraw from the same ``sync_status`` dict
+    already used to format the line — do not recompute status. Returns ``None``
+    when not homed (nothing rendered).
+    """
+    if not status or not status.get('homed'):
+        return None
+    return {
+        'connected': bool(connected),
+        'outbox_pending': int(status.get('outbox_pending', 0) or 0),
+    }
+
+
+def is_sync_render_stale(rendered, status, connected):
+    """True if a homed container's live facts differ from the last-rendered snapshot.
+
+    ``status`` is from ``sync.sync_status`` without a network probe;
+    ``connected`` is the subscriber thread flag. Never raises — bad inputs
+    yield False. Unhomed containers are never stale.
+    """
+    try:
+        if not status or not status.get('homed'):
+            return False
+        if rendered is None:
+            return False
+        cur_connected = bool(connected)
+        cur_pending = int(status.get('outbox_pending', 0) or 0)
+        if cur_connected != bool(rendered.get('connected')):
+            return True
+        if cur_pending != int(rendered.get('outbox_pending', 0) or 0):
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def _sync_subscriber_main(
     path,
     hub_url,
@@ -156,6 +194,9 @@ class MSF(toga.Document):
         self._change_baseline = None
         self._sync_stop = None
         self._sync_thread = None
+        # Snapshot of connected/outbox_pending last painted into the status line
+        # (see record_sync_render_facts). Compared by sync_render_stale().
+        self._rendered_sync = None
 
     def read(self) -> None:
         """Load representation of the document from self.path and populate the window."""
@@ -227,24 +268,53 @@ class MSF(toga.Document):
         self._sync_thread = None
 
     def _sync_status_text(self):
-        """Recompute the sync status line from local facts only (no network)."""
+        """Recompute the sync status line from local facts only (no network).
+
+        Also records the facts that were painted (``_rendered_sync``) so the
+        ~2s poll can detect live↔offline / outbox deltas that change no data.
+        """
         if not self.db:
+            self._rendered_sync = None
             return None
         try:
             from mschf import sync as msync
             hub_url, hub_cn = msync.homing(self.db)
             if not hub_cn:
+                self._rendered_sync = None
                 return None
             status = msync.sync_status(self.db)  # no probe
             connected = False
             thr = getattr(self, '_sync_thread', None)
             if thr is not None:
                 connected = bool(getattr(thr, 'connected', False))
+            # One status dict drives both the label and the staleness snapshot.
+            self._rendered_sync = record_sync_render_facts(status, connected)
             return format_sync_status_line(
                 status, connected, has_hub_url=bool(hub_url),
             )
         except Exception:
             return None
+
+    def sync_render_stale(self) -> bool:
+        """True if the painted sync status line is stale vs local facts.
+
+        Cheap: ``sync_status(self.db)`` without a network probe, plus the
+        subscriber thread's ``connected`` flag. Main-thread only; never raises.
+        """
+        try:
+            if not self.db:
+                return False
+            from mschf import sync as msync
+            status = msync.sync_status(self.db)  # no probe
+            thr = getattr(self, '_sync_thread', None)
+            connected = bool(getattr(thr, 'connected', False)) if thr is not None else False
+            return is_sync_render_stale(
+                getattr(self, '_rendered_sync', None),
+                status,
+                connected,
+            )
+        except Exception:
+            return False
 
     def _on_db_commit(self, storage) -> None:
         notify = getattr(self.app, "notify_msf_commit", None)
@@ -268,22 +338,26 @@ class MSF(toga.Document):
         except Exception:
             return None
 
-    def check_external_change(self) -> None:
-        """Redraw if another connection (CLI, second window) mutated the file."""
+    def check_external_change(self) -> bool:
+        """Return True if another connection mutated the file (caller should redraw).
+
+        Does not redraw itself — the app poll combines this with
+        ``sync_render_stale()`` into a single redraw.
+        """
         if not self.db:
-            return
+            return False
         marker = self._current_change_marker()
         if marker is None or self._change_baseline is None:
             self._change_baseline = marker
-            return
+            return False
         if marker[0] == self._change_baseline[0]:
-            return  # nothing changed on other connections
+            return False  # nothing changed on other connections
         if marker[1] == self._change_baseline[1]:
             # Other-connection activity was only audit rows from signed reads;
             # advance the baseline without a redraw.
             self._change_baseline = marker
-            return
-        self.redraw()
+            return False
+        return True
 
     def redraw(self) -> None:
         if not self.db:

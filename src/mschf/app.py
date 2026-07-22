@@ -76,9 +76,9 @@ class Mschf(toga.App):
                 log.error(f"Reactive redraw failed for {doc.path}: {e}", exc_info=True)
 
     async def on_running(self):
-        """Poll open documents for external changes (data_version moves only
-        when another connection wrote the file; see MSF.check_external_change),
-        and emit a periodic liveness heartbeat to the runtime log."""
+        """Poll open documents for external data changes and stale sync-status
+        lines (live↔offline / outbox without a data_version bump), and emit a
+        periodic liveness heartbeat to the runtime log."""
         seq = 0
         last_heartbeat = 0.0
         max_lag = 0.0
@@ -100,7 +100,9 @@ class Mschf(toga.App):
             for doc in list(self.documents):
                 if isinstance(doc, MSF):
                     try:
-                        doc.check_external_change()
+                        # Data mutation OR connectivity/outbox drift — one redraw.
+                        if doc.check_external_change() or doc.sync_render_stale():
+                            doc.redraw()
                     except Exception as e:
                         log.error(f"External-change check failed for {doc.path}: {e}", exc_info=True)
 

@@ -11,6 +11,17 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **GUI sync-status line no longer goes stale across connectivity
+  transitions**: the label was only recomputed on data-driven redraws, so a
+  live↔offline flip (or an outbox count change) with no accompanying write
+  left an outdated line on screen — observed as "offline" persisting after
+  the hub woke from suspension. Each redraw now records the facts it painted
+  and the existing ~2s poll redraws when the subscriber's live state or the
+  outbox count drifts from what's shown. Implemented by the grok agent;
+  reviewed and independently re-tested by Claude.
+
 ### Added
 
 - **Hub-mode product wiring — homed containers are now live, usable apps**:
