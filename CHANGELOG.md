@@ -11,6 +11,8 @@ entry here.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-21
+
 ### Fixed
 
 - **GUI sync-status line no longer goes stale across connectivity
