@@ -25,12 +25,15 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert, default_backend, serialization
 from mschf.hub import MSFHub
-from mschf.msf import (
+from mschf.syncstate import (
     is_sync_render_stale,
     record_sync_render_facts,
 )
 from mschf.storage import MSFStorage, canonical_payload
 from mschf import sync as msync
+
+# Regression gate: CI runs this suite without toga installed.
+assert 'toga' not in sys.modules, 'test_reactive must stay headless (CI runs without toga)'
 
 
 def make_signed_payload(db, query, params, pem_key_bytes):

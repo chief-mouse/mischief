@@ -6,6 +6,8 @@ import dill
 import re
 import hashlib
 import secrets
+import tempfile
+import threading
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
@@ -221,6 +223,12 @@ class MSFStorage:
         # local execute_signed appends unless MSCHF_ALLOW_LOCAL_WRITES=1.
         # The hub opens with allow_homed_writes=True (it is the serializer).
         self.allow_homed_writes = allow_homed_writes
+        # Serializes all use of self.conn (and connection-global state such as
+        # the authorizer / _active_signer). RLock because execute_signed calls
+        # get_chain_head / get_manifest_item / container_uid internally.
+        # Required for ThreadingHTTPServer hubs that share one MSFStorage per
+        # container across handler threads (check_same_thread=False).
+        self._conn_lock = threading.RLock()
         self.conn = sqlite3.connect(filename)
         self.conn.execute("PRAGMA foreign_keys = ON")
         # current_signer(): SQL function returning the verified identity string
@@ -329,10 +337,11 @@ class MSFStorage:
     @property
     def container_uid(self):
         """Stable 32-hex-char id minted once per container (see container_meta)."""
-        row = self.conn.execute(
-            "SELECT value FROM container_meta WHERE key = 'container_uid'"
-        ).fetchone()
-        return row[0] if row else None
+        with self._conn_lock:
+            row = self.conn.execute(
+                "SELECT value FROM container_meta WHERE key = 'container_uid'"
+            ).fetchone()
+            return row[0] if row else None
 
     def _get_identity(self, pub_key_pem):
         """Extract a stable, readable cryptographic identity string from a PEM Cert/Public Key."""
@@ -377,22 +386,23 @@ class MSFStorage:
         the chain continues past it and the pollution stays localized to the
         injected row.
         """
-        row = self.conn.execute(
-            "SELECT query, params, signature, seq, prev_hash, payload_fmt "
-            "FROM transactions ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            return 1, GENESIS_PREV_HASH
-        query, params_str, signature, seq, prev_hash, payload_fmt = row
-        try:
-            params = json.loads(params_str) if params_str else []
-        except json.JSONDecodeError:
-            params = []
-        payload = payload_from_ledger_row(
-            query, params, seq, prev_hash, payload_fmt, self.container_uid)
-        max_seq = self.conn.execute(
-            "SELECT IFNULL(MAX(seq), 0) FROM transactions").fetchone()[0]
-        return max_seq + 1, ledger_row_hash(payload, signature)
+        with self._conn_lock:
+            row = self.conn.execute(
+                "SELECT query, params, signature, seq, prev_hash, payload_fmt "
+                "FROM transactions ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return 1, GENESIS_PREV_HASH
+            query, params_str, signature, seq, prev_hash, payload_fmt = row
+            try:
+                params = json.loads(params_str) if params_str else []
+            except json.JSONDecodeError:
+                params = []
+            payload = payload_from_ledger_row(
+                query, params, seq, prev_hash, payload_fmt, self.container_uid)
+            max_seq = self.conn.execute(
+                "SELECT IFNULL(MAX(seq), 0) FROM transactions").fetchone()[0]
+            return max_seq + 1, ledger_row_hash(payload, signature)
 
     def _parse_sql_query(self, query):
         """Extract (operation, table_name) from basic SQLite queries."""
@@ -538,25 +548,26 @@ class MSFStorage:
         Check if the resolved identity has a specific permission for a level/target.
         Returns True if allowed, False otherwise.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT role FROM user_roles WHERE identity = ?", (identity,))
-        row = cursor.fetchone()
-        role = row[0] if row else 'guest'  # default fallback role is guest
-        
-        # Admin bypass
-        if role == 'admin':
-            return True
-            
-        # Check rules matching level, target, role, permission (supports wildcard '*')
-        cursor.execute('''
-            SELECT COUNT(*) FROM rbac_rules
-            WHERE level = ?
-              AND (target = ? OR target = '*')
-              AND role = ?
-              AND (permission = ? OR permission = '*')
-        ''', (level, target, role, permission))
-        count = cursor.fetchone()[0]
-        return count > 0
+        with self._conn_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT role FROM user_roles WHERE identity = ?", (identity,))
+            row = cursor.fetchone()
+            role = row[0] if row else 'guest'  # default fallback role is guest
+
+            # Admin bypass
+            if role == 'admin':
+                return True
+
+            # Check rules matching level, target, role, permission (supports wildcard '*')
+            cursor.execute('''
+                SELECT COUNT(*) FROM rbac_rules
+                WHERE level = ?
+                  AND (target = ? OR target = '*')
+                  AND role = ?
+                  AND (permission = ? OR permission = '*')
+            ''', (level, target, role, permission))
+            count = cursor.fetchone()[0]
+            return count > 0
 
     def check_view_permission(self, view_name, pub_key_pem):
         """Check if an identity has permission to access a specific view."""
@@ -640,24 +651,28 @@ class MSFStorage:
         bootstrap can fire; callers that run untrusted code (the sandbox) must
         never set it. Use ``bootstrap_admin`` for the deliberate authoring step.
         """
-        # Hold the write lock across verify -> execute -> ledger append: the
-        # chain head read below must still be the head when the audit row
-        # commits, or a concurrent writer could extend the same head (a fork).
-        own_txn = not self.conn.in_transaction
-        if own_txn:
-            self.conn.execute("BEGIN IMMEDIATE")
-        try:
-            operation, cursor = self._execute_signed_locked(
-                query, params, signature, pub_key_pem, allow_bootstrap)
-            self.conn.commit()
-        except Exception:
-            if own_txn and self.conn.in_transaction:
-                self.conn.rollback()
-            raise
+        # Hold the connection lock across verify -> execute -> ledger append:
+        # chain head, authorizer, and _active_signer are connection-global, and
+        # a concurrent reader on the same conn can wedge sqlite3's mutex /
+        # Python-callback machinery (ThreadingHTTPServer hub deadlock).
+        # RLock: _execute_signed_locked calls get_chain_head / get_manifest_item.
+        with self._conn_lock:
+            own_txn = not self.conn.in_transaction
+            if own_txn:
+                self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                operation, cursor = self._execute_signed_locked(
+                    query, params, signature, pub_key_pem, allow_bootstrap)
+                self.conn.commit()
+            except Exception:
+                if own_txn and self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
 
         # Reactive redraw: notify the host after mutating transactions only.
         # Signed reads also commit (they append an audit row), so notifying on
         # 'read' would let two open documents redraw each other forever.
+        # Fired outside _conn_lock so host callbacks never block readers/writers.
         if operation != 'read' and self.on_commit:
             try:
                 self.on_commit(self)
@@ -823,10 +838,11 @@ class MSFStorage:
         self.execute_signed(query, [key, value], signature, pub_key_pem)
 
     def get_manifest_item(self, key):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT value FROM manifest WHERE key = ?", (key,))
-        row = cursor.fetchone()
-        return row[0] if row else None
+        with self._conn_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT value FROM manifest WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else None
 
     def store_code(self, id_val, code_obj, signature, pub_key_pem):
         """Store pickled Python code securely."""
@@ -836,12 +852,13 @@ class MSFStorage:
 
     def get_code(self, id_val):
         """Retrieve pickled Python code."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT code_blob FROM source_code WHERE id = ?", (id_val,))
-        row = cursor.fetchone()
-        if row and row[0]:
-            return dill.loads(row[0])
-        return None
+        with self._conn_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT code_blob FROM source_code WHERE id = ?", (id_val,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return dill.loads(row[0])
+            return None
 
     def get_code_signature_status(self, id_val):
         """
@@ -853,87 +870,88 @@ class MSFStorage:
             'error': str or None
         }
         """
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "SELECT query, params, signature, pub_key, seq, prev_hash, payload_fmt "
-                "FROM transactions WHERE query LIKE 'INSERT OR REPLACE INTO source_code%' "
-                "ORDER BY id DESC"
-            )
-            rows = cursor.fetchall()
+        with self._conn_lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT query, params, signature, pub_key, seq, prev_hash, payload_fmt "
+                    "FROM transactions WHERE query LIKE 'INSERT OR REPLACE INTO source_code%' "
+                    "ORDER BY id DESC"
+                )
+                rows = cursor.fetchall()
 
-            for query, params_str, signature, pub_key_pem, seq, prev_hash, payload_fmt in rows:
-                try:
-                    params = json.loads(params_str)
-                except Exception:
-                    continue
-                if isinstance(params, list) and len(params) > 0 and params[0] == id_val:
-                    # Found the transaction that stored this code blob!
-                    # Reconstruct from the row's stored payload_fmt — no guessing.
-                    payload_bytes = payload_from_ledger_row(
-                        query, params, seq, prev_hash, payload_fmt, self.container_uid)
-
-                    # Verify signature
-                    verified = self.verify_signature(payload_bytes, signature, pub_key_pem)
-                    error = None if verified else "Signature verification failed (data was tampered with or key is invalid)"
-
-                    # Cryptographic check: Ensure code blob in table matches the signed blob in transactions
-                    if verified:
-                        try:
-                            cursor.execute("SELECT code_blob FROM source_code WHERE id = ?", (id_val,))
-                            current_row = cursor.fetchone()
-                            if current_row and current_row[0]:
-                                current_blob = current_row[0]
-                                import base64
-                                signed_blob = base64.b64decode(params[1])
-                                if current_blob != signed_blob:
-                                    verified = False
-                                    error = "Code blob does not match the signed transaction (tampered)"
-                            else:
-                                verified = False
-                                error = "Code blob is missing from the container"
-                        except Exception:
-                            verified = False
-                            error = "Signature verification failed (data was tampered with or key is invalid)"
-
-                    # Trust check: a valid signature from a signer whose cert does not chain
-                    # to the host Root CA is NOT "verified" — it only proves the blob matches
-                    # whatever key is in the audit row, not that a trusted party signed it.
-                    if verified and not self._signer_is_ca_trusted(pub_key_pem):
-                        verified = False
-                        error = "Signer certificate is not signed by the trusted Root CA"
-
-                    signer_cn = "Unknown"
-                    method = "RSA / SHA-256 / PKCS#1 v1.5"
+                for query, params_str, signature, pub_key_pem, seq, prev_hash, payload_fmt in rows:
                     try:
-                        from cryptography import x509
-                        from cryptography.x509.oid import NameOID
-                        cert = x509.load_pem_x509_certificate(pub_key_pem if isinstance(pub_key_pem, bytes) else pub_key_pem.encode('utf-8'), default_backend())
-                        signer_cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
-                        method = f"RSA-{cert.public_key().key_size} / SHA-256 / PKCS#1 v1.5"
+                        params = json.loads(params_str)
                     except Exception:
-                        signer_cn = self._get_identity(pub_key_pem)
+                        continue
+                    if isinstance(params, list) and len(params) > 0 and params[0] == id_val:
+                        # Found the transaction that stored this code blob!
+                        # Reconstruct from the row's stored payload_fmt — no guessing.
+                        payload_bytes = payload_from_ledger_row(
+                            query, params, seq, prev_hash, payload_fmt, self.container_uid)
 
-                    return {
-                        'verified': verified,
-                        'signer': signer_cn,
-                        'method': method,
-                        'error': error
-                    }
-            
-            return {
-                'verified': False,
-                'signer': 'None',
-                'method': 'None',
-                'error': "No matching code signing transaction found in the audit log"
-            }
-        except Exception as e:
-            return {
-                'verified': False,
-                'signer': 'None',
-                'method': 'None',
-                'error': f"Failed to verify code signature: {e}"
-            }
+                        # Verify signature
+                        verified = self.verify_signature(payload_bytes, signature, pub_key_pem)
+                        error = None if verified else "Signature verification failed (data was tampered with or key is invalid)"
+
+                        # Cryptographic check: Ensure code blob in table matches the signed blob in transactions
+                        if verified:
+                            try:
+                                cursor.execute("SELECT code_blob FROM source_code WHERE id = ?", (id_val,))
+                                current_row = cursor.fetchone()
+                                if current_row and current_row[0]:
+                                    current_blob = current_row[0]
+                                    import base64
+                                    signed_blob = base64.b64decode(params[1])
+                                    if current_blob != signed_blob:
+                                        verified = False
+                                        error = "Code blob does not match the signed transaction (tampered)"
+                                else:
+                                    verified = False
+                                    error = "Code blob is missing from the container"
+                            except Exception:
+                                verified = False
+                                error = "Signature verification failed (data was tampered with or key is invalid)"
+
+                        # Trust check: a valid signature from a signer whose cert does not chain
+                        # to the host Root CA is NOT "verified" — it only proves the blob matches
+                        # whatever key is in the audit row, not that a trusted party signed it.
+                        if verified and not self._signer_is_ca_trusted(pub_key_pem):
+                            verified = False
+                            error = "Signer certificate is not signed by the trusted Root CA"
+
+                        signer_cn = "Unknown"
+                        method = "RSA / SHA-256 / PKCS#1 v1.5"
+                        try:
+                            from cryptography import x509
+                            from cryptography.x509.oid import NameOID
+                            cert = x509.load_pem_x509_certificate(pub_key_pem if isinstance(pub_key_pem, bytes) else pub_key_pem.encode('utf-8'), default_backend())
+                            signer_cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                            method = f"RSA-{cert.public_key().key_size} / SHA-256 / PKCS#1 v1.5"
+                        except Exception:
+                            signer_cn = self._get_identity(pub_key_pem)
+
+                        return {
+                            'verified': verified,
+                            'signer': signer_cn,
+                            'method': method,
+                            'error': error
+                        }
+
+                return {
+                    'verified': False,
+                    'signer': 'None',
+                    'method': 'None',
+                    'error': "No matching code signing transaction found in the audit log"
+                }
+            except Exception as e:
+                return {
+                    'verified': False,
+                    'signer': 'None',
+                    'method': 'None',
+                    'error': f"Failed to verify code signature: {e}"
+                }
 
     def create_object_table(self, table_name, fields, signature, pub_key_pem):
         """Create a dynamic object table."""
@@ -960,5 +978,49 @@ class MSFStorage:
         """
         return self.execute_signed(query, params, signature, pub_key_pem, allow_bootstrap=True)
 
+    def fetch_ledger_rows_since(self, since_seq):
+        """Chained ledger rows with seq > since_seq (hub /events and /transactions).
+
+        Materializes under ``_conn_lock`` so concurrent ``execute_signed`` cannot
+        race the shared connection. Safe to call while holding a Condition that
+        is released before any long wait (do not hold this result path across
+        network/long-poll sleeps — the lock is only held for the SELECT).
+        """
+        with self._conn_lock:
+            return self.conn.execute(
+                "SELECT id, query, params, signature, pub_key, timestamp, seq, "
+                "prev_hash, payload_fmt FROM transactions "
+                "WHERE seq IS NOT NULL AND seq > ? ORDER BY seq",
+                (since_seq,),
+            ).fetchall()
+
+    def backup_to_bytes(self):
+        """Consistent on-disk snapshot of committed state as bytes (hub GET /file).
+
+        Holds ``_conn_lock`` for the whole backup so no concurrent signed
+        transaction is mid-flight on ``self.conn`` (authorizer / active
+        signer / open write txn). Uses a fresh source connection on the same
+        file — committed state is what bootstrap needs.
+        """
+        with self._conn_lock:
+            fd, tmp = tempfile.mkstemp(suffix='.msf')
+            os.close(fd)
+            src = sqlite3.connect(self.filename)
+            try:
+                dst = sqlite3.connect(tmp)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+                with open(tmp, 'rb') as f:
+                    return f.read()
+            finally:
+                src.close()
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
     def close(self):
-        self.conn.close()
+        with self._conn_lock:
+            self.conn.close()

@@ -927,6 +927,134 @@ def run():
         print(f'  [OK] {n_threads} concurrent submits → sequential seqs {seqs}; audit clean')
 
         # ==================================================================
+        # 11b. Concurrent submit + read hammer (deadlock regression)
+        # ==================================================================
+        # Reproduces the ThreadingHTTPServer race: writers on execute_signed
+        # concurrent with lockless readers (GET /head, /transactions, /file).
+        # Without storage-level conn serialization this can wedge permanently.
+        print('\n=== 11b. Concurrent submit + read hammer ===')
+        hammer_secs = 6.0
+        n_writers = 3
+        n_readers = 4
+        stop_hammer = threading.Event()
+        hammer_errors = []
+        hammer_submit_count = [0]
+        hammer_read_count = [0]
+        hammer_lock = threading.Lock()
+        before_hammer_max = hub_storage.conn.execute(
+            "SELECT IFNULL(MAX(seq), 0) FROM transactions WHERE seq IS NOT NULL"
+        ).fetchone()[0]
+
+        def _hammer_writer(i):
+            n = 0
+            try:
+                while not stop_hammer.is_set():
+                    msync.sign_and_submit(
+                        hub_url, container_id, user_private, user_cert,
+                        "INSERT INTO notes (body) VALUES (?)",
+                        [f'hammer-w{i}-{n}'],
+                        expected_hub_cn=hub_cn,
+                        ca_cert_path=ca_cert_path,
+                        max_retries=20,
+                    )
+                    n += 1
+                    with hammer_lock:
+                        hammer_submit_count[0] += 1
+            except Exception as e:
+                if not stop_hammer.is_set():
+                    hammer_errors.append(('writer', i, e))
+
+        def _hammer_reader(i):
+            n = 0
+            try:
+                while not stop_hammer.is_set():
+                    # Spin head + transactions + occasional file snapshot.
+                    msync.fetch_head(
+                        hub_url, container_id,
+                        expected_hub_cn=hub_cn,
+                        ca_cert_path=ca_cert_path,
+                    )
+                    code, data = msync._http_json(
+                        'GET',
+                        msync._url(
+                            hub_url, 'containers', container_id, 'transactions',
+                            query={'since_seq': 0},
+                        ),
+                        timeout=15,
+                    )
+                    if code != 200:
+                        raise AssertionError(
+                            f'reader {i}: GET /transactions → {code} {data!r}'
+                        )
+                    if n % 3 == 0:
+                        file_url = msync._url(
+                            hub_url, 'containers', container_id, 'file')
+                        blob = msync._http_bytes(file_url, timeout=30)
+                        if not blob or len(blob) < 100:
+                            raise AssertionError(
+                                f'reader {i}: GET /file returned empty/short body'
+                            )
+                    n += 1
+                    with hammer_lock:
+                        hammer_read_count[0] += 1
+            except Exception as e:
+                if not stop_hammer.is_set():
+                    hammer_errors.append(('reader', i, e))
+
+        hammer_threads = [
+            threading.Thread(target=_hammer_writer, args=(i,), daemon=True)
+            for i in range(n_writers)
+        ] + [
+            threading.Thread(target=_hammer_reader, args=(i,), daemon=True)
+            for i in range(n_readers)
+        ]
+        for t in hammer_threads:
+            t.start()
+        time.sleep(hammer_secs)
+        stop_hammer.set()
+        # Watchdog join: must finish well under a hang timeout.
+        join_deadline = 20.0
+        join_t0 = time.monotonic()
+        alive = []
+        for t in hammer_threads:
+            remaining = join_deadline - (time.monotonic() - join_t0)
+            t.join(timeout=max(0.1, remaining))
+            if t.is_alive():
+                alive.append(t.name)
+        assert not alive, (
+            f'HAMMER DEADLOCK/HANG: {len(alive)} thread(s) still alive after '
+            f'{join_deadline:.0f}s join timeout (storage conn race). '
+            f'submits={hammer_submit_count[0]} reads={hammer_read_count[0]} '
+            f'errors={hammer_errors!r}'
+        )
+        assert not hammer_errors, f'hammer threads failed: {hammer_errors}'
+        assert hammer_submit_count[0] >= 1, 'writers made no submits'
+        assert hammer_read_count[0] >= 1, 'readers made no requests'
+        hub_storage.close()
+        hub_storage = MSFStorage(hub_msf, ca_cert_path=ca_cert_path)
+        hammer_seqs = [
+            r[0] for r in hub_storage.conn.execute(
+                "SELECT seq FROM transactions WHERE seq IS NOT NULL AND seq > ? "
+                "ORDER BY seq",
+                (before_hammer_max,),
+            ).fetchall()
+        ]
+        assert len(hammer_seqs) == hammer_submit_count[0], (
+            f'ledger growth {len(hammer_seqs)} != submit count '
+            f'{hammer_submit_count[0]}: {hammer_seqs}'
+        )
+        assert hammer_seqs == list(range(
+            before_hammer_max + 1,
+            before_hammer_max + 1 + len(hammer_seqs),
+        )), f'gaps in hammer ledger seqs: {hammer_seqs}'
+        report = replay_audit(hub_storage)
+        assert report['ok'], format_report(report)
+        print(
+            f'  [OK] hammer {hammer_secs:.0f}s: {hammer_submit_count[0]} submits, '
+            f'{hammer_read_count[0]} read loops; sequential seqs; audit clean'
+        )
+
+        # ==================================================================
         # 12. Subscribe
         # ==================================================================
         print('\n=== 12. Subscribe long-poll propagation ===')

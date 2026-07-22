@@ -18,7 +18,6 @@ import json
 import os
 import sqlite3
 import sys
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -221,34 +220,17 @@ class MSFHub:
     def serialize_container_file(self, storage) -> bytes:
         """Consistent snapshot via sqlite3 backup to a temp file.
 
-        Uses a fresh source connection (not ``storage.conn``) so the backup is
-        safe even if the hub storage was first touched from another thread
-        (e.g. test setup). Committed state is what matters for bootstrap.
+        Delegates to ``MSFStorage.backup_to_bytes``, which holds the storage
+        connection lock for the whole backup so concurrent ``execute_signed``
+        cannot race the shared hub connection while the snapshot is taken.
         """
-        fd, tmp = tempfile.mkstemp(suffix='.msf')
-        os.close(fd)
-        src = sqlite3.connect(storage.filename)
-        try:
-            dst = sqlite3.connect(tmp)
-            try:
-                src.backup(dst)
-            finally:
-                dst.close()
-            with open(tmp, 'rb') as f:
-                return f.read()
-        finally:
-            src.close()
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+        return storage.backup_to_bytes()
 
     def transactions_since(self, storage, since_seq: int):
-        rows = storage.conn.execute(
-            "SELECT id, query, params, signature, pub_key, timestamp, seq, prev_hash, "
-            "payload_fmt FROM transactions WHERE seq IS NOT NULL AND seq > ? ORDER BY seq",
-            (since_seq,),
-        ).fetchall()
+        # fetch_ledger_rows_since holds storage._conn_lock only for the SELECT
+        # (materialized rows). wait_for_events must not hold that lock across
+        # cond.wait — it only calls us briefly between waits.
+        rows = storage.fetch_ledger_rows_since(since_seq)
         out = []
         for (txn_id, query, params_str, signature, pub_key, ts, seq, prev_hash,
              payload_fmt) in rows:

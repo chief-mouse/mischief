@@ -15,6 +15,24 @@ entry here.
 
 ### Fixed
 
+- **Hub deadlock under concurrent requests**: the threaded hub shared one
+  SQLite connection per container between the locked submit path and the
+  lockless read endpoints, while `execute_signed` mutates connection-global
+  state (authorizer callback, active signer, open transaction) — a
+  millisecond race window that could wedge two handler threads inside
+  sqlite3's connection machinery and pile every later request behind them.
+  `MSFStorage` now serializes all connection access with an internal RLock
+  (commit callbacks fire outside it; the hub's per-container write lock
+  remains as the submit-ordering layer), and the hub reads ledger rows and
+  file snapshots through locked storage methods instead of the raw
+  connection. Found by py-spy on a hung test run; regression-guarded by a
+  writers-plus-readers hammer test with a watchdog.
+- **CI test matrix broke on toga import**: the sync-status helpers landed in
+  `msf.py`, whose module level imports toga, and `test_reactive.py` imported
+  them from there — failing the headless CI matrix (which runs without toga).
+  The toga-free helpers moved to `mschf.syncstate` (re-exported from
+  `msf.py`), and `test_reactive.py` now asserts toga is never imported.
+
 - **GUI sync-status line no longer goes stale across connectivity
   transitions**: the label was only recomputed on data-driven redraws, so a
   live↔offline flip (or an outbox count change) with no accompanying write
