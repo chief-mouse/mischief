@@ -1,5 +1,4 @@
 import os
-import toga
 
 
 class HubWriteResult:
@@ -244,6 +243,11 @@ def execute_micro_app(code_func, workspace_path, db=None, current_user_cn=None, 
     code_func should be a callable returned by dill.loads().
     Returns the Toga widget constructed by the micro-app.
     """
+    # toga is imported here, not at module level: HostAPI is headless logic
+    # (signing, RBAC, hub routing) used by toga-less tests and CI; only this
+    # rendering path needs the GUI toolkit.
+    import toga
+
     # Create the host API bridge with the active db instance and current user
     host_api = HostAPI(workspace_path, db, current_user_cn, current_user_cert_pem, key_path, key_passphrase)
     

@@ -1693,7 +1693,8 @@ def run():
         # 17. msf.py headless: status-line builder + subscriber own-connection
         # ==================================================================
         print('\n=== 17. msf format_sync_status_line + subscriber own-connection ===')
-        from mschf.msf import format_sync_status_line, _sync_subscriber_main
+        # syncstate, not msf: msf imports toga and CI runs these suites headless.
+        from mschf.syncstate import format_sync_status_line, _sync_subscriber_main
 
         # Status-line combinations (no network).
         assert format_sync_status_line({'homed': False}, True) is None
@@ -2113,4 +2114,7 @@ def run():
 
 
 if __name__ == '__main__':
-    sys.exit(run() or 0)
+    rc = run() or 0
+    assert 'toga' not in sys.modules, \
+        'test_hub_sync must stay headless (CI runs without toga)'
+    sys.exit(rc)
