@@ -11,6 +11,39 @@ entry here.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-23
+
+### Added
+
+- **Declarative UI in the document loader**: the Workspace Manager now
+  renders containers whose manifest carries a `ui_spec` JSON widget tree
+  through `mschf.declarative` — no dill, no exec, pure data. `msf.py` picks
+  the UI via `declarative.resolve_ui_mode`: `ui_spec` is preferred over a
+  pickled `entry_point` when both exist (so authors can dual-publish during
+  migration), `entry_point` alone keeps today's sandbox path, and neither
+  falls back to the About view. A present-but-malformed `ui_spec` is a hard
+  error view — the loader never silently drops from data-only rendering back
+  to executing pickled code. RBAC is unchanged: the db-read gate shows the
+  fixed lockout box, and all data flows through
+  `HostAPI.execute_signed_query`.
+- **Signed-manifest verification banner**: declarative documents get the
+  same "CRYPTO ACTIVE: VERIFIED" header as pickled apps, backed by the new
+  `MSFStorage.get_manifest_signature_status(key)` — it re-verifies the
+  ledger row that signed the `ui_spec` value (signature, CA trust, and that
+  the live manifest value still matches the signed one), so a raw
+  out-of-band edit of the spec flips the banner to TAMPERED exactly like a
+  patched code blob. Banner also names the signer and shows
+  "UI: signed manifest (declarative)" as the source.
+
+### Changed
+
+- `mschf.declarative` no longer imports toga at module level: spec
+  parsing/validation and `resolve_ui_mode` are usable from headless code and
+  CI (widget construction reaches the toolkit through the caller-passed
+  `toga` module, mirroring the `syncstate` split). The signature-status
+  banner and sync-status wrapper in `msf.py` are shared between the pickle
+  and declarative paths (`_wrap_app_widget`).
+
 ## [0.7.0] - 2026-07-21
 
 ### Fixed

@@ -6,7 +6,12 @@ import toga
 from toga.style import Pack
 
 from mschf.storage import MSFStorage
-from mschf.sandbox import execute_micro_app
+from mschf.sandbox import HostAPI, execute_micro_app
+from mschf.declarative import (
+    DeclarativeSpecError,
+    render_declarative,
+    resolve_ui_mode,
+)
 from mschf.syncstate import (
     format_sync_status_line,
     record_sync_render_facts,
@@ -208,10 +213,95 @@ class MSF(toga.Document):
         finally:
             self._change_baseline = self._current_change_marker()
 
+    def _security_banner(self, status, source_text=None):
+        """Build the signature-status header row shared by both UI modes."""
+        status_text = (
+            "🛡️ CRYPTO ACTIVE: VERIFIED" if status['verified']
+            else "🚨 CRYPTO WARNING: UNVERIFIED OR TAMPERED"
+        )
+        header_box = toga.Box(style=Pack(direction='row', margin=10))
+        header_box.add(toga.Label(status_text, style=Pack(font_weight='bold', margin_right=15)))
+        header_box.add(toga.Label(f"Signer CN: {status['signer']}", style=Pack(margin_right=15)))
+        header_box.add(toga.Label(f"Method: {status['method']}", style=Pack(font_size=9)))
+        if source_text:
+            header_box.add(toga.Label(source_text, style=Pack(font_size=9, margin_left=15)))
+        return header_box
+
+    def _wrap_app_widget(self, app_widget, status, source_text=None):
+        """Banner + optional sync-status line + the micro-app widget."""
+        wrapper_box = toga.Box(style=Pack(direction='column', margin=5))
+        wrapper_box.add(self._security_banner(status, source_text))
+
+        # Homed containers: second, smaller sync-status line (local facts only).
+        sync_text = self._sync_status_text()
+        if sync_text:
+            wrapper_box.add(toga.Label(
+                sync_text,
+                style=Pack(font_size=9, color='#555555', margin_left=10, margin_bottom=4),
+            ))
+
+        app_widget.style.flex = 1
+        wrapper_box.add(app_widget)
+        return wrapper_box
+
+    def _show_spec_error(self, error) -> None:
+        """A present-but-broken ui_spec is a hard error view — never a silent
+        fallback to executing pickled code."""
+        box = toga.Box(style=Pack(direction='column', margin=20))
+        box.add(toga.Label(
+            "🚨 DECLARATIVE UI ERROR",
+            style=Pack(font_size=20, font_weight='bold', margin_bottom=10, color='red')))
+        box.add(toga.Label(
+            "This container's ui_spec manifest entry could not be rendered:",
+            style=Pack(margin_bottom=8)))
+        detail = toga.MultilineTextInput(readonly=True, style=Pack(flex=1))
+        detail.value = str(error)
+        box.add(detail)
+        self.main_window.content = box
+
+    def _draw_declarative(self, spec) -> None:
+        """Render manifest ui_spec via the declarative renderer (no exec/dill).
+
+        The db-read gate lives inside render_declarative (fixed lockout box).
+        The banner verifies the ui_spec manifest value against its signing
+        ledger row — pure data, so the signed transaction IS the integrity
+        proof (no code blob to hash).
+        """
+        workspace_path = os.path.dirname(os.path.abspath(str(self.path)))
+        active_id = getattr(self.app, "active_identity", None)
+        host_api = HostAPI(
+            workspace_path,
+            self.db,
+            current_user_cn=active_id.cn if active_id else "Unknown",
+            current_user_cert_pem=active_id.cert_pem if active_id else "",
+            key_path=active_id.key_path if active_id else None,
+            key_passphrase=active_id.key_passphrase if active_id else None,
+        )
+        try:
+            app_widget = render_declarative(spec, toga, host_api)
+        except DeclarativeSpecError as e:
+            self._show_spec_error(e)
+            return
+
+        status = self.db.get_manifest_signature_status('ui_spec')
+        self.main_window.content = self._wrap_app_widget(
+            app_widget, status, "UI: signed manifest (declarative)"
+        )
+
     def _draw_content(self) -> None:
 
-        entry_point_id = self.db.get_manifest_item('entry_point')
-        
+        try:
+            ui_mode, ui_payload = resolve_ui_mode(self.db)
+        except DeclarativeSpecError as e:
+            self._show_spec_error(e)
+            return
+
+        if ui_mode == 'declarative':
+            self._draw_declarative(ui_payload)
+            return
+
+        entry_point_id = ui_payload if ui_mode == 'pickle' else None
+
         if entry_point_id:
             code_func = self.db.get_code(entry_point_id)
             if code_func:
@@ -245,35 +335,8 @@ class MSF(toga.Document):
                 
                 # Fetch cryptographic verification status
                 status = self.db.get_code_signature_status(entry_point_id)
-                
-                # Create a security status banner
-                status_text = "🛡️ CRYPTO ACTIVE: VERIFIED" if status['verified'] else "🚨 CRYPTO WARNING: UNVERIFIED OR TAMPERED"
-                
-                header_box = toga.Box(style=Pack(direction='row', margin=10))
-                status_lbl = toga.Label(status_text, style=Pack(font_weight='bold', margin_right=15))
-                signer_lbl = toga.Label(f"Signer CN: {status['signer']}", style=Pack(margin_right=15))
-                method_lbl = toga.Label(f"Method: {status['method']}", style=Pack(font_size=9))
-                
-                header_box.add(status_lbl)
-                header_box.add(signer_lbl)
-                header_box.add(method_lbl)
 
-                wrapper_box = toga.Box(style=Pack(direction='column', margin=5))
-                wrapper_box.add(header_box)
-
-                # Homed containers: second, smaller sync-status line (local facts only).
-                sync_text = self._sync_status_text()
-                if sync_text:
-                    sync_lbl = toga.Label(
-                        sync_text,
-                        style=Pack(font_size=9, color='#555555', margin_left=10, margin_bottom=4),
-                    )
-                    wrapper_box.add(sync_lbl)
-                
-                app_widget.style.flex = 1
-                wrapper_box.add(app_widget)
-                
-                self.main_window.content = wrapper_box
+                self.main_window.content = self._wrap_app_widget(app_widget, status)
                 return
                 
         # Default fallback "About" view if no custom entry point is defined

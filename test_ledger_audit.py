@@ -653,6 +653,54 @@ def run():
     db10.close()
     os.remove(db10_path)
 
+    print("\n--- 17. Manifest signature status (ui_spec-style pure-data proof) ---")
+    # The declarative-UI banner verifies a manifest value against its signing
+    # ledger row instead of a code blob; toga-free, so covered here in CI.
+    db11_path = 'test_ledger_audit_manifest.msf'
+    if os.path.exists(db11_path):
+        os.remove(db11_path)
+    db11 = MSFStorage(db11_path)
+
+    def signed11(query, params, bootstrap=False):
+        sig = make_signed_payload(db11, query, params, admin_key)
+        if bootstrap:
+            return db11.bootstrap_admin(query, params, sig, admin_cert)
+        return db11.execute_signed(query, params, sig, admin_cert)
+
+    manifest_q = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
+    signed11(manifest_q, ['ui_spec', '{"type": "box", "children": []}'],
+             bootstrap=True)
+    status = db11.get_manifest_signature_status('ui_spec')
+    assert status['verified'], status
+    assert status['signer'] == 'audit_admin', status
+    print(f"  [OK] signed manifest value verifies (signer={status['signer']})")
+
+    # A later signed rewrite supersedes the earlier row (latest wins).
+    signed11(manifest_q, ['ui_spec', '{"type": "box", "margin": 4}'])
+    status = db11.get_manifest_signature_status('ui_spec')
+    assert status['verified'], f"latest signed rewrite must verify: {status}"
+
+    # Out-of-band edit diverges from the signed value → tampered.
+    db11.conn.execute(
+        "UPDATE manifest SET value = ? WHERE key = ?", ('{"evil": 1}', 'ui_spec'))
+    db11.conn.commit()
+    status = db11.get_manifest_signature_status('ui_spec')
+    assert not status['verified'], status
+    assert 'tampered' in (status['error'] or '').lower(), status
+    print(f"  [OK] raw manifest edit flagged: {status['error']}")
+
+    # Deleted value → missing; never-signed key → no signing transaction.
+    db11.conn.execute("DELETE FROM manifest WHERE key = ?", ('ui_spec',))
+    db11.conn.commit()
+    status = db11.get_manifest_signature_status('ui_spec')
+    assert not status['verified'] and 'missing' in (status['error'] or '').lower(), status
+    status = db11.get_manifest_signature_status('never_written')
+    assert not status['verified'], status
+    assert 'No signed transaction' in (status['error'] or ''), status
+    print("  [OK] missing value / unsigned key both refuse the banner")
+    db11.close()
+    os.remove(db11_path)
+
     print("\n==========================================")
     print("ALL LEDGER AUDIT TESTS PASSED")
     print("==========================================")

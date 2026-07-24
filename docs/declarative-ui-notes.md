@@ -1,6 +1,9 @@
 # Declarative UI exploration — findings
 
-**Status:** prototype only (v0). No document-loader integration.  
+**Status:** v0 vocabulary, **integrated into the document loader** as of 0.8.0
+(`msf.py` renders manifest `ui_spec` through `resolve_ui_mode`, preferring it
+over a pickled `entry_point`; banner backed by
+`MSFStorage.get_manifest_signature_status`).  
 **Artifacts:** `src/mschf/declarative.py`, `test_declarative.py`, this note.  
 **Date:** 2026-07.
 
@@ -59,9 +62,13 @@ Authoring a declarative container is ordinary signed authoring: bootstrap → tr
 
 **Verdict:** The tracker’s *read surface* (table of tasks) and *add task* form fit v0. The interactive board — select row, show detail, change status — needs selection-bound actions and at least one detail widget. Platform hacks stay in host Python forever (or in a declarative “host chrome” layer, not in the container).
 
-## Integration sketch (`msf.py` — future work)
+## Integration (`msf.py` — landed in 0.8.0)
 
-Do **not** change the loader in this exploration. A plausible path:
+The loader now implements this path via `declarative.resolve_ui_mode`
+(declarative > pickle > about; malformed `ui_spec` is a hard error view,
+never a fallback to executing code) and
+`MSFStorage.get_manifest_signature_status('ui_spec')` for the banner.
+The original sketch, kept for context:
 
 1. **Manifest keys**
    - Keep `entry_point` for pickled apps.

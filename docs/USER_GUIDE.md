@@ -18,7 +18,21 @@ When opened by the Mischief Toga host application, the host validates database s
 
 ## 2. Anatomy of a Micro-App Entry Point
 
-Every micro-app must define an entry-point function. This function must accept exactly two arguments:
+There are two ways to define a micro-app's UI:
+
+- **Declarative (preferred for forms-over-data apps):** store a JSON widget
+  tree in the manifest key `ui_spec` (via a signed `set_manifest_item`).
+  The host renders it with no pickled code at all — widgets `box`, `label`,
+  `table` (SELECT-only signed query binding), `text_input`, `button`
+  (parameterized `exec` actions through `execute_signed_query`), and
+  `status`. When both `ui_spec` and `entry_point` exist, the declarative
+  spec wins, so containers can dual-publish during migration. The security
+  banner verifies the `ui_spec` manifest value against its signing ledger
+  row. See `docs/declarative-ui-notes.md` for the spec vocabulary.
+- **Pickled entry point:** a Python function stored in `source_code` and
+  named by the manifest key `entry_point`, described below.
+
+Every pickled micro-app must define an entry-point function. This function must accept exactly two arguments:
 1. **`toga`:** The native Python GUI framework.
 2. **`host_api`:** The restricted bridge API provided by the host.
 

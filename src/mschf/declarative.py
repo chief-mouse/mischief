@@ -1,20 +1,22 @@
-"""Manifest-driven declarative UI renderer (exploration prototype).
+"""Manifest-driven declarative UI renderer.
 
 Micro-app UIs are expressed as pure JSON widget trees — no exec, eval, or
 pickled code. Data flows only through ``HostAPI.execute_signed_query`` so
 signing, RBAC, and the SQLite authorizer apply exactly as for dill apps.
 
-This module is intentionally standalone: document-loader integration
-(``msf.py`` / ``sandbox.py``) is future work; see ``docs/declarative-ui-notes.md``.
+The document loader (``msf.py``) renders manifest key ``ui_spec`` through
+this module, preferring it over a pickled ``entry_point`` when both exist
+(``resolve_ui_mode``); see ``docs/declarative-ui-notes.md``.
 """
 from __future__ import annotations
 
 import json
 
-from toga.style import Pack
-
 # Security invariant: this module must never import exec/eval/dill (asserted
-# by test_declarative.py). Only stdlib + toga Pack + caller's host_api objects.
+# by test_declarative.py). Only stdlib + the caller's toga module + host_api.
+# toga is deliberately NOT imported at module level: mode resolution and spec
+# validation must stay usable from headless (toga-less) code and CI; widget
+# construction reaches everything through the ``toga`` argument.
 
 
 class DeclarativeSpecError(Exception):
@@ -70,6 +72,30 @@ def spec_from_manifest(storage):
             f"manifest ui_spec must be a JSON object, got {type(parsed).__name__}"
         )
     return parsed
+
+
+def resolve_ui_mode(storage):
+    """Decide how the document loader should render this container's UI.
+
+    Returns ``(mode, payload)``:
+
+    - ``('declarative', spec_dict)`` — manifest ``ui_spec`` is present and
+      valid. Preferred over pickle when both exist so authors can
+      dual-publish during migration.
+    - ``('pickle', entry_point_id)`` — no ``ui_spec``, but ``entry_point``
+      names a code blob.
+    - ``('about', None)`` — neither; the loader shows the About fallback.
+
+    A present-but-malformed ``ui_spec`` raises ``DeclarativeSpecError`` —
+    it never silently falls through to executing pickled code.
+    """
+    spec = spec_from_manifest(storage)
+    if spec is not None:
+        return ("declarative", spec)
+    entry_point_id = storage.get_manifest_item("entry_point")
+    if entry_point_id:
+        return ("pickle", entry_point_id)
+    return ("about", None)
 
 
 def render_declarative(spec, toga, host_api):
@@ -143,6 +169,13 @@ class _RenderContext:
 
     def __init__(self, toga, host_api):
         self.toga = toga
+        # toga's package __init__ lazy-loads widgets but not the style
+        # submodule, so reach it via importlib off the passed-in module.
+        style_mod = getattr(toga, "style", None)
+        if style_mod is None:
+            import importlib
+            style_mod = importlib.import_module(f"{toga.__name__}.style")
+        self.Pack = style_mod.Pack
         self.host_api = host_api
         self.inputs = {}       # id -> TextInput
         self.tables = {}       # id -> {"widget", "sql", "params", "columns"}
@@ -330,7 +363,7 @@ class _RenderContext:
         style_kw = self._pack_kwargs(node)
         if "direction" not in style_kw:
             style_kw["direction"] = "column"
-        box = self.toga.Box(style=Pack(**style_kw))
+        box = self.toga.Box(style=self.Pack(**style_kw))
         for i, child in enumerate(node.get("children") or []):
             box.add(self.build(child, f"{path}.children[{i}]"))
         return box
@@ -350,7 +383,7 @@ class _RenderContext:
             style_kw["margin"] = node["margin"]
         if "flex" in node:
             style_kw["flex"] = node["flex"]
-        return self.toga.Label(str(text), style=Pack(**style_kw) if style_kw else Pack())
+        return self.toga.Label(str(text), style=self.Pack(**style_kw) if style_kw else self.Pack())
 
     def _resolve_text_from(self, text_from, path):
         if not isinstance(text_from, dict):
@@ -412,7 +445,7 @@ class _RenderContext:
         table = self.toga.Table(
             columns=list(headings),
             data=[],
-            style=Pack(**style_kw) if style_kw else Pack(),
+            style=self.Pack(**style_kw) if style_kw else self.Pack(),
         )
         self.tables[tid] = {
             "widget": table,
@@ -433,7 +466,7 @@ class _RenderContext:
             style_kw["margin"] = node["margin"]
         widget = self.toga.TextInput(
             placeholder=str(node.get("placeholder", "")),
-            style=Pack(**style_kw) if style_kw else Pack(),
+            style=self.Pack(**style_kw) if style_kw else self.Pack(),
         )
         self.inputs[tid] = widget
         return widget
@@ -447,7 +480,7 @@ class _RenderContext:
             style_kw["margin"] = node["margin"]
         if "font_size" in node:
             style_kw["font_size"] = node["font_size"]
-        label = self.toga.Label("", style=Pack(**style_kw))
+        label = self.toga.Label("", style=self.Pack(**style_kw))
         self.status[tid] = label
         return label
 
@@ -473,7 +506,7 @@ class _RenderContext:
         return self.toga.Button(
             text,
             on_press=handler,
-            style=Pack(**style_kw) if style_kw else Pack(),
+            style=self.Pack(**style_kw) if style_kw else self.Pack(),
         )
 
     def _make_action_handler(self, action, path):

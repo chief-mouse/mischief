@@ -25,6 +25,7 @@ from mschf.audit import format_report, replay_audit
 from mschf.declarative import (
     DeclarativeSpecError,
     render_declarative,
+    resolve_ui_mode,
     spec_from_manifest,
 )
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert
@@ -420,6 +421,94 @@ def test_malformed_specs(db, admin_cert, admin_cn="decl_admin"):
             print(f"  [OK] {label}: {e}")
 
 
+def test_loader_mode_resolution(db):
+    print("--- 7. Loader mode: declarative preferred; pickle/about fallbacks ---")
+    # Authored container carries both entry_point and ui_spec → declarative wins.
+    mode, payload = resolve_ui_mode(db)
+    assert mode == "declarative", f"expected declarative, got {mode}"
+    assert isinstance(payload, dict) and payload["type"] == "box"
+
+    scratch = "test_declarative_modes.msf"
+    if os.path.exists(scratch):
+        os.remove(scratch)
+    sdb = MSFStorage(scratch)
+    try:
+        assert resolve_ui_mode(sdb) == ("about", None)
+
+        sdb.conn.execute(
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ("entry_point", "main"),
+        )
+        sdb.conn.commit()
+        assert resolve_ui_mode(sdb) == ("pickle", "main")
+
+        # Present-but-malformed ui_spec must hard-error, never fall through
+        # to the pickle path.
+        sdb.conn.execute(
+            "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)",
+            ("ui_spec", "{not valid json"),
+        )
+        sdb.conn.commit()
+        try:
+            resolve_ui_mode(sdb)
+            raise AssertionError("malformed ui_spec must raise DeclarativeSpecError")
+        except DeclarativeSpecError as e:
+            print(f"  [OK] malformed ui_spec blocks the loader: {e}")
+    finally:
+        sdb.close()
+        os.remove(scratch)
+    print("  [OK] declarative > pickle > about resolution")
+
+
+def test_manifest_signature_status(db):
+    print("--- 8. ui_spec banner: verified clean; raw tamper detected ---")
+    status = db.get_manifest_signature_status("ui_spec")
+    assert status["verified"], f"clean ui_spec must verify: {status}"
+    assert status["signer"] == "decl_admin", status
+    print(f"  [OK] verified, signer={status['signer']}, method={status['method']}")
+
+    # Out-of-band edit of the manifest value (skips execute_signed).
+    original = db.get_manifest_item("ui_spec")
+    tampered = json.dumps({"type": "box", "children": []})
+    db.conn.execute(
+        "UPDATE manifest SET value = ? WHERE key = ?", (tampered, "ui_spec"))
+    db.conn.commit()
+    status = db.get_manifest_signature_status("ui_spec")
+    assert not status["verified"], "tampered ui_spec must not verify"
+    assert "tampered" in (status["error"] or "").lower(), status
+    print(f"  [OK] raw tamper flagged: {status['error']}")
+
+    # Restore for the later replay-audit test.
+    db.conn.execute(
+        "UPDATE manifest SET value = ? WHERE key = ?", (original, "ui_spec"))
+    db.conn.commit()
+    assert db.get_manifest_signature_status("ui_spec")["verified"]
+
+    # A key never written through a signed transaction has no proof.
+    status = db.get_manifest_signature_status("no_such_key")
+    assert not status["verified"]
+    assert "No signed transaction" in (status["error"] or ""), status
+    print("  [OK] unsigned key reports no signing transaction")
+
+
+def test_headless_import():
+    print("--- 9. mschf.declarative imports without toga (loader helpers headless) ---")
+    import subprocess
+
+    code = (
+        "import sys; sys.path.insert(0, 'src'); sys.modules['toga'] = None; "
+        "from mschf.declarative import resolve_ui_mode, DeclarativeSpecError; "
+        "print('headless-ok')"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=os.getcwd()
+    )
+    assert out.returncode == 0 and "headless-ok" in out.stdout, (
+        f"headless import failed: {out.stderr}"
+    )
+    print("  [OK] no module-level toga dependency")
+
+
 def test_replay_audit(db):
     print("--- 5. replay_audit on authored container ---")
     report = replay_audit(db)
@@ -489,6 +578,9 @@ def run():
         test_viewer_rbac_denial(db, viewer_cert)
         test_lockout(db, guest_cert)
         test_malformed_specs(db, admin_cert)
+        test_loader_mode_resolution(db)
+        test_manifest_signature_status(db)
+        test_headless_import()
         test_replay_audit(db)
         test_no_dangerous_imports()
     finally:

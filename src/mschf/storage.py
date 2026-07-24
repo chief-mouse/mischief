@@ -953,6 +953,103 @@ class MSFStorage:
                     'error': f"Failed to verify code signature: {e}"
                 }
 
+    def get_manifest_signature_status(self, key):
+        """Verify a manifest value against the ledger row that signed it.
+
+        The declarative-UI loader banner uses this for ``ui_spec``: the value
+        is pure data written via ``set_manifest_item``, so its integrity proof
+        is the signed transaction itself — a raw out-of-band edit of the
+        manifest row leaves the stored value diverging from the signed params.
+        Same contract as ``get_code_signature_status``: 'verified' requires a
+        valid signature, a CA-trusted signer, AND the live value matching the
+        signed one. Returns {'verified', 'signer', 'method', 'error'}.
+        """
+        with self._conn_lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT query, params, signature, pub_key, seq, prev_hash, payload_fmt "
+                    "FROM transactions WHERE query LIKE 'INSERT OR REPLACE INTO manifest%' "
+                    "ORDER BY id DESC"
+                )
+                rows = cursor.fetchall()
+
+                for query, params_str, signature, pub_key_pem, seq, prev_hash, payload_fmt in rows:
+                    try:
+                        params = json.loads(params_str)
+                    except Exception:
+                        continue
+                    if not (isinstance(params, list) and len(params) >= 2 and params[0] == key):
+                        continue
+
+                    payload_bytes = payload_from_ledger_row(
+                        query, params, seq, prev_hash, payload_fmt, self.container_uid)
+                    verified = self.verify_signature(payload_bytes, signature, pub_key_pem)
+                    error = None if verified else (
+                        "Signature verification failed (data was tampered with or key is invalid)")
+
+                    if verified:
+                        cursor.execute(
+                            "SELECT value FROM manifest WHERE key = ?", (key,))
+                        current_row = cursor.fetchone()
+                        current_value = current_row[0] if current_row else None
+                        signed_value = params[1]
+                        if isinstance(current_value, bytes):
+                            # Bytes params were base64-encoded when the payload
+                            # was canonicalized (make_json_serializable).
+                            try:
+                                signed_value = base64.b64decode(signed_value)
+                            except Exception:
+                                signed_value = None
+                        if current_value is None:
+                            verified = False
+                            error = f"Manifest key '{key}' is missing from the container"
+                        elif current_value != signed_value:
+                            verified = False
+                            error = (
+                                f"Manifest value for '{key}' does not match the "
+                                "signed transaction (tampered)")
+
+                    if verified and not self._signer_is_ca_trusted(pub_key_pem):
+                        verified = False
+                        error = "Signer certificate is not signed by the trusted Root CA"
+
+                    signer_cn = "Unknown"
+                    method = "RSA / SHA-256 / PKCS#1 v1.5"
+                    try:
+                        from cryptography import x509
+                        from cryptography.x509.oid import NameOID
+                        cert = x509.load_pem_x509_certificate(
+                            pub_key_pem if isinstance(pub_key_pem, bytes)
+                            else pub_key_pem.encode('utf-8'),
+                            default_backend())
+                        signer_cn = cert.subject.get_attributes_for_oid(
+                            NameOID.COMMON_NAME)[0].value
+                        method = f"RSA-{cert.public_key().key_size} / SHA-256 / PKCS#1 v1.5"
+                    except Exception:
+                        signer_cn = self._get_identity(pub_key_pem)
+
+                    return {
+                        'verified': verified,
+                        'signer': signer_cn,
+                        'method': method,
+                        'error': error,
+                    }
+
+                return {
+                    'verified': False,
+                    'signer': 'None',
+                    'method': 'None',
+                    'error': f"No signed transaction found for manifest key '{key}'",
+                }
+            except Exception as e:
+                return {
+                    'verified': False,
+                    'signer': 'None',
+                    'method': 'None',
+                    'error': f"Failed to verify manifest signature: {e}",
+                }
+
     def create_object_table(self, table_name, fields, signature, pub_key_pem):
         """Create a dynamic object table."""
         columns = ", ".join(f"{name} {definition}" for name, definition in fields.items())
