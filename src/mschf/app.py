@@ -435,10 +435,160 @@ class Mschf(toga.App):
             self.label.text = f"Could not create starter app: {e}"
         self.refresh_workspace()
 
+    def _workspace_msf_paths(self):
+        """Absolute paths of workspace ``.msf`` files (same scan as refresh_workspace)."""
+        import glob
+
+        cwd = os.getcwd()
+        patterns = [os.path.join(cwd, f"*{FILE_EXT}")]
+        try:
+            if os.path.isdir(ARTIFACT_ROOT) and ARTIFACT_ROOT != cwd:
+                patterns.append(os.path.join(ARTIFACT_ROOT, f"*{FILE_EXT}"))
+        except Exception:
+            pass
+        data_dir = getattr(self, 'data_dir', None)
+        if data_dir and os.path.isdir(data_dir):
+            patterns.append(os.path.join(data_dir, f"*{FILE_EXT}"))
+
+        seen = set()
+        paths = []
+        for pattern in patterns:
+            for path in glob.glob(pattern):
+                abs_path = os.path.abspath(path)
+                if abs_path not in seen:
+                    seen.add(abs_path)
+                    paths.append(abs_path)
+        paths.sort(key=lambda p: os.path.basename(p).lower())
+        return paths
+
+    def new_app_from_template(self, widget=None):
+        """Thin GUI: name + template picker → ``create_from_template`` → open."""
+        if not self.active_identity.is_valid:
+            self.label.text = "Sign in before creating a new app from a template."
+            return
+
+        template_paths = self._workspace_msf_paths()
+        if not template_paths:
+            self.label.text = (
+                "No template apps found. Create the starter app first, or Browse "
+                "an existing .msf into the workspace."
+            )
+            return
+
+        # Close any prior New App dialog so we don't stack windows.
+        prev = getattr(self, '_new_app_window', None)
+        if prev is not None:
+            try:
+                prev.close()
+            except Exception:
+                pass
+
+        name_input = toga.TextInput(
+            placeholder="App name",
+            style=Pack(flex=1, margin=5),
+        )
+        # Selection shows basenames; map back to absolute paths on confirm.
+        basenames = [os.path.basename(p) for p in template_paths]
+        path_by_name = {os.path.basename(p): p for p in template_paths}
+        template_select = toga.Selection(
+            items=basenames,
+            style=Pack(flex=1, margin=5),
+        )
+
+        status = toga.Label("", style=Pack(margin=5, font_size=10, color="#666666"))
+
+        def close_dialog(widget=None):
+            win = getattr(self, '_new_app_window', None)
+            if win is not None:
+                try:
+                    win.close()
+                except Exception:
+                    pass
+                self._new_app_window = None
+
+        def on_create(widget=None):
+            app_name = (name_input.value or "").strip()
+            if not app_name:
+                status.text = "Enter an app name."
+                return
+            choice = template_select.value
+            if not choice or choice not in path_by_name:
+                status.text = "Select a template from the list."
+                return
+            template_path = path_by_name[choice]
+
+            from mschf.template import TemplateError, create_from_template, safe_msf_filename
+            dest = os.path.join(self.data_dir, safe_msf_filename(app_name))
+            try:
+                summary = create_from_template(
+                    template_path,
+                    dest,
+                    self.active_identity,
+                    app_name,
+                    ca_cert_path=self.ca_cert_path,
+                )
+            except FileExistsError:
+                status.text = f"Already exists: {os.path.basename(dest)}"
+                self.label.text = f"Could not create app — {os.path.basename(dest)} already exists."
+                return
+            except TemplateError as e:
+                log.warning("New App refused: %s", e)
+                status.text = str(e).split("\n", 1)[0]
+                self.label.text = f"Could not create app: {e}".split("\n", 1)[0]
+                return
+            except Exception as e:
+                log.error("New App failed: %s", e, exc_info=True)
+                status.text = str(e)
+                self.label.text = f"Could not create app: {e}"
+                return
+
+            close_dialog()
+            self.label.text = (
+                f"Created '{summary['app_name']}' — opening "
+                f"{os.path.basename(summary['dest_path'])}."
+            )
+            log.info(
+                "Instantiated template %s → %s (uid=%s) as CN=%s",
+                template_path, summary["dest_path"],
+                summary["container_uid"], self.active_identity.cn,
+            )
+            self.refresh_workspace()
+            try:
+                self.documents.open(summary["dest_path"])
+            except Exception as open_err:
+                log.error("Opened workspace but failed to open new app: %s", open_err, exc_info=True)
+                self.label.text = (
+                    f"Created {os.path.basename(summary['dest_path'])} but could not open it: "
+                    f"{open_err}"
+                )
+
+        form = toga.Box(
+            children=[
+                toga.Label("New App from Template", style=Pack(margin=8, font_weight="bold")),
+                toga.Label("App name", style=Pack(margin_left=5, font_size=10)),
+                name_input,
+                toga.Label("Template (.msf in workspace)", style=Pack(margin_left=5, font_size=10)),
+                template_select,
+                status,
+                toga.Box(
+                    children=[
+                        toga.Button("Create", on_press=on_create, style=Pack(margin=5, flex=1)),
+                        toga.Button("Cancel", on_press=close_dialog, style=Pack(margin=5, flex=1)),
+                    ],
+                    style=Pack(direction=ROW, margin=5),
+                ),
+            ],
+            style=Pack(direction=COLUMN, margin=10),
+        )
+        win = toga.Window(title="New App…", size=(420, 280), on_close=lambda w: close_dialog())
+        win.content = form
+        self._new_app_window = win
+        win.show()
+
     def _apply_identity_state(self):
         """Sync button enablement to the active identity and re-lock/redraw open docs."""
         is_valid = self.active_identity.is_valid
-        for attr in ('btn_open_selected', 'btn_open_dialog'):
+        for attr in ('btn_open_selected', 'btn_open_dialog', 'btn_new_app'):
             btn = getattr(self, attr, None)
             if btn is not None:
                 btn.enabled = is_valid
@@ -585,12 +735,16 @@ class Mschf(toga.App):
         btn_style = Pack(flex=1, margin=5)
         self.btn_open_selected = toga.Button('Open Selected', on_press=self.open_selected_app, style=btn_style, enabled=is_valid)
         self.btn_open_dialog = toga.Button('Browse MSF', on_press=self.action_open_file_dialog, style=btn_style, enabled=is_valid)
+        self.btn_new_app = toga.Button('New App…', on_press=self.new_app_from_template, style=btn_style, enabled=is_valid)
         btn_refresh = toga.Button('Refresh', on_press=self.refresh_workspace, style=btn_style)
         # Log Out clears the active identity; disabled until someone is logged in.
         self.btn_logout = toga.Button('Log Out', on_press=self.log_out, style=btn_style, enabled=is_valid)
 
         self.btn_box = toga.Box(
-            children=[self.btn_open_selected, self.btn_open_dialog, btn_refresh, self.btn_logout],
+            children=[
+                self.btn_open_selected, self.btn_open_dialog, self.btn_new_app,
+                btn_refresh, self.btn_logout,
+            ],
             style=Pack(direction=ROW, margin=5)
         )
 

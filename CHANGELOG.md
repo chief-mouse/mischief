@@ -13,6 +13,21 @@ entry here.
 
 ### Added
 
+- **Instantiate-from-template + "New App…"** (`mschf.template`): no-code app
+  creation. Templates are recipes, not replicas — `create_from_template`
+  verifies the template fail-closed (`replay_audit`, verified
+  `ui_spec`/`schema_spec` signatures, pickled `source_code` refused
+  outright), then authors a FRESH container: new `container_uid`, new
+  genesis, the creating identity bootstrapped as sole admin, and the
+  template's content (schema via the `schema_spec` enforcement train when
+  present, trigger/index DDL, `rbac_rules` role definitions, `ui_spec`)
+  re-signed as new transactions by the creator. Never lifted: ledger
+  history, `user_roles`, `sync_hub_*` (a homed template yields an unhomed
+  app), data rows (v1: structure + UI only). GUI: identity-gated
+  "New App…" button — name + workspace-template picker → instantiate →
+  open. Implemented by the grok agent; reviewed and independently
+  re-tested by Claude.
+
 - **`schema_spec` — objects, fields, and validation rules as signed data**
   (`mschf.schemaspec`): a versioned JSON manifest entry describing an app's
   tables, fields (`text`/`integer`/`real`), and rules (`required`, `unique`,

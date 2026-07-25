@@ -65,6 +65,9 @@ jobs:
       - name: schema_spec compiler + engine-enforced rules
         run: python test_schemaspec.py
 
+      - name: Instantiate-from-template
+        run: python test_template.py
+
       # Intentionally omitted (import/instantiate toga — not headless-safe on CI):
       #   test_declarative.py, verify_microapp.py
 
