@@ -13,6 +13,23 @@ entry here.
 
 ### Fixed
 
+- **Add-rule helper can no longer emit invalid specs**: choosing a field
+  rule (e.g. `required`) without a field placed it in `object_rules`,
+  producing a spec that validation refused at save time. `helper_add_rule`
+  now enforces rule levels — field rules require a field (error lists the
+  object's actual fields), `owner_only_update` requires none, unknown
+  rules list the vocabulary by level — with the classification imported
+  from `schemaspec` (single source of truth). Validate-before-sign remains
+  the backstop it proved itself to be.
+- **Helper dialogs use dropdowns for enumerable choices**: Add rule picks
+  object, rule (labeled by level), and field from `Selection` dropdowns —
+  the field list follows the selected object and is disabled for
+  object-level rules; Add object's field type is a dropdown over
+  `text`/`integer`/`real`; Add list view picks its object from a dropdown
+  and defaults columns to all of its fields. Containers with no objects
+  get a clear "add an object first" message instead of empty dropdowns.
+  Enumeration logic lives in `editor.py` as tested pure helpers.
+
 - **Onboarding banner renders as wrapped label text**: the login banner was
   still a `message_widget` (read-only input: border, tint, text cursor)
   from the 0.9.1 sweep. It's static prose, so it now renders through the

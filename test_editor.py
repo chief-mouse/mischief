@@ -24,6 +24,10 @@ from mschf.editor import (
     helper_add_list_view,
     helper_add_object,
     helper_add_rule,
+    known_field_types,
+    known_rules,
+    list_fields,
+    list_objects,
     load_spec_texts,
     save_schema_spec,
     save_ui_spec,
@@ -422,6 +426,85 @@ def test_helpers():
     assert validate_schema_spec_text(json.dumps(schema4)) == []
     print("  [OK] helper_add_rule object-level → valid")
 
+    # --- Rule-level mismatches: error cleanly, input not mutated ---
+    snap = json.dumps(schema2, sort_keys=True)
+
+    try:
+        helper_add_rule(schema2, "items", None, "required")
+        raise AssertionError("expected EditorError for field rule without field")
+    except EditorError as e:
+        msg = str(e)
+        assert "applies to a field" in msg, e
+        assert "required" in msg, e
+        assert "title" in msg, e  # lists the object's fields
+        print(f"  [OK] field rule + no field: {e}")
+    assert json.dumps(schema2, sort_keys=True) == snap
+
+    try:
+        helper_add_rule(schema2, "items", "", "unique")
+        raise AssertionError("expected EditorError for field rule with empty field")
+    except EditorError as e:
+        assert "applies to a field" in str(e), e
+        print(f"  [OK] field rule + empty field: {e}")
+    assert json.dumps(schema2, sort_keys=True) == snap
+
+    try:
+        helper_add_rule(schema2, "items", "title", "owner_only_update")
+        raise AssertionError("expected EditorError for object rule with field")
+    except EditorError as e:
+        msg = str(e).lower()
+        assert "object rule" in msg, e
+        assert "owner_only_update" in str(e), e
+        print(f"  [OK] object rule + field: {e}")
+    assert json.dumps(schema2, sort_keys=True) == snap
+
+    try:
+        helper_add_rule(schema2, "items", None, "not_a_real_rule")
+        raise AssertionError("expected EditorError for unknown rule")
+    except EditorError as e:
+        msg = str(e).lower()
+        assert "unknown rule" in msg, e
+        assert "field rules" in msg and "object rules" in msg, e
+        print(f"  [OK] unknown rule lists known by level: {e}")
+    assert json.dumps(schema2, sort_keys=True) == snap
+
+    try:
+        helper_add_rule(schema2, "items", "title", {"bogus": True})
+        raise AssertionError("expected EditorError for unknown dict rule")
+    except EditorError as e:
+        assert "unknown rule" in str(e).lower(), e
+        print(f"  [OK] unknown dict rule: {e}")
+    assert json.dumps(schema2, sort_keys=True) == snap
+
+    # --- Every field-rule kind + object rule round-trip validate_schema_spec_text ---
+    # Use tags.color (no rules yet) so each kind is independent of BASE required.
+    for rule, label in (
+        ("required", "required"),
+        ("unique", "unique"),
+        ("immutable_after_create", "immutable_after_create"),
+        ({"enum": ["red", "blue"]}, "enum"),
+        ({"reference": "items.id"}, "reference"),
+    ):
+        s = helper_add_rule(schema2, "tags", "color", rule)
+        errs = validate_schema_spec_text(json.dumps(s))
+        assert errs == [], (label, errs)
+        # Confirm it landed on the field, not object_rules
+        for o in s["objects"]:
+            if o["name"] == "tags":
+                color_rules = next(
+                    f["rules"] for f in o["fields"] if f["name"] == "color"
+                )
+                assert rule in color_rules, (label, color_rules)
+                assert rule not in o.get("object_rules", []), o.get("object_rules")
+        print(f"  [OK] helper_add_rule field-kind {label!r} → valid")
+
+    s_obj = helper_add_rule(schema2, "tags", None, "owner_only_update")
+    assert validate_schema_spec_text(json.dumps(s_obj)) == []
+    for o in s_obj["objects"]:
+        if o["name"] == "tags":
+            assert "owner_only_update" in o.get("object_rules", [])
+    print("  [OK] helper_add_rule object-kind owner_only_update (no field) → valid")
+
     # Unknown object/field errors cleanly
     try:
         helper_add_rule(schema2, "nope", "x", "required")
@@ -435,6 +518,36 @@ def test_helpers():
     except EditorError as e:
         assert "unknown field" in str(e).lower(), e
         print(f"  [OK] unknown field: {e}")
+
+    # --- Enumeration helpers (dialogs must not parse JSON themselves) ---
+    rules = known_rules()
+    assert all(isinstance(t, tuple) and len(t) == 2 for t in rules), rules
+    by_name = {name: level for name, level in rules}
+    assert by_name.get("required") == "field"
+    assert by_name.get("unique") == "field"
+    assert by_name.get("immutable_after_create") == "field"
+    assert by_name.get("enum") == "field"
+    assert by_name.get("reference") == "field"
+    assert by_name.get("owner_only_update") == "object"
+    assert set(level for _, level in rules) <= {"field", "object"}
+    print(f"  [OK] known_rules → {len(rules)} entries with field/object levels")
+
+    types = known_field_types()
+    assert types == sorted(types)
+    assert set(types) == {"text", "integer", "real"}
+    print(f"  [OK] known_field_types → {types}")
+
+    text = json.dumps(schema2)
+    assert list_objects(text) == ["items", "tags"]
+    assert list_fields(text, "items") == ["title"]
+    assert list_fields(text, "tags") == ["label", "color"]
+    assert list_fields(text, "nope") == []
+    assert list_objects("") == []
+    assert list_objects("not-json") == []
+    assert list_objects(None) == []
+    assert list_fields("{", "items") == []
+    assert list_fields("{}", "items") == []
+    print("  [OK] list_objects / list_fields (valid + empty/invalid)")
 
 
 def test_homed(ca_cert_path, admin_key, admin_cert):

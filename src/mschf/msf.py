@@ -503,34 +503,102 @@ class MSF(toga.Document):
                 pass
         self._helper_dialog = None
 
+    def _editor_schema_text(self) -> str:
+        inp = getattr(self, "_editor_schema_input", None)
+        if inp is None:
+            return "{}"
+        return inp.value or "{}"
+
+    def _helper_empty_objects_dialog(self, title: str, action_label: str) -> None:
+        """Dialog when schema has no objects yet (Add rule / Add list view)."""
+        err_lbl = message_widget(
+            toga,
+            f"No objects in schema_spec yet — add an object first "
+            f"(Edit App → Add object…), then use {action_label}.",
+            kind="error",
+            min_height=72,
+        )
+        box = toga.Box(style=Pack(direction='column', margin=10))
+        box.add(ui_label(toga, title, style=Pack(font_weight='bold', margin_bottom=6)))
+        box.add(err_lbl)
+        box.add(toga.Button(
+            "Close", on_press=lambda w: self._close_helper_dialog(), style=Pack(margin=4)))
+        win = toga.Window(title=title + "…", size=(420, 180))
+        win.content = box
+        self._helper_dialog = win
+        win.show()
+
     def _helper_prompt_add_object(self, widget=None) -> None:
-        """Minimal prompt → helper_add_object → land in schema text area."""
+        """Prompt → helper_add_object → land in schema text area.
+
+        Field types come from a Selection (text/integer/real). Multiple fields
+        still use the mini-syntax: ``name`` or ``name:rule`` (type from the
+        dropdown) or full ``name:type:rule,...`` (embedded type wins).
+        """
         self._close_helper_dialog()
-        name_in = toga.TextInput(placeholder="object name (e.g. items)", style=Pack(margin=4, flex=1))
+        type_items = mschf_editor.known_field_types()
+        name_in = toga.TextInput(
+            placeholder="object name (e.g. items)", style=Pack(margin=4, flex=1))
         fields_in = toga.TextInput(
-            placeholder="fields: name:type:rule,...  e.g. title:text:required,amount:real",
+            placeholder="fields: title, amount  OR  title:required, amount:real",
             style=Pack(margin=4, flex=1),
         )
+        type_sel = toga.Selection(
+            items=type_items, style=Pack(margin=4, flex=1))
+        try:
+            type_sel.value = "text" if "text" in type_items else type_items[0]
+        except Exception:
+            pass
         err_lbl = message_widget(toga, "", kind="error", min_height=48)
+        known_types = set(type_items)
+
+        def parse_fields(raw: str, default_type: str):
+            fields = []
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                bits = [b.strip() for b in part.split(":")]
+                fname = bits[0].strip()
+                if not fname:
+                    raise ValueError(f"bad field entry {part!r}")
+                if len(bits) == 1:
+                    fields.append((fname, default_type, []))
+                elif len(bits) == 2:
+                    second = bits[1].strip()
+                    if second in known_types:
+                        fields.append((fname, second, []))
+                    else:
+                        # name:rule — type from dropdown
+                        rules = [second] if second else []
+                        fields.append((fname, default_type, rules))
+                else:
+                    # name:type:rule,... (type may be omitted → default)
+                    maybe_type = bits[1].strip()
+                    if maybe_type in known_types:
+                        ftype = maybe_type
+                        rules = [r.strip() for r in bits[2:] if r.strip()]
+                    else:
+                        ftype = default_type
+                        rules = [r.strip() for r in bits[1:] if r.strip()]
+                    fields.append((fname, ftype, rules))
+            return fields
 
         def apply_helper(w=None):
             name = (name_in.value or "").strip()
             raw = (fields_in.value or "").strip()
+            default_type = type_sel.value
             if not name or not raw:
                 set_message(err_lbl, "Name and fields are required.")
                 return
-            fields = []
+            if not default_type:
+                set_message(err_lbl, "Select a field type.")
+                return
             try:
-                for part in raw.split(","):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    bits = [b.strip() for b in part.split(":")]
-                    if len(bits) < 2:
-                        raise ValueError(f"bad field entry {part!r}")
-                    fname, ftype = bits[0], bits[1]
-                    rules = [r for r in bits[2:] if r] if len(bits) > 2 else []
-                    fields.append((fname, ftype, rules))
+                fields = parse_fields(raw, default_type)
+                if not fields:
+                    set_message(err_lbl, "Name and fields are required.")
+                    return
                 schema = json.loads(self._editor_schema_input.value or "{}")
                 if "v" not in schema:
                     schema["v"] = 1
@@ -549,34 +617,81 @@ class MSF(toga.Document):
 
         box = toga.Box(style=Pack(direction='column', margin=10))
         box.add(ui_label(toga, "Add object", style=Pack(font_weight='bold', margin_bottom=6)))
+        box.add(ui_label(
+            toga,
+            "Fields: comma-separated names. Optional mini-syntax "
+            "name:type:rule (type dropdown is the default when type is omitted).",
+            style=Pack(font_size=9, margin_bottom=4),
+        ))
         box.add(name_in)
         box.add(fields_in)
+        box.add(ui_label(toga, "Default field type", style=Pack(font_size=9, margin_top=2)))
+        box.add(type_sel)
         box.add(err_lbl)
         row = toga.Box(style=Pack(direction='row'))
         row.add(toga.Button("Apply", on_press=apply_helper, style=Pack(margin=4)))
         row.add(toga.Button(
             "Cancel", on_press=lambda w: self._close_helper_dialog(), style=Pack(margin=4)))
         box.add(row)
-        win = toga.Window(title="Add object…", size=(480, 240))
+        win = toga.Window(title="Add object…", size=(520, 300))
         win.content = box
         self._helper_dialog = win
         win.show()
 
     def _helper_prompt_add_list_view(self, widget=None) -> None:
         self._close_helper_dialog()
-        obj_in = toga.TextInput(placeholder="object name", style=Pack(margin=4, flex=1))
+        schema_text = self._editor_schema_text()
+        objects = mschf_editor.list_objects(schema_text)
+        if not objects:
+            self._helper_empty_objects_dialog("Add list view", "Add list view…")
+            return
+
+        obj_sel = toga.Selection(items=list(objects), style=Pack(margin=4, flex=1))
+        try:
+            obj_sel.value = objects[0]
+        except Exception:
+            pass
+
+        def default_cols_for(obj_name: str) -> str:
+            fields = mschf_editor.list_fields(schema_text, obj_name)
+            return ", ".join(fields)
+
+        initial_obj = objects[0]
         cols_in = toga.TextInput(
-            placeholder="columns: title,body", style=Pack(margin=4, flex=1))
+            value=default_cols_for(initial_obj),
+            placeholder="columns: title, body (default: all fields)",
+            style=Pack(margin=4, flex=1),
+        )
         err_lbl = message_widget(toga, "", kind="error", min_height=48)
 
+        def on_obj_change(widget=None):
+            choice = obj_sel.value
+            if choice:
+                cols_in.value = default_cols_for(choice)
+
+        try:
+            obj_sel.on_change = on_obj_change
+        except Exception:
+            pass
+
         def apply_helper(w=None):
-            object_name = (obj_in.value or "").strip()
+            object_name = (obj_sel.value or "").strip()
             cols_raw = (cols_in.value or "").strip()
-            if not object_name or not cols_raw:
-                set_message(err_lbl, "Object name and columns are required.")
+            if not object_name:
+                set_message(err_lbl, "Select an object.")
                 return
             try:
-                columns = [c.strip() for c in cols_raw.split(",") if c.strip()]
+                if cols_raw:
+                    columns = [c.strip() for c in cols_raw.split(",") if c.strip()]
+                else:
+                    columns = mschf_editor.list_fields(schema_text, object_name)
+                if not columns:
+                    set_message(
+                        err_lbl,
+                        f"No columns for {object_name!r} — enter field names "
+                        f"or add fields to the object first.",
+                    )
+                    return
                 ui = json.loads(self._editor_ui_input.value or "{}")
                 new_spec = mschf_editor.helper_add_list_view(ui, object_name, columns)
                 self._editor_ui_input.value = json.dumps(
@@ -591,7 +706,11 @@ class MSF(toga.Document):
 
         box = toga.Box(style=Pack(direction='column', margin=10))
         box.add(ui_label(toga, "Add list view", style=Pack(font_weight='bold', margin_bottom=6)))
-        box.add(obj_in)
+        box.add(ui_label(toga, "Object", style=Pack(font_size=9)))
+        box.add(obj_sel)
+        box.add(ui_label(
+            toga, "Columns (comma-separated; defaults to all fields)",
+            style=Pack(font_size=9, margin_top=2)))
         box.add(cols_in)
         box.add(err_lbl)
         row = toga.Box(style=Pack(direction='row'))
@@ -599,40 +718,117 @@ class MSF(toga.Document):
         row.add(toga.Button(
             "Cancel", on_press=lambda w: self._close_helper_dialog(), style=Pack(margin=4)))
         box.add(row)
-        win = toga.Window(title="Add list view…", size=(420, 220))
+        win = toga.Window(title="Add list view…", size=(420, 260))
         win.content = box
         self._helper_dialog = win
         win.show()
 
     def _helper_prompt_add_rule(self, widget=None) -> None:
         self._close_helper_dialog()
-        obj_in = toga.TextInput(placeholder="object name", style=Pack(margin=4, flex=1))
-        field_in = toga.TextInput(
-            placeholder="field name (empty = object-level rule)",
+        schema_text = self._editor_schema_text()
+        objects = mschf_editor.list_objects(schema_text)
+        if not objects:
+            self._helper_empty_objects_dialog("Add rule", "Add rule…")
+            return
+
+        # Bare-string rules only in the dropdown (enum/reference need parameters
+        # and stay available via direct schema_spec editing).
+        rule_entries = [
+            (name, level) for name, level in mschf_editor.known_rules()
+            if name not in ("enum", "reference")
+        ]
+        rule_labels = [f"{name} ({level})" for name, level in rule_entries]
+        rule_by_label = {
+            f"{name} ({level})": (name, level) for name, level in rule_entries
+        }
+
+        obj_sel = toga.Selection(items=list(objects), style=Pack(margin=4, flex=1))
+        try:
+            obj_sel.value = objects[0]
+        except Exception:
+            pass
+
+        rule_sel = toga.Selection(items=rule_labels, style=Pack(margin=4, flex=1))
+        try:
+            if rule_labels:
+                rule_sel.value = rule_labels[0]
+        except Exception:
+            pass
+
+        initial_fields = mschf_editor.list_fields(schema_text, objects[0])
+        field_sel = toga.Selection(
+            items=list(initial_fields) if initial_fields else [""],
             style=Pack(margin=4, flex=1),
+            enabled=bool(initial_fields),
         )
-        rule_in = toga.TextInput(
-            placeholder="rule (e.g. required or owner_only_update)",
-            style=Pack(margin=4, flex=1),
+        if initial_fields:
+            try:
+                field_sel.value = initial_fields[0]
+            except Exception:
+                pass
+        field_hint = ui_label(
+            toga, "Field (for field-level rules)",
+            style=Pack(font_size=9, margin_top=2),
         )
         err_lbl = message_widget(toga, "", kind="error", min_height=48)
 
-        def apply_helper(w=None):
-            object_name = (obj_in.value or "").strip()
-            field = (field_in.value or "").strip() or None
-            rule = (rule_in.value or "").strip()
-            if not object_name or not rule:
-                set_message(err_lbl, "Object name and rule are required.")
-                return
+        def _selected_rule():
+            label = rule_sel.value
+            return rule_by_label.get(label) if label else None
+
+        def _refresh_fields(widget=None):
+            obj_name = obj_sel.value or ""
+            fields = mschf_editor.list_fields(schema_text, obj_name) if obj_name else []
             try:
-                # Allow simple JSON object rules like {"enum":["a","b"]}
-                if rule.startswith("{"):
-                    rule_val = json.loads(rule)
-                else:
-                    rule_val = rule
+                field_sel.items = list(fields) if fields else [""]
+            except Exception:
+                pass
+            if fields:
+                try:
+                    field_sel.value = fields[0]
+                except Exception:
+                    pass
+            _sync_field_enabled()
+
+        def _sync_field_enabled(widget=None):
+            info = _selected_rule()
+            level = info[1] if info else "field"
+            if level == "object":
+                field_sel.enabled = False
+                field_hint.text = "Field (ignored for object-level rules)"
+            else:
+                obj_name = obj_sel.value or ""
+                fields = mschf_editor.list_fields(schema_text, obj_name) if obj_name else []
+                field_sel.enabled = bool(fields)
+                field_hint.text = "Field (for field-level rules)"
+
+        try:
+            obj_sel.on_change = _refresh_fields
+        except Exception:
+            pass
+        try:
+            rule_sel.on_change = _sync_field_enabled
+        except Exception:
+            pass
+        _sync_field_enabled()
+
+        def apply_helper(w=None):
+            object_name = (obj_sel.value or "").strip()
+            info = _selected_rule()
+            if not object_name:
+                set_message(err_lbl, "Select an object.")
+                return
+            if not info:
+                set_message(err_lbl, "Select a rule.")
+                return
+            rule_name, level = info
+            field = None
+            if level == "field":
+                field = (field_sel.value or "").strip() or None
+            try:
                 schema = json.loads(self._editor_schema_input.value or "{}")
                 new_spec = mschf_editor.helper_add_rule(
-                    schema, object_name, field, rule_val
+                    schema, object_name, field, rule_name
                 )
                 self._editor_schema_input.value = json.dumps(
                     new_spec, indent=2, sort_keys=True
@@ -646,16 +842,19 @@ class MSF(toga.Document):
 
         box = toga.Box(style=Pack(direction='column', margin=10))
         box.add(ui_label(toga, "Add rule", style=Pack(font_weight='bold', margin_bottom=6)))
-        box.add(obj_in)
-        box.add(field_in)
-        box.add(rule_in)
+        box.add(ui_label(toga, "Object", style=Pack(font_size=9)))
+        box.add(obj_sel)
+        box.add(ui_label(toga, "Rule", style=Pack(font_size=9, margin_top=2)))
+        box.add(rule_sel)
+        box.add(field_hint)
+        box.add(field_sel)
         box.add(err_lbl)
         row = toga.Box(style=Pack(direction='row'))
         row.add(toga.Button("Apply", on_press=apply_helper, style=Pack(margin=4)))
         row.add(toga.Button(
             "Cancel", on_press=lambda w: self._close_helper_dialog(), style=Pack(margin=4)))
         box.add(row)
-        win = toga.Window(title="Add rule…", size=(420, 260))
+        win = toga.Window(title="Add rule…", size=(420, 320))
         win.content = box
         self._helper_dialog = win
         win.show()

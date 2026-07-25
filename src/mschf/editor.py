@@ -12,6 +12,9 @@ from types import SimpleNamespace
 
 from mschf.declarative import DeclarativeSpecError, _RenderContext
 from mschf.schemaspec import (
+    FIELD_RULE_NAMES,
+    OBJECT_RULE_NAMES,
+    SUPPORTED_TYPES,
     SchemaSpecError,
     apply_schema_spec,
     validate_schema_spec,
@@ -28,6 +31,10 @@ HOMED_EDIT_REFUSAL = (
     "This container is homed on a sync hub (sync_hub_cn is set). "
     "Edit the hub's copy; hub-routed editing is future work."
 )
+
+# Dict-keyed field rules handled by schemaspec._normalize_field_rules but not
+# listed in FIELD_RULE_NAMES (string tokens only). Keep in sync with schemaspec.
+_FIELD_RULE_DICT_KEYS = frozenset({"enum", "reference"})
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +261,72 @@ def _unique_id(base: str, existing: set) -> str:
     return f"{base}_{n}"
 
 
+# ---------------------------------------------------------------------------
+# Enumeration helpers for editor dialogs (pure; dialogs must not parse JSON)
+# ---------------------------------------------------------------------------
+
+
+def known_rules():
+    """Return ``[(name, level), ...]`` for the fixed rule vocabulary.
+
+    *level* is ``'field'`` or ``'object'``. Order: field rules (sorted), then
+    object rules (sorted). Includes dict-keyed field rules (``enum``,
+    ``reference``) by name only — callers that need parameters still construct
+    the rule value themselves.
+    """
+    items = [(name, "field") for name in sorted(FIELD_RULE_NAMES | _FIELD_RULE_DICT_KEYS)]
+    items.extend((name, "object") for name in sorted(OBJECT_RULE_NAMES))
+    return items
+
+
+def known_field_types():
+    """Return the supported schema field types (``text`` / ``integer`` / ``real``)."""
+    return sorted(SUPPORTED_TYPES)
+
+
+def list_objects(spec_text):
+    """Object names from a schema_spec JSON *text* (ordered as in the spec).
+
+    Returns ``[]`` for empty/invalid input — never raises.
+    """
+    try:
+        spec = json.loads(spec_text if spec_text is not None else "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(spec, dict):
+        return []
+    objects = spec.get("objects")
+    if not isinstance(objects, list):
+        return []
+    names = []
+    for obj in objects:
+        if isinstance(obj, dict):
+            name = obj.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return names
+
+
+def list_fields(spec_text, object_name):
+    """Field names for *object_name* from schema_spec JSON *text*.
+
+    Returns ``[]`` when the object is missing or input is invalid — never raises.
+    """
+    try:
+        spec = json.loads(spec_text if spec_text is not None else "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(spec, dict):
+        return []
+    objects = spec.get("objects")
+    if not isinstance(objects, list):
+        return []
+    for obj in objects:
+        if isinstance(obj, dict) and obj.get("name") == object_name:
+            return _object_field_names(obj)
+    return []
+
+
 def helper_add_object(schema_spec, name, fields):
     """Return a new schema_spec with an added object.
 
@@ -414,11 +487,61 @@ def helper_add_list_view(ui_spec, object_name, columns):
     return new_spec
 
 
+def _known_rules_by_level_msg() -> str:
+    field_names = sorted(FIELD_RULE_NAMES | _FIELD_RULE_DICT_KEYS)
+    object_names = sorted(OBJECT_RULE_NAMES)
+    return (
+        f"field rules: {', '.join(field_names)}; "
+        f"object rules: {', '.join(object_names)}"
+    )
+
+
+def _classify_rule(rule):
+    """Return ``('field'|'object', display_name)`` for *rule*.
+
+    Classification uses schemaspec's ``FIELD_RULE_NAMES`` /
+    ``OBJECT_RULE_NAMES`` plus the dict keys ``enum`` / ``reference``.
+    Unknown rules raise ``EditorError`` (no level assumed).
+    """
+    if isinstance(rule, str):
+        if rule in FIELD_RULE_NAMES:
+            return "field", rule
+        if rule in OBJECT_RULE_NAMES:
+            return "object", rule
+        raise EditorError(
+            f"unknown rule {rule!r}; {_known_rules_by_level_msg()}"
+        )
+    if isinstance(rule, dict):
+        if not rule or len(rule) != 1:
+            raise EditorError(
+                f"unknown rule {rule!r}; {_known_rules_by_level_msg()}"
+            )
+        key = next(iter(rule))
+        if key in _FIELD_RULE_DICT_KEYS:
+            return "field", key
+        raise EditorError(
+            f"unknown rule {key!r}; {_known_rules_by_level_msg()}"
+        )
+    raise EditorError(
+        f"rule must be a string or object, got {type(rule).__name__}"
+    )
+
+
+def _object_field_names(obj) -> list:
+    names = []
+    for f in obj.get("fields") or []:
+        if isinstance(f, dict) and isinstance(f.get("name"), str) and f["name"]:
+            names.append(f["name"])
+    return names
+
+
 def helper_add_rule(schema_spec, object_name, field_name_or_None, rule):
     """Return a new schema_spec with *rule* appended (field or object level).
 
-    *field_name_or_None* is ``None`` for object-level rules (``object_rules``).
-    Unknown object/field raises ``EditorError``.
+    Rule level is derived from schemaspec's field/object rule vocabulary:
+    field rules require a non-empty *field_name_or_None*; object rules
+    require it to be ``None``/empty. Unknown object/field/rule raises
+    ``EditorError`` — no spec dict is produced on error.
     """
     if not isinstance(schema_spec, dict):
         raise EditorError(
@@ -428,6 +551,12 @@ def helper_add_rule(schema_spec, object_name, field_name_or_None, rule):
         raise EditorError("object_name must be a non-empty string")
     if rule is None or rule == "":
         raise EditorError("rule must be non-empty")
+
+    level, rule_name = _classify_rule(rule)
+
+    field_name = field_name_or_None
+    if isinstance(field_name, str):
+        field_name = field_name.strip() or None
 
     new_spec = copy.deepcopy(schema_spec)
     objects = new_spec.get("objects")
@@ -442,33 +571,44 @@ def helper_add_rule(schema_spec, object_name, field_name_or_None, rule):
     if target_obj is None:
         raise EditorError(f"unknown object {object_name!r}")
 
-    if field_name_or_None is None:
-        rules = target_obj.setdefault("object_rules", [])
-        if not isinstance(rules, list):
+    if level == "field":
+        if not field_name:
+            pick = ", ".join(_object_field_names(target_obj)) or "(none)"
             raise EditorError(
-                f"object {object_name!r}: object_rules must be a list"
+                f"rule {rule_name!r} applies to a field — pick one of: {pick}"
             )
-        rules.append(rule)
+        fields = target_obj.get("fields")
+        if not isinstance(fields, list):
+            raise EditorError(f"object {object_name!r}: fields must be a list")
+        target_field = None
+        for f in fields:
+            if isinstance(f, dict) and f.get("name") == field_name:
+                target_field = f
+                break
+        if target_field is None:
+            raise EditorError(
+                f"unknown field {field_name!r} on object {object_name!r}"
+            )
+        frules = target_field.setdefault("rules", [])
+        if not isinstance(frules, list):
+            raise EditorError(
+                f"field {object_name}.{field_name}: rules must be a list"
+            )
+        frules.append(rule)
         return new_spec
 
-    fields = target_obj.get("fields")
-    if not isinstance(fields, list):
-        raise EditorError(f"object {object_name!r}: fields must be a list")
-    target_field = None
-    for f in fields:
-        if isinstance(f, dict) and f.get("name") == field_name_or_None:
-            target_field = f
-            break
-    if target_field is None:
+    # Object-level rule
+    if field_name:
         raise EditorError(
-            f"unknown field {field_name_or_None!r} on object {object_name!r}"
+            f"rule {rule_name!r} is an object rule — leave field empty "
+            f"(got {field_name!r})"
         )
-    frules = target_field.setdefault("rules", [])
-    if not isinstance(frules, list):
+    rules = target_obj.setdefault("object_rules", [])
+    if not isinstance(rules, list):
         raise EditorError(
-            f"field {object_name}.{field_name_or_None}: rules must be a list"
+            f"object {object_name!r}: object_rules must be a list"
         )
-    frules.append(rule)
+    rules.append(rule)
     return new_spec
 
 
@@ -482,6 +622,10 @@ __all__ = [
     "helper_add_rule",
     "is_container_admin",
     "is_homed",
+    "known_field_types",
+    "known_rules",
+    "list_fields",
+    "list_objects",
     "load_spec_texts",
     "save_schema_spec",
     "save_ui_spec",
