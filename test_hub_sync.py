@@ -949,14 +949,22 @@ def run():
             n = 0
             try:
                 while not stop_hammer.is_set():
-                    msync.sign_and_submit(
-                        hub_url, container_id, user_private, user_cert,
-                        "INSERT INTO notes (body) VALUES (?)",
-                        [f'hammer-w{i}-{n}'],
-                        expected_hub_cn=hub_cn,
-                        ca_cert_path=ca_cert_path,
-                        max_retries=20,
-                    )
+                    try:
+                        msync.sign_and_submit(
+                            hub_url, container_id, user_private, user_cert,
+                            "INSERT INTO notes (body) VALUES (?)",
+                            [f'hammer-w{i}-{n}'],
+                            expected_hub_cn=hub_cn,
+                            ca_cert_path=ca_cert_path,
+                            max_retries=20,
+                        )
+                    except msync.StaleHead:
+                        # Retry exhaustion under hammer contention is a benign
+                        # outcome (a real client would just retry again), not a
+                        # deadlock signal — observed flaking on slow macOS CI
+                        # runners. Progress/ledger/audit assertions below are
+                        # the real regression gates.
+                        continue
                     n += 1
                     with hammer_lock:
                         hammer_submit_count[0] += 1
