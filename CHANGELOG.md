@@ -13,6 +13,20 @@ entry here.
 
 ### Added
 
+- **No-code editor v1** (`mschf.editor` + "Edit App" in the document
+  window): admins evolve a live app with zero code. Raw JSON editing of the
+  two signed spec documents with validation BEFORE signing (declarative
+  structural checks for `ui_spec`, `schemaspec` validation for
+  `schema_spec` — an invalid spec is never signed; refused saves leave the
+  chain head untouched), saves as signed manifest writes / the
+  `apply_schema_spec` evolution path, and three structured helpers — add
+  object, add list view (table + bound query + insert action), add rule —
+  as pure functions whose output lands in the editor for explicit review
+  and save (helpers never auto-save). Homed replicas refuse edits in v1
+  (hub-routed editing is future work). GUI is a thin admin-gated view; all
+  logic is headless and CI-covered. Implemented by the grok agent;
+  reviewed and independently re-tested by Claude.
+
 - **Instantiate-from-template + "New App…"** (`mschf.template`): no-code app
   creation. Templates are recipes, not replicas — `create_from_template`
   verifies the template fail-closed (`replay_audit`, verified

@@ -68,6 +68,9 @@ jobs:
       - name: Instantiate-from-template
         run: python test_template.py
 
+      - name: No-code editor (ui_spec / schema_spec)
+        run: python test_editor.py
+
       # Intentionally omitted (import/instantiate toga — not headless-safe on CI):
       #   test_declarative.py, verify_microapp.py
 
