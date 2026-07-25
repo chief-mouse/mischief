@@ -20,15 +20,20 @@ entry here.
   prose stretched the app window to ~2000px) because prior fixes swept call
   sites, not the source. Every text label in the codebase now goes through
   `widgets.label(toga, text)`, which owns the decision: short single-line
-  text renders a real `toga.Label`; long or multiline text renders a
-  wrapping read-only presentation (no tint). The declarative renderer's
-  `label` nodes route through the factory, covering every current and
-  future `ui_spec` app. A new CI gate (`scripts/check_label_gate.py`) fails
-  the build on any raw `toga.Label(` construction outside `widgets.py` —
-  recurrence is now a build failure. Known residual: widgets that mutate
-  `.text` at runtime choose their type at construction; such sites use
-  forced single-line truncation. Verified visually: the starter opens at
-  normal width with prose wrapping.
+  text renders a `toga.Label` as-is; long or multiline text renders a real
+  `toga.Label` with a platform-native wrap constraint (WinForms:
+  `AutoSize` + a `MaximumSize` width cap applied via the widget's native
+  handle, guarded per the established platform-tweak pattern; other
+  backends no-op to a styled unwrapped Label) — wrapped prose is genuine
+  label text with full Pack styling, not a read-only input box. The
+  declarative renderer's `label` nodes route through the factory, covering
+  every current and future `ui_spec` app. A new CI gate
+  (`scripts/check_label_gate.py`) fails the build on any raw `toga.Label(`
+  construction outside `widgets.py` — recurrence is now a build failure.
+  Known residual: widgets that mutate `.text` at runtime choose their type
+  at construction; such sites use forced single-line truncation. Verified
+  visually: the starter opens at normal width, prose wraps as borderless
+  styled text.
 
 - **New App dialog lists only valid templates**: the template dropdown
   previously listed every workspace `.msf` with no signal which would pass

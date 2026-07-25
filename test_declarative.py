@@ -593,11 +593,10 @@ def test_label_factory_routing():
         stub_toga,
         host,
     )
-    assert isinstance(long_w, _Box), type(long_w)
-    assert not isinstance(long_w, _Label)
-    inners = [c for c in long_w.children if isinstance(c, _MultilineTextInput)]
-    assert inners and inners[0].value == long_text and inners[0].readonly
-    print("  [OK] short → Label; >80-char → wrapping Box + MultilineTextInput")
+    # Long text is still a real Label; wrapping is native-level (invisible to stub).
+    assert isinstance(long_w, _Label), type(long_w)
+    assert long_w.text == long_text
+    print("  [OK] short → Label; >80-char → Label (native wrap, not input)")
 
 
 def test_no_dangerous_imports():

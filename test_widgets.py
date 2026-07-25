@@ -237,7 +237,7 @@ def test_truncate_for_label():
 
 
 def test_label_factory_decision_rule():
-    """short → Label; long/newline → wrapping Box; force_single_line truncates."""
+    """short → Label; long/newline → Label (+ native wrap); force_single_line truncates."""
     from mschf.widgets import label, truncate_for_label
 
     toga = _make_stub_toga()
@@ -253,21 +253,12 @@ def test_label_factory_decision_rule():
 
     long = "y" * 81
     wrapped = label(toga, long)
-    assert isinstance(wrapped, _Box), type(wrapped)
-    assert not isinstance(wrapped, _Label)
-    inp = _inner(wrapped)
-    assert inp is not None and isinstance(inp, _MultilineTextInput)
-    assert inp.readonly is True
-    assert inp.value == long
-    # Content wrap: no error/warning tint
-    color = getattr(inp.style, "color", None) or (
-        inp.style.kwargs.get("color") if hasattr(inp.style, "kwargs") else None
-    )
-    assert color is None
+    assert isinstance(wrapped, _Label), type(wrapped)
+    assert wrapped.text == long
 
     with_nl = label(toga, "line one\nline two")
-    assert isinstance(with_nl, _Box)
-    assert _inner(with_nl).value == "line one\nline two"
+    assert isinstance(with_nl, _Label)
+    assert with_nl.text == "line one\nline two"
 
     # force_single_line always Label + truncate
     forced = label(toga, "a" * 200, force_single_line=True)
@@ -291,9 +282,92 @@ def test_label_style_passthrough():
     assert short.style is style
 
     long = label(toga, "z" * 100, style=style)
-    assert isinstance(long, _Box)
+    assert isinstance(long, _Label)
     assert long.style is style
-    print("  [OK] label() style passthrough (Label + wrapping)")
+    print("  [OK] label() style passthrough (Label short + long)")
+
+
+def test_enable_native_wrap_records_on_fake_native():
+    """WinForms path: AutoSize + MaximumSize set on a fake _impl.native."""
+    from mschf.widgets import _enable_native_wrap, label
+
+    # Fake System.Drawing.Size so the WinForms import path can run headless.
+    import types
+
+    class _Size:
+        def __init__(self, width, height):
+            self.Width = width
+            self.Height = height
+            self.args = (width, height)
+
+        def __eq__(self, other):
+            return (
+                isinstance(other, _Size)
+                and other.Width == self.Width
+                and other.Height == self.Height
+            )
+
+    fake_drawing = types.ModuleType("System.Drawing")
+    fake_drawing.Size = _Size
+    fake_system = types.ModuleType("System")
+    fake_system.Drawing = fake_drawing
+    prev_system = sys.modules.get("System")
+    prev_drawing = sys.modules.get("System.Drawing")
+    sys.modules["System"] = fake_system
+    sys.modules["System.Drawing"] = fake_drawing
+    try:
+        class _Native:
+            def __init__(self):
+                self.AutoSize = None
+                self.MaximumSize = None
+
+        native = _Native()
+        widget = SimpleNamespace(_impl=SimpleNamespace(native=native))
+        _enable_native_wrap(widget, 900)
+        assert native.AutoSize is True
+        assert native.MaximumSize is not None
+        assert native.MaximumSize.Width == 900
+        assert native.MaximumSize.Height == 0
+
+        # Via label() long-text branch + custom max_width
+        toga = _make_stub_toga()
+        long_w = label(toga, "q" * 100, max_width=400)
+        assert isinstance(long_w, _Label)
+        long_w._impl = SimpleNamespace(native=_Native())
+        _enable_native_wrap(long_w, 400)
+        assert long_w._impl.native.AutoSize is True
+        assert long_w._impl.native.MaximumSize.Width == 400
+        assert long_w._impl.native.MaximumSize.Height == 0
+    finally:
+        if prev_system is None:
+            sys.modules.pop("System", None)
+        else:
+            sys.modules["System"] = prev_system
+        if prev_drawing is None:
+            sys.modules.pop("System.Drawing", None)
+        else:
+            sys.modules["System.Drawing"] = prev_drawing
+    print("  [OK] _enable_native_wrap sets AutoSize + MaximumSize on fake native")
+
+
+def test_enable_native_wrap_missing_impl_noop():
+    """Stub Label without _impl / native: silent no-op, never raises."""
+    from mschf.widgets import _enable_native_wrap, label
+
+    toga = _make_stub_toga()
+    w = label(toga, "r" * 100)
+    assert isinstance(w, _Label)
+    assert not hasattr(w, "_impl")
+    _enable_native_wrap(w, 900)  # must not raise
+
+    # _impl present but no native
+    w2 = SimpleNamespace(_impl=SimpleNamespace())
+    _enable_native_wrap(w2, 900)
+
+    # native is None
+    w3 = SimpleNamespace(_impl=SimpleNamespace(native=None))
+    _enable_native_wrap(w3, 900)
+    print("  [OK] _enable_native_wrap no-op without _impl/native")
 
 
 def main():
@@ -307,6 +381,8 @@ def main():
     test_truncate_for_label()
     test_label_factory_decision_rule()
     test_label_style_passthrough()
+    test_enable_native_wrap_records_on_fake_native()
+    test_enable_native_wrap_missing_impl_noop()
 
     assert "toga" not in sys.modules, (
         "test_widgets must stay headless — real toga was imported"

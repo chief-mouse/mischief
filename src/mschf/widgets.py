@@ -92,26 +92,38 @@ def _remove_child(container, child):
         pass
 
 
-def _wrapping_content(toga, text, *, style=None, min_height=None):
-    """Wrapping read-only presentation for content labels (no tint, no collapse).
+def _enable_native_wrap(widget, max_width_px=900):
+    """Best-effort platform-native text wrap on a real ``toga.Label``.
 
-    Shared with the message path via :func:`_make_readonly_input`. Caller's
-    *style* is applied to the outer Box (height-ish properties best-effort).
+    **WinForms (primary target):** via the widget's native handle
+    (``widget._impl.native``), set ``AutoSize = True`` and
+    ``MaximumSize = System.Drawing.Size(max_width_px, 0)`` so the native
+    Label wraps at the width cap and grows vertically.
+
+    The native handle may not exist until the widget is realized. This helper
+    attempts once at construction (same pattern as ``app.py`` WinForms
+    tweaks); if ``_impl`` / ``native`` is absent the call is a silent no-op.
+    There is no cheap cross-backend "on realize" hook worth attaching here.
+
+    Secondary backends (GTK/Cocoa/dummy/stub toga in tests): any missing
+    attribute or import fails closed into the broad ``except`` — caller keeps
+    an unwrapped-but-styled Label. Never raises; never falls back to an input.
     """
-    Pack = _pack_cls(toga)
-    height = int(min_height) if min_height is not None else 60
-    if style is None:
-        style = Pack(direction="column", flex=1)
-    else:
-        # Prefer a column so the input stacks; best-effort on foreign Packs.
-        try:
-            if getattr(style, "direction", None) in (None, ""):
-                style.direction = "column"
-        except Exception:
-            pass
-    container = toga.Box(style=style)
-    container.add(_make_readonly_input(toga, text, height=height, kind=None))
-    return container
+    try:
+        impl = getattr(widget, "_impl", None)
+        if impl is None:
+            return
+        native = getattr(impl, "native", None)
+        if native is None:
+            return
+        max_w = int(max_width_px)
+        # Import/System.Drawing only inside the guarded block (pythonnet/WinForms).
+        from System.Drawing import Size
+
+        native.AutoSize = True
+        native.MaximumSize = Size(max_w, 0)
+    except Exception:
+        pass
 
 
 def message_widget(toga, text, *, kind="info", min_height=None):
@@ -213,7 +225,7 @@ def truncate_for_label(text, max_chars=120):
     return s[: n - 1] + "…"
 
 
-def label(toga, text, *, style=None, force_single_line=False):
+def label(toga, text, *, style=None, force_single_line=False, max_width=900):
     """THE way to make a text label anywhere in this codebase.
 
     Decision rule:
@@ -221,14 +233,14 @@ def label(toga, text, *, style=None, force_single_line=False):
     - ``force_single_line=True`` → real ``toga.Label`` with
       :func:`truncate_for_label` applied to *text*.
     - else text ≤ 80 chars AND no newline → real ``toga.Label`` verbatim.
-    - else → wrapping read-only presentation (no tint, no collapse — content,
-      not a message). Built via the shared private helper used by
-      :func:`message_widget`'s input path.
+    - else → real ``toga.Label`` with *style* applied verbatim (bold /
+      font_size / color work), plus a best-effort platform-native wrap
+      constraint via :func:`_enable_native_wrap` (WinForms
+      ``MaximumSize`` + ``AutoSize``; silent no-op elsewhere).
 
-    *style* passes through to whichever widget is built (callers keep their
-    Pack styling). Height-ish properties apply best-effort on the wrapping
-    variant. Returns the widget. ``toga`` is passed in so this stays
-    import-safe headless.
+    *style* passes through to the Label. *max_width* (px, default 900) is the
+    native wrap cap when the long-text branch runs. Returns the widget.
+    ``toga`` is passed in so this stays import-safe headless.
     """
     Pack = _pack_cls(toga)
     text_s = "" if text is None else str(text)
@@ -242,4 +254,7 @@ def label(toga, text, *, style=None, force_single_line=False):
     if len(text_s) <= _LABEL_SINGLE_LINE_MAX and not has_newline:
         return toga.Label(text_s, style=style)
 
-    return _wrapping_content(toga, text_s, style=style)
+    # Long / multi-line prose: real Label (keeps Pack styling) + native wrap.
+    widget = toga.Label(text_s, style=style)
+    _enable_native_wrap(widget, max_width)
+    return widget
