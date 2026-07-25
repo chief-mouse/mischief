@@ -11,6 +11,22 @@ entry here.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-25
+
+### Fixed
+
+- **Long messages no longer blow out GUI layout**: `toga.Label` never wraps
+  (WinForms auto-sizes to one line), so any long error/status string — e.g.
+  the New App dialog's template-refusal message — stretched its dialog to
+  the text's full width. New shared `mschf.widgets.message_widget` (read-only
+  wrapping multiline, flex-width; toga passed in, headless-importable) now
+  backs every long-message surface: New App dialog errors, the onboarding
+  banner, Edit App validate/save status, helper-dialog errors, declarative
+  error detail, and About parse errors; unbounded one-line sites use
+  `truncate_for_label`. Fixed short strings (captions, banners, the sync
+  status line) deliberately remain Labels. Implemented by the grok agent;
+  reviewed and independently re-tested by Claude.
+
 ## [0.9.0] - 2026-07-25
 
 ### Added

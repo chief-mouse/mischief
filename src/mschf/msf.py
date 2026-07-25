@@ -19,6 +19,7 @@ from mschf.syncstate import (
     _sync_subscriber_main,
 )
 from mschf import editor as mschf_editor
+from mschf.widgets import message_widget, set_message
 
 
 class MSF(toga.Document):
@@ -295,9 +296,7 @@ class MSF(toga.Document):
         box.add(toga.Label(
             "This container's ui_spec manifest entry could not be rendered:",
             style=Pack(margin_bottom=8)))
-        detail = toga.MultilineTextInput(readonly=True, style=Pack(flex=1))
-        detail.value = str(error)
-        box.add(detail)
+        box.add(message_widget(toga, str(error), kind="error", min_height=120))
         self._set_document_content(box)
 
     def _draw_declarative(self, spec) -> None:
@@ -359,7 +358,7 @@ class MSF(toga.Document):
 
     def _editor_set_status(self, msg) -> None:
         if self._editor_status is not None:
-            self._editor_status.text = str(msg) if msg else ""
+            set_message(self._editor_status, str(msg) if msg else "")
 
     def _draw_editor(self) -> None:
         """Thin wiring: two JSON text areas + validate/save/cancel + helpers."""
@@ -385,7 +384,8 @@ class MSF(toga.Document):
         self._editor_schema_input = schema_input
         root.add(schema_input)
 
-        status = toga.Label("", style=Pack(font_size=10, margin=4, color='#333333'))
+        # Validation / save errors can be many lines — wrap, don't blow layout.
+        status = message_widget(toga, "", kind="info", min_height=96)
         self._editor_status = status
         root.add(status)
 
@@ -476,13 +476,13 @@ class MSF(toga.Document):
             placeholder="fields: name:type:rule,...  e.g. title:text:required,amount:real",
             style=Pack(margin=4, flex=1),
         )
-        err_lbl = toga.Label("", style=Pack(color='red', margin=4))
+        err_lbl = message_widget(toga, "", kind="error", min_height=48)
 
         def apply_helper(w=None):
             name = (name_in.value or "").strip()
             raw = (fields_in.value or "").strip()
             if not name or not raw:
-                err_lbl.text = "Name and fields are required."
+                set_message(err_lbl, "Name and fields are required.")
                 return
             fields = []
             try:
@@ -510,7 +510,7 @@ class MSF(toga.Document):
                 )
                 self._close_helper_dialog()
             except Exception as e:
-                err_lbl.text = str(e)
+                set_message(err_lbl, str(e))
 
         box = toga.Box(style=Pack(direction='column', margin=10))
         box.add(toga.Label("Add object", style=Pack(font_weight='bold', margin_bottom=6)))
@@ -522,7 +522,7 @@ class MSF(toga.Document):
         row.add(toga.Button(
             "Cancel", on_press=lambda w: self._close_helper_dialog(), style=Pack(margin=4)))
         box.add(row)
-        win = toga.Window(title="Add object…", size=(480, 200))
+        win = toga.Window(title="Add object…", size=(480, 240))
         win.content = box
         self._helper_dialog = win
         win.show()
@@ -532,13 +532,13 @@ class MSF(toga.Document):
         obj_in = toga.TextInput(placeholder="object name", style=Pack(margin=4, flex=1))
         cols_in = toga.TextInput(
             placeholder="columns: title,body", style=Pack(margin=4, flex=1))
-        err_lbl = toga.Label("", style=Pack(color='red', margin=4))
+        err_lbl = message_widget(toga, "", kind="error", min_height=48)
 
         def apply_helper(w=None):
             object_name = (obj_in.value or "").strip()
             cols_raw = (cols_in.value or "").strip()
             if not object_name or not cols_raw:
-                err_lbl.text = "Object name and columns are required."
+                set_message(err_lbl, "Object name and columns are required.")
                 return
             try:
                 columns = [c.strip() for c in cols_raw.split(",") if c.strip()]
@@ -552,7 +552,7 @@ class MSF(toga.Document):
                 )
                 self._close_helper_dialog()
             except Exception as e:
-                err_lbl.text = str(e)
+                set_message(err_lbl, str(e))
 
         box = toga.Box(style=Pack(direction='column', margin=10))
         box.add(toga.Label("Add list view", style=Pack(font_weight='bold', margin_bottom=6)))
@@ -564,7 +564,7 @@ class MSF(toga.Document):
         row.add(toga.Button(
             "Cancel", on_press=lambda w: self._close_helper_dialog(), style=Pack(margin=4)))
         box.add(row)
-        win = toga.Window(title="Add list view…", size=(420, 180))
+        win = toga.Window(title="Add list view…", size=(420, 220))
         win.content = box
         self._helper_dialog = win
         win.show()
@@ -580,14 +580,14 @@ class MSF(toga.Document):
             placeholder="rule (e.g. required or owner_only_update)",
             style=Pack(margin=4, flex=1),
         )
-        err_lbl = toga.Label("", style=Pack(color='red', margin=4))
+        err_lbl = message_widget(toga, "", kind="error", min_height=48)
 
         def apply_helper(w=None):
             object_name = (obj_in.value or "").strip()
             field = (field_in.value or "").strip() or None
             rule = (rule_in.value or "").strip()
             if not object_name or not rule:
-                err_lbl.text = "Object name and rule are required."
+                set_message(err_lbl, "Object name and rule are required.")
                 return
             try:
                 # Allow simple JSON object rules like {"enum":["a","b"]}
@@ -607,7 +607,7 @@ class MSF(toga.Document):
                 )
                 self._close_helper_dialog()
             except Exception as e:
-                err_lbl.text = str(e)
+                set_message(err_lbl, str(e))
 
         box = toga.Box(style=Pack(direction='column', margin=10))
         box.add(toga.Label("Add rule", style=Pack(font_weight='bold', margin_bottom=6)))
@@ -620,7 +620,7 @@ class MSF(toga.Document):
         row.add(toga.Button(
             "Cancel", on_press=lambda w: self._close_helper_dialog(), style=Pack(margin=4)))
         box.add(row)
-        win = toga.Window(title="Add rule…", size=(420, 220))
+        win = toga.Window(title="Add rule…", size=(420, 260))
         win.content = box
         self._helper_dialog = win
         win.show()
@@ -702,7 +702,9 @@ class MSF(toga.Document):
                 body.value = about.get('body', '')
                 box.add(body)
             except Exception as e:
-                box.add(toga.Label(f"Error parsing about info: {e}"))
+                box.add(message_widget(
+                    toga, f"Error parsing about info: {e}", kind="error", min_height=48,
+                ))
         else:
             box.add(toga.Label("This MSF file has no manifest data or entry point."))
             

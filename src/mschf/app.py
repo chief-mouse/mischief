@@ -14,6 +14,7 @@ from mschf.gen_cert import generate_selfsigned_cert, x509, NameOID, default_back
 from mschf.msf import MSF
 from mschf.identity import Identity
 from mschf.paths import host_root
+from mschf.widgets import message_widget, set_message, truncate_for_label
 
 # Writable host data root for CA/identities/settings/logs. In briefcase dev
 # this is the source checkout (same as the old module-location PROJ_DIR);
@@ -186,14 +187,19 @@ class Mschf(toga.App):
                 with open(path, 'rb') as f:
                     header = f.read(16)
                 if not header.startswith(b"SQLite format 3\x00"):
-                    self.label.text = f"Error: {os.path.basename(str(path))} is not a valid SQLite database (legacy SHELF-1 container)"
+                    self.label.text = truncate_for_label(
+                        f"Error: {os.path.basename(str(path))} is not a valid "
+                        "SQLite database (legacy SHELF-1 container)"
+                    )
                     return
 
                 # 2. Open via Toga documents API
                 self.documents.open(path)
-                self.label.text = f"Opened: {os.path.basename(str(path))}"
+                self.label.text = truncate_for_label(
+                    f"Opened: {os.path.basename(str(path))}"
+                )
         except Exception as e:
-            self.label.text = f"Error: {e}"
+            self.label.text = truncate_for_label(f"Error: {e}")
 
     def open_selected_app(self, widget, row=None, **kwargs):
         if not self.active_identity.is_valid:
@@ -208,21 +214,28 @@ class Mschf(toga.App):
             try:
                 # 1. Verify file exists
                 if not os.path.isfile(path):
-                    self.label.text = f"Error: File does not exist at {path}"
+                    self.label.text = truncate_for_label(
+                        f"Error: File does not exist at {path}"
+                    )
                     return
 
                 # 2. Verify file is a valid SQLite database before opening
                 with open(path, 'rb') as f:
                     header = f.read(16)
                 if not header.startswith(b"SQLite format 3\x00"):
-                    self.label.text = f"Error: {os.path.basename(path)} is not a valid SQLite database (legacy SHELF-1 container)"
+                    self.label.text = truncate_for_label(
+                        f"Error: {os.path.basename(path)} is not a valid "
+                        "SQLite database (legacy SHELF-1 container)"
+                    )
                     return
 
                 # 3. Open via Toga documents API
                 self.documents.open(path)
-                self.label.text = f"Opened: {os.path.basename(path)}"
+                self.label.text = truncate_for_label(
+                    f"Opened: {os.path.basename(path)}"
+                )
             except Exception as e:
-                self.label.text = f"Error opening {path}: {e}"
+                self.label.text = truncate_for_label(f"Error opening {path}: {e}")
         else:
             self.label.text = "Please select an app from the workspace list below."
 
@@ -368,16 +381,18 @@ class Mschf(toga.App):
                 if getattr(self, '_admin_passphrase_is_default', True)
                 else "your MSCHF_ADMIN_PASSPHRASE passphrase"
             )
-            self.onboarding_label.text = (
+            set_message(
+                self.onboarding_label,
                 "Welcome to Mischief. Sign in below to unlock the workspace —\n"
-                f"this machine's built-in identity is 'admin', with {pw_hint}."
+                f"this machine's built-in identity is 'admin', with {pw_hint}.",
             )
         elif app_count == 0:
-            self.onboarding_label.text = (
+            set_message(
+                self.onboarding_label,
                 "You're signed in, but no micro-apps (.msf) were found.\n"
                 f"Workspace folder: {self.data_dir}\n"
                 "Create the starter app to see the platform in action, or use Browse MSF "
-                "to open an existing container."
+                "to open an existing container.",
             )
         self._recompose_layout()
 
@@ -432,7 +447,7 @@ class Mschf(toga.App):
             self.label.text = "Starter app already exists — double-click it in the list to open it."
         except Exception as e:
             log.error(f"Failed to create starter app: {e}", exc_info=True)
-            self.label.text = f"Could not create starter app: {e}"
+            self.label.text = truncate_for_label(f"Could not create starter app: {e}")
         self.refresh_workspace()
 
     def _workspace_msf_paths(self):
@@ -469,7 +484,7 @@ class Mschf(toga.App):
 
         template_paths = self._workspace_msf_paths()
         if not template_paths:
-            self.label.text = (
+            self.label.text = truncate_for_label(
                 "No template apps found. Create the starter app first, or Browse "
                 "an existing .msf into the workspace."
             )
@@ -495,7 +510,8 @@ class Mschf(toga.App):
             style=Pack(flex=1, margin=5),
         )
 
-        status = toga.Label("", style=Pack(margin=5, font_size=10, color="#666666"))
+        # Wrapping message area — long TemplateError refusals must not blow the dialog.
+        status = message_widget(toga, "", kind="error", min_height=72)
 
         def close_dialog(widget=None):
             win = getattr(self, '_new_app_window', None)
@@ -509,11 +525,11 @@ class Mschf(toga.App):
         def on_create(widget=None):
             app_name = (name_input.value or "").strip()
             if not app_name:
-                status.text = "Enter an app name."
+                set_message(status, "Enter an app name.")
                 return
             choice = template_select.value
             if not choice or choice not in path_by_name:
-                status.text = "Select a template from the list."
+                set_message(status, "Select a template from the list.")
                 return
             template_path = path_by_name[choice]
 
@@ -528,22 +544,24 @@ class Mschf(toga.App):
                     ca_cert_path=self.ca_cert_path,
                 )
             except FileExistsError:
-                status.text = f"Already exists: {os.path.basename(dest)}"
-                self.label.text = f"Could not create app — {os.path.basename(dest)} already exists."
+                set_message(status, f"Already exists: {os.path.basename(dest)}")
+                self.label.text = truncate_for_label(
+                    f"Could not create app — {os.path.basename(dest)} already exists."
+                )
                 return
             except TemplateError as e:
                 log.warning("New App refused: %s", e)
-                status.text = str(e).split("\n", 1)[0]
-                self.label.text = f"Could not create app: {e}".split("\n", 1)[0]
+                set_message(status, str(e))
+                self.label.text = truncate_for_label(f"Could not create app: {e}")
                 return
             except Exception as e:
                 log.error("New App failed: %s", e, exc_info=True)
-                status.text = str(e)
-                self.label.text = f"Could not create app: {e}"
+                set_message(status, str(e))
+                self.label.text = truncate_for_label(f"Could not create app: {e}")
                 return
 
             close_dialog()
-            self.label.text = (
+            self.label.text = truncate_for_label(
                 f"Created '{summary['app_name']}' — opening "
                 f"{os.path.basename(summary['dest_path'])}."
             )
@@ -557,7 +575,7 @@ class Mschf(toga.App):
                 self.documents.open(summary["dest_path"])
             except Exception as open_err:
                 log.error("Opened workspace but failed to open new app: %s", open_err, exc_info=True)
-                self.label.text = (
+                self.label.text = truncate_for_label(
                     f"Created {os.path.basename(summary['dest_path'])} but could not open it: "
                     f"{open_err}"
                 )
@@ -580,7 +598,7 @@ class Mschf(toga.App):
             ],
             style=Pack(direction=COLUMN, margin=10),
         )
-        win = toga.Window(title="New App…", size=(420, 280), on_close=lambda w: close_dialog())
+        win = toga.Window(title="New App…", size=(420, 340), on_close=lambda w: close_dialog())
         win.content = form
         self._new_app_window = win
         win.show()
@@ -750,8 +768,9 @@ class Mschf(toga.App):
 
         # First-run onboarding banner: contextual next-step guidance, populated
         # by _update_onboarding(). The starter button is composed in only when
-        # actionable (signed in + empty workspace).
-        self.onboarding_label = toga.Label("", style=Pack(margin=8, font_size=10))
+        # actionable (signed in + empty workspace). Multi-sentence copy wraps
+        # via message_widget so long workspace paths don't blow layout.
+        self.onboarding_label = message_widget(toga, "", kind="info", min_height=72)
         self.btn_create_starter = toga.Button(
             'Create Starter App', on_press=self.create_starter_app,
             style=Pack(margin=8, margin_top=0), enabled=is_valid,
