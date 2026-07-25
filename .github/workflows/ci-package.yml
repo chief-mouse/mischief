@@ -62,6 +62,9 @@ jobs:
       - name: Container binding (container_uid / payload v3)
         run: python test_container_binding.py
 
+      - name: schema_spec compiler + engine-enforced rules
+        run: python test_schemaspec.py
+
       # Intentionally omitted (import/instantiate toga — not headless-safe on CI):
       #   test_declarative.py, verify_microapp.py
 
