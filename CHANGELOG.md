@@ -11,6 +11,25 @@ entry here.
 
 ## [Unreleased]
 
+### Added
+
+- **`schema_spec` — objects, fields, and validation rules as signed data**
+  (`mschf.schemaspec`): a versioned JSON manifest entry describing an app's
+  tables, fields (`text`/`integer`/`real`), and rules (`required`, `unique`,
+  `enum`, `immutable_after_create`, `reference`, object-level
+  `owner_only_update`), compiled deterministically into the signed DDL train
+  the platform previously required hand-authoring: CREATE TABLE with
+  canonical audit columns, `current_signer()` attribution/immutability
+  triggers, rule enforcement as CHECK/UNIQUE-index/BEFORE-triggers (engine-
+  enforced — a crafted signed write is refused the same as a form submit),
+  and per-object RBAC seed rows. Evolution is additive-only in v1 (new
+  objects, ADD COLUMN, new trigger-form rules); anything needing a table
+  rebuild is refused atomically with a clear error and an untouched chain
+  head. `owner_only_update` is strictly-owner (no admin bypass — documented
+  limitation pending role-mirror machinery). Foundation for the no-code
+  authoring track. Implemented by the grok agent; reviewed and independently
+  re-tested by Claude.
+
 ### Changed
 
 - **The starter app is now declarative — first-run UX is fully pickle-free**:
