@@ -255,10 +255,12 @@ def execute_micro_app(code_func, workspace_path, db=None, current_user_cn=None, 
         try:
             return code_func(toga, host_api)
         except Exception as e:
-            # Fallback error UI
-            box = toga.Box(style=toga.style.Pack(direction='column', padding=10))
-            box.add(toga.Label("Error executing micro-app:", style=toga.style.Pack(color='red')))
-            box.add(toga.Label(str(e)))
+            # Fallback error UI (label factory: long exception text wraps)
+            from mschf.widgets import label as ui_label
+            Pack = toga.style.Pack
+            box = toga.Box(style=Pack(direction='column', padding=10))
+            box.add(ui_label(toga, "Error executing micro-app:", style=Pack(color='red')))
+            box.add(ui_label(toga, str(e)))
             return box
             
     raise ValueError("The stored code is not a callable function.")

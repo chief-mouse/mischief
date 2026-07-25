@@ -32,6 +32,9 @@ jobs:
       - name: Version sources agree (semver discipline)
         run: python -c "import sys, toml; sys.path.insert(0, 'src'); import mschf; pv = toml.load('pyproject.toml')['tool']['briefcase']['version']; print('code:', mschf.__version__, '| pyproject:', pv); assert mschf.__version__ == pv, 'version mismatch'"
 
+      - name: Label factory gate
+        run: python scripts/check_label_gate.py
+
       - name: RBAC & signature verification
         run: python test_rbac.py
 

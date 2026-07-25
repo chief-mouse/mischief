@@ -55,13 +55,17 @@ def main_app(toga, host_api):
         except Exception:
             can_read = False
 
+    from mschf.widgets import label as ui_label
+
     if not can_read:
         denied = toga.Box(style=P(direction="column", margin=20))
-        denied.add(toga.Label(
+        denied.add(ui_label(
+            toga,
             "ACCESS DENIED",
             style=P(font_size=20, font_weight="bold", color="red", margin_bottom=10),
         ))
-        denied.add(toga.Label(
+        denied.add(ui_label(
+            toga,
             f"Identity cert:CN={cn} has no database-level read permission "
             "on the Identity Directory.",
             style=P(),
@@ -69,11 +73,13 @@ def main_app(toga, host_api):
         return denied
 
     board = toga.Box(id="directory_board", style=P(direction="column", margin=16, flex=1))
-    board.add(toga.Label(
+    board.add(ui_label(
+        toga,
         "Identity Directory",
         style=P(font_size=20, font_weight="bold", margin_bottom=2),
     ))
-    board.add(toga.Label(
+    board.add(ui_label(
+        toga,
         f"Signed in as {cn} — public certificates for org role grants.",
         style=P(font_style="italic", font_size=10, color="#666666", margin_bottom=10),
     ))
@@ -85,7 +91,9 @@ def main_app(toga, host_api):
         style=P(flex=1, margin_bottom=8),
     )
     board.add(table)
-    status_label = toga.Label("Ready.", style=P(font_size=10, font_style="italic", margin_top=4))
+    status_label = ui_label(
+        toga, "Ready.", style=P(font_size=10, font_style="italic", margin_top=4)
+    )
     board.add(status_label)
 
     def refresh(widget=None):

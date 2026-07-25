@@ -27,6 +27,13 @@ class _MultilineTextInput:
         self.kwargs = kwargs
 
 
+class _Label:
+    def __init__(self, text="", style=None, **kwargs):
+        self.text = text
+        self.style = style
+        self.kwargs = kwargs
+
+
 class _Box:
     def __init__(self, *args, style=None, children=None, **kwargs):
         self.style = style
@@ -51,6 +58,7 @@ def _make_stub_toga():
     return SimpleNamespace(
         MultilineTextInput=_MultilineTextInput,
         Box=_Box,
+        Label=_Label,
         style=_StyleMod,
         __name__="fake_toga_for_test_widgets",
     )
@@ -228,6 +236,66 @@ def test_truncate_for_label():
     print("  [OK] truncate_for_label single-line + ellipsis, never newlines")
 
 
+def test_label_factory_decision_rule():
+    """short → Label; long/newline → wrapping Box; force_single_line truncates."""
+    from mschf.widgets import label, truncate_for_label
+
+    toga = _make_stub_toga()
+
+    short = label(toga, "Hello")
+    assert isinstance(short, _Label), type(short)
+    assert short.text == "Hello"
+
+    exactly_80 = "x" * 80
+    w80 = label(toga, exactly_80)
+    assert isinstance(w80, _Label)
+    assert w80.text == exactly_80
+
+    long = "y" * 81
+    wrapped = label(toga, long)
+    assert isinstance(wrapped, _Box), type(wrapped)
+    assert not isinstance(wrapped, _Label)
+    inp = _inner(wrapped)
+    assert inp is not None and isinstance(inp, _MultilineTextInput)
+    assert inp.readonly is True
+    assert inp.value == long
+    # Content wrap: no error/warning tint
+    color = getattr(inp.style, "color", None) or (
+        inp.style.kwargs.get("color") if hasattr(inp.style, "kwargs") else None
+    )
+    assert color is None
+
+    with_nl = label(toga, "line one\nline two")
+    assert isinstance(with_nl, _Box)
+    assert _inner(with_nl).value == "line one\nline two"
+
+    # force_single_line always Label + truncate
+    forced = label(toga, "a" * 200, force_single_line=True)
+    assert isinstance(forced, _Label)
+    assert forced.text == truncate_for_label("a" * 200)
+    assert forced.text.endswith("…")
+
+    forced_nl = label(toga, "one\ntwo\nthree", force_single_line=True)
+    assert isinstance(forced_nl, _Label)
+    assert "\n" not in forced_nl.text
+    print("  [OK] label() decision rule (short/long/newline/force_single_line)")
+
+
+def test_label_style_passthrough():
+    from mschf.widgets import label
+
+    toga = _make_stub_toga()
+    style = _Pack(margin=8, font_weight="bold", font_size=14)
+
+    short = label(toga, "caption", style=style)
+    assert short.style is style
+
+    long = label(toga, "z" * 100, style=style)
+    assert isinstance(long, _Box)
+    assert long.style is style
+    print("  [OK] label() style passthrough (Label + wrapping)")
+
+
 def main():
     print("=== test_widgets ===")
     test_import_without_toga()
@@ -237,6 +305,8 @@ def main():
     test_set_message_expand_collapse_roundtrip()
     test_set_message_updates_value()
     test_truncate_for_label()
+    test_label_factory_decision_rule()
+    test_label_style_passthrough()
 
     assert "toga" not in sys.modules, (
         "test_widgets must stay headless — real toga was imported"

@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import json
 
+from mschf import widgets as mschf_widgets
+
 # Security invariant: this module must never import exec/eval/dill (asserted
 # by test_declarative.py). Only stdlib + the caller's toga module + host_api.
 # toga is deliberately NOT imported at module level: mode resolution and spec
 # validation must stay usable from headless (toga-less) code and CI; widget
 # construction reaches everything through the ``toga`` argument.
+# mschf.widgets is toga-free at import time — pass ``toga`` through.
 
 
 class DeclarativeSpecError(Exception):
@@ -383,7 +386,11 @@ class _RenderContext:
             style_kw["margin"] = node["margin"]
         if "flex" in node:
             style_kw["flex"] = node["flex"]
-        return self.toga.Label(str(text), style=self.Pack(**style_kw) if style_kw else self.Pack())
+        return mschf_widgets.label(
+            self.toga,
+            str(text),
+            style=self.Pack(**style_kw) if style_kw else self.Pack(),
+        )
 
     def _resolve_text_from(self, text_from, path):
         if not isinstance(text_from, dict):
@@ -480,7 +487,10 @@ class _RenderContext:
             style_kw["margin"] = node["margin"]
         if "font_size" in node:
             style_kw["font_size"] = node["font_size"]
-        label = self.toga.Label("", style=self.Pack(**style_kw))
+        # Empty → real Label (≤80, no newline); status updates assign .text.
+        label = mschf_widgets.label(
+            self.toga, "", style=self.Pack(**style_kw)
+        )
         self.status[tid] = label
         return label
 

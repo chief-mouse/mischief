@@ -517,6 +517,89 @@ def test_replay_audit(db):
     print("  [OK] ledger fully explains the container")
 
 
+def test_label_factory_routing():
+    """Long label nodes wrap; short labels stay real Labels (stub-toga types)."""
+    print("--- 6b. label nodes route through widgets.label factory ---")
+    from types import SimpleNamespace
+
+    class _Pack:
+        def __init__(self, **kwargs):
+            self.kwargs = dict(kwargs)
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class _Label:
+        def __init__(self, text="", style=None, **kwargs):
+            self.text = text
+            self.style = style
+
+    class _MultilineTextInput:
+        def __init__(self, *args, readonly=False, value="", style=None, **kwargs):
+            self.readonly = readonly
+            self.value = value
+            self.style = style
+
+    class _Box:
+        def __init__(self, *args, style=None, children=None, **kwargs):
+            self.style = style
+            self.children = list(children) if children else []
+
+        def add(self, child):
+            self.children.append(child)
+
+    class _StyleMod:
+        Pack = _Pack
+
+    stub_toga = SimpleNamespace(
+        Label=_Label,
+        Box=_Box,
+        MultilineTextInput=_MultilineTextInput,
+        Table=lambda **kw: SimpleNamespace(**kw, data=[]),
+        TextInput=lambda **kw: SimpleNamespace(value="", **kw),
+        Button=lambda *a, **kw: SimpleNamespace(text=a[0] if a else "", **kw),
+        style=_StyleMod,
+        __name__="fake_toga_for_decl_label",
+    )
+
+    class _Host:
+        def get_current_user(self):
+            return {"common_name": "stub", "certificate_pem": "PEM"}
+
+        def has_database_permission(self, *a, **k):
+            return True
+
+        def execute_signed_query(self, *a, **k):
+            class C:
+                def fetchall(self_inner):
+                    return []
+
+            return C()
+
+    host = _Host()
+    short_text = "Short title"
+    long_text = "Orientation prose that would stretch the WinForms window " + ("x" * 40)
+    assert len(long_text) > 80
+
+    short_w = render_declarative(
+        {"type": "label", "text": short_text, "font_size": 18, "bold": True},
+        stub_toga,
+        host,
+    )
+    assert isinstance(short_w, _Label), type(short_w)
+    assert short_w.text == short_text
+
+    long_w = render_declarative(
+        {"type": "label", "text": long_text},
+        stub_toga,
+        host,
+    )
+    assert isinstance(long_w, _Box), type(long_w)
+    assert not isinstance(long_w, _Label)
+    inners = [c for c in long_w.children if isinstance(c, _MultilineTextInput)]
+    assert inners and inners[0].value == long_text and inners[0].readonly
+    print("  [OK] short → Label; >80-char → wrapping Box + MultilineTextInput")
+
+
 def test_no_dangerous_imports():
     print("--- 6. declarative.py has no exec/eval/dill usage ---")
     path = os.path.join("src", "mschf", "declarative.py")
@@ -578,6 +661,7 @@ def run():
         test_viewer_rbac_denial(db, viewer_cert)
         test_lockout(db, guest_cert)
         test_malformed_specs(db, admin_cert)
+        test_label_factory_routing()
         test_loader_mode_resolution(db)
         test_manifest_signature_status(db)
         test_headless_import()

@@ -19,7 +19,7 @@ from mschf.syncstate import (
     _sync_subscriber_main,
 )
 from mschf import editor as mschf_editor
-from mschf.widgets import message_widget, set_message
+from mschf.widgets import label as ui_label, message_widget, set_message
 
 
 class MSF(toga.Document):
@@ -228,11 +228,11 @@ class MSF(toga.Document):
             else "🚨 CRYPTO WARNING: UNVERIFIED OR TAMPERED"
         )
         header_box = toga.Box(style=Pack(direction='row', margin=10))
-        header_box.add(toga.Label(status_text, style=Pack(font_weight='bold', margin_right=15)))
-        header_box.add(toga.Label(f"Signer CN: {status['signer']}", style=Pack(margin_right=15)))
-        header_box.add(toga.Label(f"Method: {status['method']}", style=Pack(font_size=9)))
+        header_box.add(ui_label(toga, status_text, style=Pack(font_weight='bold', margin_right=15)))
+        header_box.add(ui_label(toga, f"Signer CN: {status['signer']}", style=Pack(margin_right=15)))
+        header_box.add(ui_label(toga, f"Method: {status['method']}", style=Pack(font_size=9)))
         if source_text:
-            header_box.add(toga.Label(source_text, style=Pack(font_size=9, margin_left=15)))
+            header_box.add(ui_label(toga, source_text, style=Pack(font_size=9, margin_left=15)))
         return header_box
 
     def _can_show_edit_app(self) -> bool:
@@ -277,7 +277,8 @@ class MSF(toga.Document):
         # Homed containers: second, smaller sync-status line (local facts only).
         sync_text = self._sync_status_text()
         if sync_text:
-            wrapper_box.add(toga.Label(
+            wrapper_box.add(ui_label(
+                toga,
                 sync_text,
                 style=Pack(font_size=9, color='#555555', margin_left=10, margin_bottom=4),
             ))
@@ -290,10 +291,12 @@ class MSF(toga.Document):
         """A present-but-broken ui_spec is a hard error view — never a silent
         fallback to executing pickled code."""
         box = toga.Box(style=Pack(direction='column', margin=20))
-        box.add(toga.Label(
+        box.add(ui_label(
+            toga,
             "🚨 DECLARATIVE UI ERROR",
             style=Pack(font_size=20, font_weight='bold', margin_bottom=10, color='red')))
-        box.add(toga.Label(
+        box.add(ui_label(
+            toga,
             "This container's ui_spec manifest entry could not be rendered:",
             style=Pack(margin_bottom=8)))
         box.add(message_widget(toga, str(error), kind="error", min_height=120))
@@ -365,20 +368,21 @@ class MSF(toga.Document):
         texts = mschf_editor.load_spec_texts(self.db)
 
         root = toga.Box(style=Pack(direction='column', margin=8, flex=1))
-        root.add(toga.Label(
+        root.add(ui_label(
+            toga,
             "Edit App — ui_spec / schema_spec (signed on Save)",
             style=Pack(font_size=14, font_weight='bold', margin_bottom=6),
         ))
 
         # --- ui_spec ---
-        root.add(toga.Label("ui_spec", style=Pack(font_weight='bold', margin_top=4)))
+        root.add(ui_label(toga, "ui_spec", style=Pack(font_weight='bold', margin_top=4)))
         ui_input = toga.MultilineTextInput(style=Pack(flex=1, margin=4))
         ui_input.value = texts.get("ui_spec") or ""
         self._editor_ui_input = ui_input
         root.add(ui_input)
 
         # --- schema_spec ---
-        root.add(toga.Label("schema_spec", style=Pack(font_weight='bold', margin_top=4)))
+        root.add(ui_label(toga, "schema_spec", style=Pack(font_weight='bold', margin_top=4)))
         schema_input = toga.MultilineTextInput(style=Pack(flex=1, margin=4))
         schema_input.value = texts.get("schema_spec") or ""
         self._editor_schema_input = schema_input
@@ -513,7 +517,7 @@ class MSF(toga.Document):
                 set_message(err_lbl, str(e))
 
         box = toga.Box(style=Pack(direction='column', margin=10))
-        box.add(toga.Label("Add object", style=Pack(font_weight='bold', margin_bottom=6)))
+        box.add(ui_label(toga, "Add object", style=Pack(font_weight='bold', margin_bottom=6)))
         box.add(name_in)
         box.add(fields_in)
         box.add(err_lbl)
@@ -555,7 +559,7 @@ class MSF(toga.Document):
                 set_message(err_lbl, str(e))
 
         box = toga.Box(style=Pack(direction='column', margin=10))
-        box.add(toga.Label("Add list view", style=Pack(font_weight='bold', margin_bottom=6)))
+        box.add(ui_label(toga, "Add list view", style=Pack(font_weight='bold', margin_bottom=6)))
         box.add(obj_in)
         box.add(cols_in)
         box.add(err_lbl)
@@ -610,7 +614,7 @@ class MSF(toga.Document):
                 set_message(err_lbl, str(e))
 
         box = toga.Box(style=Pack(direction='column', margin=10))
-        box.add(toga.Label("Add rule", style=Pack(font_weight='bold', margin_bottom=6)))
+        box.add(ui_label(toga, "Add rule", style=Pack(font_weight='bold', margin_bottom=6)))
         box.add(obj_in)
         box.add(field_in)
         box.add(rule_in)
@@ -656,10 +660,21 @@ class MSF(toga.Document):
                 identity = self.db._get_identity(user_cert_pem)
                 if not self.db.check_permission(identity, 'database', '*', 'read'):
                     box = toga.Box(style=Pack(direction='column', margin=20))
-                    box.add(toga.Label("🚨 ACCESS DENIED", style=Pack(font_size=28, font_weight='bold', margin_bottom=15, color='red')))
-                    box.add(toga.Label(f"Active Identity: {user_cn} ({identity})", style=Pack(font_size=14, margin_bottom=10)))
-                    box.add(toga.Label("This identity does not have database-level permissions ('No Access' active).", style=Pack(font_size=12, margin_bottom=20)))
-                    box.add(toga.Label("The micro-app interface has been completely blocked for security.", style=Pack(font_style='italic', color='gray')))
+                    box.add(ui_label(
+                        toga, "🚨 ACCESS DENIED",
+                        style=Pack(font_size=28, font_weight='bold', margin_bottom=15, color='red')))
+                    box.add(ui_label(
+                        toga, f"Active Identity: {user_cn} ({identity})",
+                        style=Pack(font_size=14, margin_bottom=10)))
+                    box.add(ui_label(
+                        toga,
+                        "This identity does not have database-level permissions "
+                        "('No Access' active).",
+                        style=Pack(font_size=12, margin_bottom=20)))
+                    box.add(ui_label(
+                        toga,
+                        "The micro-app interface has been completely blocked for security.",
+                        style=Pack(font_style='italic', color='gray')))
                     self._set_document_content(box)
                     return
 
@@ -683,20 +698,23 @@ class MSF(toga.Document):
         about_data = self.db.get_manifest_item('about')
         
         box = toga.Box(style=Pack(direction='column', margin=20))
-        title_lbl = toga.Label("MSF Micro-App", style=Pack(font_size=24, margin_bottom=10))
+        title_lbl = ui_label(toga, "MSF Micro-App", style=Pack(font_size=24, margin_bottom=10))
         box.add(title_lbl)
 
         # Sync status for about view too (homed containers with no entry point).
         sync_text = self._sync_status_text()
         if sync_text:
-            box.add(toga.Label(sync_text, style=Pack(font_size=9, color='#555555', margin_bottom=8)))
+            box.add(ui_label(
+                toga, sync_text,
+                style=Pack(font_size=9, color='#555555', margin_bottom=8),
+            ))
         
         if about_data:
             try:
                 about = json.loads(about_data)
-                box.add(toga.Label(f"Title: {about.get('title', 'Unknown')}"))
-                box.add(toga.Label(f"UUID: {about.get('uuid', 'Unknown')}"))
-                box.add(toga.Label(f"Created At: {about.get('created_at', 'Unknown')}"))
+                box.add(ui_label(toga, f"Title: {about.get('title', 'Unknown')}"))
+                box.add(ui_label(toga, f"UUID: {about.get('uuid', 'Unknown')}"))
+                box.add(ui_label(toga, f"Created At: {about.get('created_at', 'Unknown')}"))
                 
                 body = toga.MultilineTextInput(readonly=True, style=Pack(flex=1, margin_top=10))
                 body.value = about.get('body', '')
@@ -706,7 +724,9 @@ class MSF(toga.Document):
                     toga, f"Error parsing about info: {e}", kind="error", min_height=48,
                 ))
         else:
-            box.add(toga.Label("This MSF file has no manifest data or entry point."))
+            box.add(ui_label(
+                toga, "This MSF file has no manifest data or entry point.",
+            ))
             
         self._set_document_content(box)
 

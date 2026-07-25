@@ -11,6 +11,9 @@ import importlib
 # Private marker stashed on the container returned by message_widget.
 _MSG_META = "_mschf_message_meta"
 
+# Single-line Label ceiling for :func:`label` (chars, inclusive).
+_LABEL_SINGLE_LINE_MAX = 80
+
 
 def _pack_cls(toga):
     """Resolve ``Pack`` from a passed-in toga module (lazy style submodule)."""
@@ -35,6 +38,18 @@ def _input_style_kw(kind, height):
         style_kw["background_color"] = "#fffbeb"
     # else info / default: no tint
     return style_kw
+
+
+def _make_readonly_input(toga, text, *, height, kind=None):
+    """Shared inner read-only MultilineTextInput (no tint when kind is None/info)."""
+    Pack = _pack_cls(toga)
+    style_kw = _input_style_kw(kind if kind else "info", height)
+    inp = toga.MultilineTextInput(
+        readonly=True,
+        style=Pack(**style_kw),
+    )
+    inp.value = "" if text is None else str(text)
+    return inp
 
 
 def _collapse_container(container):
@@ -75,6 +90,28 @@ def _remove_child(container, child):
         container.clear()
     except Exception:
         pass
+
+
+def _wrapping_content(toga, text, *, style=None, min_height=None):
+    """Wrapping read-only presentation for content labels (no tint, no collapse).
+
+    Shared with the message path via :func:`_make_readonly_input`. Caller's
+    *style* is applied to the outer Box (height-ish properties best-effort).
+    """
+    Pack = _pack_cls(toga)
+    height = int(min_height) if min_height is not None else 60
+    if style is None:
+        style = Pack(direction="column", flex=1)
+    else:
+        # Prefer a column so the input stacks; best-effort on foreign Packs.
+        try:
+            if getattr(style, "direction", None) in (None, ""):
+                style.direction = "column"
+        except Exception:
+            pass
+    container = toga.Box(style=style)
+    container.add(_make_readonly_input(toga, text, height=height, kind=None))
+    return container
 
 
 def message_widget(toga, text, *, kind="info", min_height=None):
@@ -131,7 +168,6 @@ def set_message(widget, text):
 
     text_s = "" if text is None else str(text)
     toga = meta["toga"]
-    Pack = _pack_cls(toga)
     kind = meta["kind"]
     height = meta["height"]
     inp = meta["input"]
@@ -143,15 +179,12 @@ def set_message(widget, text):
         _collapse_container(widget)
         return
 
-    style_kw = _input_style_kw(kind, height)
     if inp is None:
-        inp = toga.MultilineTextInput(
-            readonly=True,
-            style=Pack(**style_kw),
-        )
+        inp = _make_readonly_input(toga, text_s, height=height, kind=kind)
         meta["input"] = inp
         widget.add(inp)
-    inp.value = text_s
+    else:
+        inp.value = text_s
     _expand_container(widget)
 
 
@@ -178,3 +211,35 @@ def truncate_for_label(text, max_chars=120):
     if n == 1:
         return "…"
     return s[: n - 1] + "…"
+
+
+def label(toga, text, *, style=None, force_single_line=False):
+    """THE way to make a text label anywhere in this codebase.
+
+    Decision rule:
+
+    - ``force_single_line=True`` → real ``toga.Label`` with
+      :func:`truncate_for_label` applied to *text*.
+    - else text ≤ 80 chars AND no newline → real ``toga.Label`` verbatim.
+    - else → wrapping read-only presentation (no tint, no collapse — content,
+      not a message). Built via the shared private helper used by
+      :func:`message_widget`'s input path.
+
+    *style* passes through to whichever widget is built (callers keep their
+    Pack styling). Height-ish properties apply best-effort on the wrapping
+    variant. Returns the widget. ``toga`` is passed in so this stays
+    import-safe headless.
+    """
+    Pack = _pack_cls(toga)
+    text_s = "" if text is None else str(text)
+    if style is None:
+        style = Pack()
+
+    if force_single_line:
+        return toga.Label(truncate_for_label(text_s), style=style)
+
+    has_newline = ("\n" in text_s) or ("\r" in text_s)
+    if len(text_s) <= _LABEL_SINGLE_LINE_MAX and not has_newline:
+        return toga.Label(text_s, style=style)
+
+    return _wrapping_content(toga, text_s, style=style)

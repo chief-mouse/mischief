@@ -11,6 +11,7 @@ from mschf.plugins.auth.providers.password import PasswordAuthenticator
 from mschf.plugins.auth.providers.oauth import OAuth2Authenticator
 from mschf.plugins.auth.providers.passkey import PasskeyAuthenticator
 from mschf.plugins.auth.providers.oidc import OIDCAuthenticator
+from mschf.widgets import label as ui_label
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +45,8 @@ class AuthPlugin(BasePlugin):
         plugin_box = toga.Box(style=Pack(direction=COLUMN, margin_top=15, margin_bottom=10))
         
         # Section Title
-        plugin_box.add(toga.Label(
+        plugin_box.add(ui_label(
+            toga,
             "🔌 Plugin: Cryptographic Identity & Auth Gateways",
             style=Pack(font_size=12, font_weight="bold", margin_bottom=5, color="#1e3a8a")
         ))
@@ -78,13 +80,25 @@ class AuthPlugin(BasePlugin):
             else:
                 hint_text = ("Tip: this machine's built-in identity is 'admin' — default "
                              "passphrase 'changeit' (set MSCHF_ADMIN_PASSPHRASE to change it).")
-            input_hint = toga.Label(hint_text, style=Pack(margin_left=5, font_size=9, font_style="italic", color="#666666"))
+            # Hint can be long; factory wraps. Status/metadata keep .text updates.
+            input_hint = ui_label(
+                toga, hint_text,
+                style=Pack(margin_left=5, font_size=9, font_style="italic", color="#666666"),
+            )
         else:
             input_hint = None
 
-        # Labels for status and metadata display
-        status_label = toga.Label("Auth Status: Waiting for input.", style=Pack(margin=5, font_style="italic"))
-        metadata_label = toga.Label("Decoded Token / Crypto Properties: (None)", style=Pack(margin=5, font_size=9))
+        # Labels for status and metadata display (mutated via .text → real Labels)
+        status_label = ui_label(
+            toga, "Auth Status: Waiting for input.",
+            style=Pack(margin=5, font_style="italic"),
+            force_single_line=True,
+        )
+        metadata_label = ui_label(
+            toga, "Decoded Token / Crypto Properties: (None)",
+            style=Pack(margin=5, font_size=9),
+            force_single_line=True,
+        )
         
         async def on_authenticate(widget):
             # Capture the secret, then clear it from the widget immediately so it does
@@ -218,7 +232,10 @@ class AuthPlugin(BasePlugin):
         password_input.on_confirm = on_authenticate
         
         # Layout organization
-        plugin_box.add(toga.Label("Select Authentication Protocol:", style=Pack(margin_left=5, font_size=10)))
+        plugin_box.add(ui_label(
+            toga, "Select Authentication Protocol:",
+            style=Pack(margin_left=5, font_size=10),
+        ))
         plugin_box.add(provider_select)
         plugin_box.add(input_box)
         if input_hint is not None:

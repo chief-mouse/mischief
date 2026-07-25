@@ -14,7 +14,7 @@ from mschf.gen_cert import generate_selfsigned_cert, x509, NameOID, default_back
 from mschf.msf import MSF
 from mschf.identity import Identity
 from mschf.paths import host_root
-from mschf.widgets import message_widget, set_message, truncate_for_label
+from mschf.widgets import label as ui_label, message_widget, set_message, truncate_for_label
 
 # Writable host data root for CA/identities/settings/logs. In briefcase dev
 # this is the source checkout (same as the old module-location PROJ_DIR);
@@ -625,10 +625,10 @@ class Mschf(toga.App):
 
         form = toga.Box(
             children=[
-                toga.Label("New App from Template", style=Pack(margin=8, font_weight="bold")),
-                toga.Label("App name", style=Pack(margin_left=5, font_size=10)),
+                ui_label(toga, "New App from Template", style=Pack(margin=8, font_weight="bold")),
+                ui_label(toga, "App name", style=Pack(margin_left=5, font_size=10)),
                 name_input,
-                toga.Label("Template (.msf in workspace)", style=Pack(margin_left=5, font_size=10)),
+                ui_label(toga, "Template (.msf in workspace)", style=Pack(margin_left=5, font_size=10)),
                 template_select,
                 status,
                 toga.Box(
@@ -771,9 +771,14 @@ class Mschf(toga.App):
         self.plugin_manager.load_all()
 
         self.main_window = toga.MainWindow(title=self.formal_name, size=(760, 640))
-        self.label = toga.Label(status_text, style=Pack(margin=10))
+        # Status line: truncated on update via truncate_for_label — keep real Label.
+        self.label = ui_label(
+            toga, status_text, style=Pack(margin=10), force_single_line=True
+        )
 
-        self.identity_label = toga.Label(identity_text, style=Pack(margin=10, font_weight="bold"))
+        self.identity_label = ui_label(
+            toga, identity_text, style=Pack(margin=10, font_weight="bold")
+        )
 
         # Create Identity Management UI components
         is_valid = self.active_identity.is_valid
