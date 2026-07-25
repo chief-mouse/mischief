@@ -1,21 +1,33 @@
 """Starter-app authoring test (headless, CI-safe — no toga at runtime).
 
 create_starter_container() is what the GUI's first-run "Create Starter App"
-button calls. Verify the container it authors is a first-class citizen:
-manifest wired, code blob signed and verified, ledger fully explains the
-data (replay audit passes), attribution stamped by trigger from the signing
-identity, and raw out-of-band writes blocked by the trigger shield.
+button calls. Verify the container it authors is declarative (signed ui_spec,
+no dill/source_code), fully explained by the ledger, and that signed query
+actions used by the declarative path work through HostAPI.
 """
-import sys
+import json
 import os
+import sqlite3
+import sys
+
 sys.path.insert(0, os.path.abspath('src'))
 
-import sqlite3
-from mschf.storage import MSFStorage
-from mschf.identity import Identity
-from mschf.starter import create_starter_container, SEED_NOTES
-from mschf.audit import replay_audit, format_report
+from mschf.audit import format_report, replay_audit
+from mschf.declarative import (
+    DeclarativeSpecError,
+    resolve_ui_mode,
+    spec_from_manifest,
+)
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert
+from mschf.identity import Identity
+from mschf.sandbox import HostAPI
+from mschf.starter import (
+    SEED_NOTES,
+    STARTER_UI_SPEC,
+    _validate_starter_spec,
+    create_starter_container,
+)
+from mschf.storage import MSFStorage
 
 
 def run():
@@ -45,37 +57,138 @@ def run():
     identity = Identity.load('starter_admin.crt', ca_cert_path)
     assert identity.is_valid, "test identity must chain to the CA"
 
+    print("--- Spec validity (toga-free structural validation) ---")
+    _validate_starter_spec(STARTER_UI_SPEC)
+    print("  [OK] STARTER_UI_SPEC passes declarative collect_ids validation")
+
     print("--- Authoring starter container ---")
     create_starter_container(dest, identity, ca_cert_path)
 
     db = MSFStorage(dest, ca_cert_path=ca_cert_path)
 
-    assert db.get_manifest_item('entry_point') == 'main_app'
     assert db.get_manifest_item('name') == 'Getting Started'
-    print("  [OK] manifest wired")
+    assert db.get_manifest_item('entry_point') is None
+    assert db.get_manifest_item('ui_spec') is not None
+    print("  [OK] manifest wired (name + ui_spec; no entry_point)")
 
-    status = db.get_code_signature_status('main_app')
-    assert status['verified'], f"code signature not verified: {status['error']}"
-    assert status['signer'] == 'starter_admin'
-    print(f"  [OK] code blob signed and verified (signer={status['signer']})")
+    code_rows = db.conn.execute("SELECT COUNT(*) FROM source_code").fetchone()[0]
+    assert code_rows == 0, f"declarative starter must have zero source_code rows, got {code_rows}"
+    print("  [OK] no source_code / dill blobs")
 
-    code_func = db.get_code('main_app')
-    assert callable(code_func), "starter code must unpickle to a callable"
-    print("  [OK] code blob unpickles to a callable (by-value, no module dependency)")
+    mode, payload = resolve_ui_mode(db)
+    assert mode == 'declarative', f"expected declarative mode, got {mode!r}"
+    assert isinstance(payload, dict) and payload.get('type') == 'box'
+    print("  [OK] resolve_ui_mode picks declarative")
 
-    rows = db.conn.execute("SELECT body, created_by FROM notes ORDER BY id").fetchall()
+    spec = spec_from_manifest(db)
+    assert spec is not None
+    # Authored JSON round-trips to the same logical tree.
+    assert spec['type'] == STARTER_UI_SPEC['type']
+    assert any(
+        c.get('type') == 'table' and c.get('id') == 'notes_table'
+        for c in spec.get('children', [])
+    )
+    _validate_starter_spec(spec)
+    print("  [OK] ui_spec parses and validates (malformed authoring impossible)")
+
+    rows = db.conn.execute(
+        "SELECT body, created_by FROM notes ORDER BY id"
+    ).fetchall()
     assert [r[0] for r in rows] == SEED_NOTES
     assert all(r[1] == 'cert:CN=starter_admin' for r in rows), rows
     print(f"  [OK] {len(rows)} seed notes stamped by trigger from the signing identity")
 
-    cur = db.conn.execute("SELECT role FROM user_roles WHERE identity = 'cert:CN=starter_admin'")
+    cur = db.conn.execute(
+        "SELECT role FROM user_roles WHERE identity = 'cert:CN=starter_admin'"
+    )
     assert cur.fetchone()[0] == 'admin', "creator must be container admin via bootstrap"
     print("  [OK] creating identity bootstrapped as container admin")
+
+    print("--- Manifest signature status (ui_spec) ---")
+    status = db.get_manifest_signature_status('ui_spec')
+    assert status['verified'], f"ui_spec must verify: {status}"
+    assert status['signer'] == 'starter_admin', status
+    print(f"  [OK] ui_spec verified (signer={status['signer']})")
 
     print("--- Replay audit of the authored container ---")
     report = replay_audit(db)
     print(format_report(report))
     assert report['ok'], "starter container must be fully explained by its ledger"
+
+    print("--- Out-of-band ui_spec tamper ---")
+    original = db.get_manifest_item('ui_spec')
+    tampered = json.dumps({"type": "box", "children": [{"type": "label", "text": "evil"}]})
+    raw = sqlite3.connect(dest)
+    raw.execute(
+        "UPDATE manifest SET value = ? WHERE key = ?", (tampered, 'ui_spec')
+    )
+    raw.commit()
+    raw.close()
+
+    status = db.get_manifest_signature_status('ui_spec')
+    assert not status['verified'], f"tampered ui_spec must not verify: {status}"
+    print(f"  [OK] tamper flips signature status: {status.get('error') or status}")
+
+    report = replay_audit(db)
+    assert not report['ok'], "replay_audit must flag out-of-band ui_spec edit"
+    print("  [OK] replay_audit flags tampered container")
+
+    # Restore so HostAPI path exercises a clean container again.
+    raw = sqlite3.connect(dest)
+    raw.execute(
+        "UPDATE manifest SET value = ? WHERE key = ?", (original, 'ui_spec')
+    )
+    raw.commit()
+    raw.close()
+    assert db.get_manifest_signature_status('ui_spec')['verified']
+    report = replay_audit(db)
+    assert report['ok'], "restored container must audit clean again"
+
+    print("--- Declarative action path via HostAPI (unhomed) ---")
+    host = HostAPI(
+        workspace_path=os.path.abspath('.'),
+        db=db,
+        current_user_cn='starter_admin',
+        current_user_cert_pem=cert_pem,
+        key_path='starter_admin.key',
+        key_passphrase=None,
+    )
+
+    # Bound table query from the authored spec (SELECT-only).
+    table_sql = None
+    insert_sql = "INSERT INTO notes (body) VALUES (?)"
+    for child in STARTER_UI_SPEC['children']:
+        if child.get('type') == 'table' and child.get('id') == 'notes_table':
+            table_sql = child['query']['sql']
+            break
+        if child.get('type') == 'box':
+            for nested in child.get('children') or []:
+                action = nested.get('action') or {}
+                if action.get('kind') == 'exec':
+                    insert_sql = action['sql']
+    assert table_sql, "notes_table query missing from STARTER_UI_SPEC"
+
+    cursor = host.execute_signed_query(table_sql, [])
+    seeded = cursor.fetchall()
+    assert len(seeded) == len(SEED_NOTES), f"expected {len(SEED_NOTES)} notes, got {len(seeded)}"
+    bodies = [r[1] for r in seeded]
+    assert set(bodies) == set(SEED_NOTES)
+    print(f"  [OK] bound SELECT reads {len(seeded)} seed notes via HostAPI")
+
+    before_tx = db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    host.execute_signed_query(insert_sql, ["Headless note via declarative action SQL"])
+    after_tx = db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    assert after_tx == before_tx + 1, "INSERT must append a ledger row"
+
+    cursor = host.execute_signed_query(table_sql, [])
+    all_bodies = [r[1] for r in cursor.fetchall()]
+    assert "Headless note via declarative action SQL" in all_bodies
+    stamped = db.conn.execute(
+        "SELECT created_by FROM notes WHERE body = ?",
+        ["Headless note via declarative action SQL"],
+    ).fetchone()
+    assert stamped[0] == 'cert:CN=starter_admin', stamped
+    print("  [OK] parameterized INSERT succeeds and appends to the ledger")
 
     print("--- Trigger shield ---")
     raw = sqlite3.connect(dest)
@@ -90,6 +203,11 @@ def run():
     db.close()
     for f in (dest, 'starter_admin.crt', 'starter_admin.key'):
         os.remove(f)
+
+    assert 'toga' not in sys.modules, (
+        'test_starter must stay headless (CI runs without toga)'
+    )
+
     print("\n==========================================")
     print("ALL STARTER-APP TESTS PASSED")
     print("==========================================")

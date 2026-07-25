@@ -11,6 +11,21 @@ entry here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The starter app is now declarative — first-run UX is fully pickle-free**:
+  `create_starter_container` authors a signed `ui_spec` manifest entry
+  (welcome copy, notes table bound to a signed SELECT, parameterized
+  add-note action) instead of the dill-pickled `STARTER_SOURCE` code blob,
+  which is removed along with the exec-into-namespace step. Authoring is
+  signed end-to-end (bootstrap → trigger DDL → seed notes → `ui_spec`),
+  passes `replay_audit`, and verifies via `get_manifest_signature_status`.
+  Known parity gaps are declarative-vocabulary limits (multiline text,
+  client-side input validation, enter-to-submit, status templating) —
+  candidate vocabulary features for the no-code authoring track.
+  Implemented by the grok agent; reviewed and independently re-tested by
+  Claude.
+
 ## [0.8.0] - 2026-07-23
 
 ### Added
