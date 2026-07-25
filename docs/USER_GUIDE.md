@@ -7,12 +7,41 @@ Welcome to the **Mischief Micro-App Platform**. This guide covers how to write, 
 ## 1. What is a Mischief Micro-App?
 
 A `.msf` micro-app is a self-contained application bundle stored entirely inside a single SQLite database file. It contains:
-1. **Metadata:** Defined in the `manifest` table (version, title, description, entry-point).
-2. **Logic:** A pickled Python function stored in the `source_code` table.
-3. **Data:** Bespoke relational SQLite tables containing custom application records.
-4. **Permissions:** Custom RBAC configurations governing which users can read/write data or open specific views.
+1. **Metadata:** Defined in the `manifest` table (version, title, description, and the UI/schema specs below).
+2. **UI:** A signed declarative JSON widget tree in the manifest key `ui_spec` (preferred), or — legacy — a pickled Python function in the `source_code` table.
+3. **Schema:** Optionally a signed `schema_spec` manifest entry describing the app's objects, fields, and validation rules (compiled to engine-enforced tables/triggers — see §1.1).
+4. **Data:** Bespoke relational SQLite tables containing custom application records.
+5. **Permissions:** Custom RBAC configurations governing which users can read/write data or open specific views.
 
-When opened by the Mischief Toga host application, the host validates database signatures, extracts the logic, and runs it inside a sandboxed execution bridge.
+When opened by the Mischief Toga host application, the host validates database signatures and renders the declarative spec (or, for legacy containers, runs the pickled logic inside a sandboxed execution bridge).
+
+---
+
+## 1.1 Creating and Evolving Apps Without Code
+
+Since 0.9.0 you never need Python to create or change an app:
+
+- **New App…** (main window, requires an active identity): pick a name and a
+  template from your workspace. Templates are *recipes, not replicas* — the
+  host verifies the template's full audit trail, then authors a **fresh**
+  container: new identity chain, you as its sole admin, and the template's
+  schema, rules, permissions, and UI re-signed as your own transactions.
+  Nothing is inherited from the template's history — no ledger rows, no user
+  assignments, no hub homing, no data. Templates containing legacy pickled
+  code are refused.
+- **Edit App** (document window, admins only, not on hub-homed replicas):
+  edit the app's `ui_spec` and `schema_spec` as JSON with **Validate** before
+  **Save** — an invalid spec is never signed. Helpers scaffold the common
+  moves (add object, add list view, add validation rule) into the editor for
+  your review; every save is a signed ledger transaction, and the
+  verification banner tracks the specs' signatures.
+- **Validation rules** (`schema_spec`): `required`, `unique`, `enum`,
+  `immutable_after_create`, `reference`, and object-level
+  `owner_only_update`. These compile to database-engine constraints and
+  triggers, so they bind *every* write — including handcrafted signed
+  queries, not just the forms. Schema evolution is additive (new objects,
+  new fields, new rules); destructive changes are refused until rebuild
+  migrations ship.
 
 ---
 

@@ -206,7 +206,13 @@ Every `MSFStorage` connection registers a `current_signer()` SQL function that r
 
 ---
 
-## 5. Deploying and Modifying Micro-App Code
+## 5. Deploying and Modifying Micro-App Code (legacy pickled path)
+
+> **Prefer the declarative path.** Since 0.8.0 the loader renders a signed
+> `ui_spec` manifest entry in preference to pickled code, and since 0.9.0 the
+> platform's own apps ship declarative-only. The pickled path below remains
+> supported for existing containers, but new apps should use §6 — templates
+> refuse pickled code outright.
 
 Deploying micro-app code is restricted to administrators. The code is written as a pickled callable function using `dill`.
 
@@ -233,3 +239,69 @@ sig = private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
 db.store_code('main_app', my_custom_app, sig, admin_cert)
 print("✓ Successfully deployed updated micro-app code.")
 ```
+
+---
+
+## 6. No-Code Authoring Surfaces (0.9.0+)
+
+The programmatic equivalents of the GUI's **New App…** and **Edit App**, for
+scripted administration. All of them ride the standard signing path
+(`canonical_payload` against the live chain head) and leave a clean
+`replay_audit`.
+
+### 6.1 schema_spec — objects, fields, validation rules as signed data
+
+```python
+from mschf.schemaspec import apply_schema_spec, verify_schema_spec
+
+spec = {
+    "v": 1,
+    "objects": [{
+        "name": "expenses",
+        "fields": [
+            {"name": "title",  "type": "text", "rules": ["required"]},
+            {"name": "state",  "type": "text",
+             "rules": [{"enum": ["draft", "submitted", "approved"]}]},
+        ],
+        "object_rules": ["owner_only_update"],
+        "access": {"member": ["read", "write"]},
+    }],
+}
+apply_schema_spec(db, private_key, admin_cert_pem, spec)
+```
+
+The compiler emits, per object: a `CREATE TABLE` with canonical audit columns,
+`current_signer()` attribution + created-fields-immutability triggers, and the
+rules as CHECK constraints / UNIQUE indexes / FK references / `BEFORE` guard
+triggers. Rules are **engine-enforced**: a handcrafted signed query is refused
+exactly like a form submit. `owner_only_update` is strictly-owner in v1 (no
+admin bypass) and refuses unsigned writes. Re-applying with a changed spec
+performs **additive-only** evolution — new objects, `ADD COLUMN`, trigger-form
+rules on existing fields; anything requiring a table rebuild raises
+`SchemaSpecError` atomically (chain head untouched). `verify_schema_spec(db)`
+re-verifies the manifest entry's signature and CA trust.
+
+### 6.2 Template instantiation
+
+```python
+from mschf.template import create_from_template
+
+create_from_template("starter.msf", "team_expenses.msf",
+                     private_key, my_cert_pem, app_name="Team Expenses")
+```
+
+Fail-closed: the template must pass `replay_audit`, its specs must verify, and
+pickled `source_code` is refused. The destination is a fresh container (new
+`container_uid`, new genesis, creator bootstrapped as sole admin) with the
+template's schema/rules/roles/UI re-signed by the creator. Never lifted:
+ledger history, `user_roles`, `sync_hub_*` keys, data rows.
+
+### 6.3 Editor saves
+
+`mschf.editor` exposes the same validate-before-sign operations the Edit App
+GUI uses: `validate_ui_spec_text` / `validate_schema_spec_text` (return error
+lists, never raise), `save_ui_spec` / `save_schema_spec` (refuse invalid input
+before signing; schema saves delegate to `apply_schema_spec` and inherit its
+additive-only rules), and pure spec-builder helpers (`helper_add_object`,
+`helper_add_list_view`, `helper_add_rule`). Saves are refused on hub-homed
+replicas in v1 — edit the hub's authoritative copy.
