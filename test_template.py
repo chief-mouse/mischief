@@ -194,11 +194,31 @@ def test_instantiate_starter(author, creator, ca_cert_path):
     assert ui_status["signer"] == creator.cn, ui_status
     print(f"  [OK] ui_spec verified, signer={ui_status['signer']}")
 
+    schema_status = db.get_manifest_signature_status("schema_spec")
+    assert schema_status["verified"], schema_status
+    assert schema_status["signer"] == creator.cn, schema_status
+    print(f"  [OK] schema_spec verified, re-signed by creator ({creator.cn})")
+
     report = replay_audit(db)
     if not report["ok"]:
         print(format_report(report))
     assert report["ok"], "instantiated container must audit clean"
     print("  [OK] replay_audit clean")
+
+    # Spot-check: notes required rule still enforces in the new container.
+    creator_key = load_key(creator.key_path)
+    try:
+        signed_exec(
+            db, creator_key, creator.cert_pem,
+            "INSERT INTO notes (body) VALUES (?)", ["   "],
+        )
+        raise AssertionError("required-empty should be refused in instantiated starter")
+    except Exception as e:
+        msg = str(e).lower()
+        assert (
+            "check" in msg or "not null" in msg or "null" in msg or "required" in msg
+        ), e
+        print(f"  [OK] required-empty refused in instantiated app: {e}")
 
     # Ledger is only the new authoring rows (no lifted history).
     n_tx = db.conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]

@@ -11,6 +11,22 @@ entry here.
 
 ## [Unreleased]
 
+### Changed
+
+- **The starter authors its schema through `apply_schema_spec` — new apps
+  carry both specs**: the declarative starter previously hand-wrote its
+  `notes` table and trigger DDL, so it (and every app instantiated from it)
+  had a `ui_spec` but no `schema_spec` — the Edit App schema pane was empty
+  and the notes table was invisible to spec-driven evolution. The starter
+  now declares `notes` in `STARTER_SCHEMA_SPEC` and authors it via the
+  schemaspec compiler: fully signed table DDL (previously unsigned
+  pre-seed), the canonical four audit columns with stamping + immutability
+  triggers, and an engine-enforced `required` rule on `body`. Fresh
+  starters and their instantiated descendants verify both `ui_spec` and
+  `schema_spec`. Pre-existing containers are unchanged (see the
+  adopt-legacy-tables backlog item for migrating them). Implemented by the
+  grok agent; reviewed and independently re-tested by Claude.
+
 ## [0.9.2] - 2026-07-25
 
 ### Fixed

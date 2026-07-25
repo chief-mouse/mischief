@@ -21,13 +21,15 @@ from mschf.declarative import (
 from mschf.gen_cert import generate_selfsigned_cert, generate_user_cert
 from mschf.identity import Identity
 from mschf.sandbox import HostAPI
+from mschf.schemaspec import get_schema_spec
 from mschf.starter import (
     SEED_NOTES,
+    STARTER_SCHEMA_SPEC,
     STARTER_UI_SPEC,
     _validate_starter_spec,
     create_starter_container,
 )
-from mschf.storage import MSFStorage
+from mschf.storage import MSFStorage, canonical_payload
 
 
 def run():
@@ -92,11 +94,14 @@ def run():
     print("  [OK] ui_spec parses and validates (malformed authoring impossible)")
 
     rows = db.conn.execute(
-        "SELECT body, created_by FROM notes ORDER BY id"
+        "SELECT body, created_by, updated_by, created_at, updated_at "
+        "FROM notes ORDER BY id"
     ).fetchall()
     assert [r[0] for r in rows] == SEED_NOTES
     assert all(r[1] == 'cert:CN=starter_admin' for r in rows), rows
-    print(f"  [OK] {len(rows)} seed notes stamped by trigger from the signing identity")
+    assert all(r[2] == 'cert:CN=starter_admin' for r in rows), rows
+    assert all(r[3] for r in rows) and all(r[4] for r in rows), rows
+    print(f"  [OK] {len(rows)} seed notes stamped by schema audit triggers")
 
     cur = db.conn.execute(
         "SELECT role FROM user_roles WHERE identity = 'cert:CN=starter_admin'"
@@ -104,11 +109,63 @@ def run():
     assert cur.fetchone()[0] == 'admin', "creator must be container admin via bootstrap"
     print("  [OK] creating identity bootstrapped as container admin")
 
-    print("--- Manifest signature status (ui_spec) ---")
+    # No invented object-level grants — starter never seeded member rbac.
+    object_rbac = db.conn.execute(
+        "SELECT COUNT(*) FROM rbac_rules WHERE level = 'object'"
+    ).fetchone()[0]
+    assert object_rbac == 0, f"starter must not invent object rbac, got {object_rbac}"
+    print("  [OK] no object-level rbac_rules (access stays empty)")
+
+    print("--- Manifest signature status (ui_spec + schema_spec) ---")
     status = db.get_manifest_signature_status('ui_spec')
     assert status['verified'], f"ui_spec must verify: {status}"
     assert status['signer'] == 'starter_admin', status
     print(f"  [OK] ui_spec verified (signer={status['signer']})")
+
+    schema_status = db.get_manifest_signature_status('schema_spec')
+    assert schema_status['verified'], f"schema_spec must verify: {schema_status}"
+    assert schema_status['signer'] == 'starter_admin', schema_status
+    print(f"  [OK] schema_spec verified (signer={schema_status['signer']})")
+
+    stored_schema = get_schema_spec(db)
+    assert stored_schema is not None
+    assert stored_schema.get('v') == STARTER_SCHEMA_SPEC['v']
+    obj_names = [o['name'] for o in stored_schema.get('objects', [])]
+    assert obj_names == ['notes'], obj_names
+    notes_obj = stored_schema['objects'][0]
+    assert notes_obj['fields'][0]['name'] == 'body'
+    assert 'required' in notes_obj['fields'][0]['rules']
+    print("  [OK] get_schema_spec returns notes object with required body")
+
+    print("--- Engine rule: required-empty note refused ---")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+    with open('starter_admin.key', 'rb') as f:
+        admin_key = load_pem_private_key(f.read(), password=None)
+
+    def _sign(query, params):
+        next_seq, prev_hash = db.get_chain_head()
+        payload = canonical_payload(
+            query, params, next_seq, prev_hash, db.container_uid)
+        return admin_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+
+    refused = False
+    for empty in ('', '   '):
+        try:
+            q = "INSERT INTO notes (body) VALUES (?)"
+            db.execute_signed(q, [empty], _sign(q, [empty]), cert_pem)
+            raise AssertionError(f"required-empty insert should fail for {empty!r}")
+        except Exception as e:
+            msg = str(e).lower()
+            assert (
+                'check' in msg or 'not null' in msg or 'null' in msg
+                or 'required' in msg
+            ), e
+            refused = True
+            print(f"  [OK] required-empty refused ({empty!r}): {e}")
+    assert refused
 
     print("--- Replay audit of the authored container ---")
     report = replay_audit(db)

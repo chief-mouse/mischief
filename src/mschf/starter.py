@@ -2,14 +2,15 @@
 
 ``create_starter_container(dest, identity, ca_cert_path)`` builds a small but
 fully real ``.msf`` signed by the active identity: bootstrap claims container
-admin for that identity, audit triggers are installed via signed DDL (so the
-ledger fully explains the container and ``replay_audit`` passes), a few
-welcome notes are seeded, and the UI is a signed declarative ``ui_spec``
-(JSON widget tree — no dill / pickled bytecode).
+admin for that identity, the notes schema is applied via
+``apply_schema_spec`` (signed DDL + ``schema_spec`` manifest), welcome notes
+are seeded, and the UI is a signed declarative ``ui_spec`` (JSON widget tree —
+no dill / pickled bytecode).
 """
 import json
 import os
 
+from mschf.schemaspec import apply_schema_spec
 from mschf.storage import MSFStorage, canonical_payload
 
 # Pure-data UI for the starter (box/label/table/text_input/button/status).
@@ -118,17 +119,30 @@ STARTER_UI_SPEC = {
     ],
 }
 
-# Engine-enforced attribution, same pattern as dev_tracker.py's AUDIT_TRIGGERS
-# (see that file for the full canonical set including the immutability guard).
-NOTES_TRIGGERS = [
-    """CREATE TRIGGER trg_notes_insert_audit AFTER INSERT ON notes
-       BEGIN
-         UPDATE notes SET
-           created_at = COALESCE(NEW.created_at, datetime('now')),
-           created_by = COALESCE(current_signer(), 'unsigned')
-         WHERE id = NEW.id;
-       END""",
-]
+# Schema half of the starter (objects/fields/rules as data). The compiler
+# adds id + created_at/created_by/updated_at/updated_by canonically and emits
+# the full audit-trigger train (insert stamp, update stamp, created_* immutability).
+#
+# Deltas vs the former hand-written notes DDL:
+# - body: was TEXT NOT NULL; now also CHECK(length(trim(body)) > 0) via "required"
+# - audit columns: was created_at DEFAULT (datetime('now')) + created_by only;
+#   now four audit columns with no DEFAULT (stamped by triggers from current_signer())
+# - triggers: was insert-only stamp; now insert + update + created_immutable
+# - CREATE TABLE / triggers are signed ledger rows (were unsigned table + signed triggers)
+# - access: empty — starter never seeded object rbac_rules (admin-only via bootstrap);
+#   do not invent member grants the hand-written path never had
+STARTER_SCHEMA_SPEC = {
+    "v": 1,
+    "objects": [
+        {
+            "name": "notes",
+            "fields": [
+                {"name": "body", "type": "text", "rules": ["required"]},
+            ],
+            "access": {},
+        },
+    ],
+}
 
 SEED_NOTES = [
     "Notes added here are signed transactions - check the container's ledger.",
@@ -159,7 +173,8 @@ def create_starter_container(dest_path, identity, ca_cert_path):
     ``identity`` is a valid, unlocked mschf Identity (cert_pem, key_path, and
     key_passphrase for an encrypted key). The identity becomes the container's
     admin via the deliberate bootstrap path. UI is a signed ``ui_spec`` only —
-    no ``source_code`` / dill blob.
+    no ``source_code`` / dill blob. Schema is a signed ``schema_spec`` applied
+    through ``apply_schema_spec`` (engine-enforced rules + audit triggers).
     """
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -187,12 +202,6 @@ def create_starter_container(dest_path, identity, ca_cert_path):
         return private_key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
 
     try:
-        # Table schema is unsigned authoring (pre-seeded by replay audits).
-        db.conn.execute(
-            "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT NOT NULL, "
-            "created_at TEXT DEFAULT (datetime('now')), created_by TEXT)")
-        db.conn.commit()
-
         # First signed write claims admin for the creating identity (opt-in
         # bootstrap); everything after is a plain ledgered transaction.
         q = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
@@ -200,8 +209,8 @@ def create_starter_container(dest_path, identity, ca_cert_path):
             q, ['name', 'Getting Started'],
             sign(q, ['name', 'Getting Started']), cert_pem)
 
-        for ddl in NOTES_TRIGGERS:
-            db.execute_signed(ddl, [], sign(ddl, []), cert_pem)
+        # Signed schema train: CREATE TABLE notes + audit triggers + schema_spec.
+        apply_schema_spec(db, sign, cert_pem, STARTER_SCHEMA_SPEC)
 
         q = "INSERT INTO notes (body) VALUES (?)"
         for body in SEED_NOTES:
