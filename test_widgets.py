@@ -27,6 +27,22 @@ class _MultilineTextInput:
         self.kwargs = kwargs
 
 
+class _Box:
+    def __init__(self, *args, style=None, children=None, **kwargs):
+        self.style = style
+        self.children = list(children) if children else []
+        self.kwargs = kwargs
+
+    def add(self, child):
+        self.children.append(child)
+
+    def remove(self, child):
+        self.children.remove(child)
+
+    def clear(self):
+        self.children.clear()
+
+
 class _StyleMod:
     Pack = _Pack
 
@@ -34,9 +50,30 @@ class _StyleMod:
 def _make_stub_toga():
     return SimpleNamespace(
         MultilineTextInput=_MultilineTextInput,
+        Box=_Box,
         style=_StyleMod,
         __name__="fake_toga_for_test_widgets",
     )
+
+
+def _inner(w):
+    """Return the MultilineTextInput child of a message container, or None."""
+    children = getattr(w, "children", None) or []
+    for c in children:
+        if isinstance(c, _MultilineTextInput):
+            return c
+    return None
+
+
+def _is_collapsed(w):
+    """Empty message area: no input child and zero-height (or no reserved height)."""
+    if _inner(w) is not None:
+        return False
+    height = getattr(w.style, "height", None)
+    if height is None and hasattr(w.style, "kwargs"):
+        height = w.style.kwargs.get("height")
+    # Collapsed = height 0 (explicit) — primary acceptance for visually-absent.
+    return height == 0
 
 
 def test_import_without_toga():
@@ -55,17 +92,24 @@ def test_message_widget_constructs_readonly_multiline():
     text = "Template contains pickled source_code; refuse instantiate."
     w = message_widget(toga, text, kind="error", min_height=72)
 
-    assert isinstance(w, _MultilineTextInput)
-    assert w.readonly is True
-    assert w.value == text
-    assert w.style is not None
+    assert isinstance(w, _Box)
+    inp = _inner(w)
+    assert inp is not None
+    assert isinstance(inp, _MultilineTextInput)
+    assert inp.readonly is True
+    assert inp.value == text
+    assert inp.style is not None
     # flex=1 on the horizontal axis so the widget fills width and wraps.
-    assert getattr(w.style, "flex", None) == 1 or w.style.kwargs.get("flex") == 1
-    assert getattr(w.style, "height", None) == 72 or w.style.kwargs.get("height") == 72
-    # error kind tints (best-effort)
-    color = getattr(w.style, "color", None) or w.style.kwargs.get("color")
+    assert getattr(inp.style, "flex", None) == 1 or inp.style.kwargs.get("flex") == 1
+    assert getattr(inp.style, "height", None) == 72 or inp.style.kwargs.get("height") == 72
+    # error kind tints (best-effort) on the *input*, not an empty shell
+    color = getattr(inp.style, "color", None) or inp.style.kwargs.get("color")
     assert color is not None
-    print("  [OK] message_widget → readonly MultilineTextInput with flex + height")
+    bg = getattr(inp.style, "background_color", None) or inp.style.kwargs.get(
+        "background_color"
+    )
+    assert bg is not None
+    print("  [OK] message_widget → Box + readonly MultilineTextInput with flex + height")
 
 
 def test_message_widget_default_height_and_info_kind():
@@ -73,12 +117,75 @@ def test_message_widget_default_height_and_info_kind():
 
     toga = _make_stub_toga()
     w = message_widget(toga, "hello")
-    assert w.value == "hello"
-    assert w.readonly is True
-    height = getattr(w.style, "height", None) or w.style.kwargs.get("height")
+    inp = _inner(w)
+    assert inp is not None
+    assert inp.value == "hello"
+    assert inp.readonly is True
+    height = getattr(inp.style, "height", None) or inp.style.kwargs.get("height")
     assert height == 60
     # info kind: no mandatory tint
+    color = getattr(inp.style, "color", None) or (
+        inp.style.kwargs.get("color") if hasattr(inp.style, "kwargs") else None
+    )
+    assert color is None
     print("  [OK] message_widget defaults (height=60, info)")
+
+
+def test_message_widget_empty_starts_collapsed():
+    """Empty/None initial text → no child, zero height, no error tint."""
+    from mschf.widgets import message_widget
+
+    toga = _make_stub_toga()
+    for initial in ("", None):
+        w = message_widget(toga, initial, kind="error", min_height=72)
+        assert isinstance(w, _Box)
+        assert _is_collapsed(w), f"expected collapsed for initial={initial!r}"
+        assert _inner(w) is None
+        # Container itself must not carry the error pink tint when empty.
+        bg = getattr(w.style, "background_color", None)
+        if bg is None and hasattr(w.style, "kwargs"):
+            bg = w.style.kwargs.get("background_color")
+        assert bg is None or bg in ("", None)
+    print("  [OK] empty/None initial → collapsed (no child, height=0, no tint)")
+
+
+def test_set_message_expand_collapse_roundtrip():
+    """set_message expands with tint; empty collapses; round-trip stable."""
+    from mschf.widgets import message_widget, set_message
+
+    toga = _make_stub_toga()
+    w = message_widget(toga, "", kind="error", min_height=72)
+    assert _is_collapsed(w)
+
+    set_message(w, "boom")
+    assert not _is_collapsed(w)
+    inp = _inner(w)
+    assert inp is not None
+    assert inp.value == "boom"
+    color = getattr(inp.style, "color", None) or inp.style.kwargs.get("color")
+    assert color is not None
+    bg = getattr(inp.style, "background_color", None) or inp.style.kwargs.get(
+        "background_color"
+    )
+    assert bg is not None
+
+    set_message(w, "")
+    assert _is_collapsed(w)
+    assert _inner(w) is None
+
+    # Round-trip again
+    set_message(w, "again")
+    assert _inner(w) is not None and _inner(w).value == "again"
+    set_message(w, None)
+    assert _is_collapsed(w)
+
+    # Idempotent collapse / expand
+    set_message(w, "")
+    assert _is_collapsed(w)
+    set_message(w, "stable")
+    set_message(w, "stable")
+    assert _inner(w) is not None and _inner(w).value == "stable"
+    print("  [OK] set_message expand/collapse round-trip + idempotent")
 
 
 def test_set_message_updates_value():
@@ -87,11 +194,11 @@ def test_set_message_updates_value():
     toga = _make_stub_toga()
     w = message_widget(toga, "initial")
     set_message(w, "updated long validation error\nline two")
-    assert w.value == "updated long validation error\nline two"
+    assert _inner(w).value == "updated long validation error\nline two"
     set_message(w, "")
-    assert w.value == ""
+    assert _is_collapsed(w)
     set_message(w, None)
-    assert w.value == ""
+    assert _is_collapsed(w)
     print("  [OK] set_message updates / clears value")
 
 
@@ -126,6 +233,8 @@ def main():
     test_import_without_toga()
     test_message_widget_constructs_readonly_multiline()
     test_message_widget_default_height_and_info_kind()
+    test_message_widget_empty_starts_collapsed()
+    test_set_message_expand_collapse_roundtrip()
     test_set_message_updates_value()
     test_truncate_for_label()
 

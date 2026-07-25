@@ -23,7 +23,7 @@ from mschf.identity import Identity
 from mschf.schemaspec import apply_schema_spec
 from mschf.starter import create_starter_container
 from mschf.storage import MSFStorage, canonical_payload
-from mschf.template import TemplateError, create_from_template
+from mschf.template import TemplateError, check_template, create_from_template
 
 # ---------------------------------------------------------------------------
 # Artifacts
@@ -39,11 +39,15 @@ ARTIFACTS = [
     "template_homed.msf",
     "template_pickled.msf",
     "template_tampered.msf",
+    "template_no_spec.msf",
+    "template_orphan.msf",
+    "template_garbage.bin",
     "inst_from_starter.msf",
     "inst_from_schema.msf",
     "inst_from_homed.msf",
     "inst_dup.msf",
     "inst_should_not_exist.msf",
+    "tmpl_orphan_trust",  # directory (cleaned below if present)
 ]
 
 SCHEMA_SPEC = {
@@ -62,7 +66,19 @@ SCHEMA_SPEC = {
 
 def cleanup():
     for path in ARTIFACTS:
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            continue
+        if os.path.isdir(path):
+            for name in os.listdir(path):
+                try:
+                    os.remove(os.path.join(path, name))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+        else:
             os.remove(path)
 
 
@@ -360,8 +376,17 @@ def test_refusals(author, creator, ca_cert_path):
         )
         raise AssertionError("tampered template must be refused")
     except TemplateError as e:
-        assert "audit" in str(e).lower() or "verif" in str(e).lower() or "tamper" in str(e).lower() or "refusing" in str(e).lower(), e
-        print(f"  [OK] tampered template refused: {str(e).split(chr(10), 1)[0]}")
+        msg = str(e).lower()
+        assert "audit" in msg or "verif" in msg or "tamper" in msg or "refusing" in msg, e
+        # Refusal must name the failing category, not only a generic catch-all.
+        assert (
+            "table mismatch" in msg
+            or "untrusted" in msg
+            or "invalid signature" in msg
+            or "chain break" in msg
+            or "mismatch" in msg
+        ), f"expected specific failing category, got: {e}"
+        print(f"  [OK] tampered template refused with category: {str(e).split(chr(10), 1)[0]}")
     assert not os.path.exists(dest), "dest must not be created on refusal"
     print("  [OK] dest not created after tamper refusal")
 
@@ -424,6 +449,155 @@ def test_refusals(author, creator, ca_cert_path):
         print(f"  [OK] dest-exists refused: {e}")
 
 
+def _ensure_pickled_fixture(author, ca_cert_path):
+    pickled = "template_pickled.msf"
+    if os.path.exists(pickled):
+        return pickled
+    author_key = load_key(author.key_path)
+    db = MSFStorage(pickled, ca_cert_path=ca_cert_path)
+    q = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
+    db.bootstrap_admin(
+        q, ["name", "Pickled"],
+        sign_with(db, author_key, q, ["name", "Pickled"]),
+        author.cert_pem,
+    )
+    import dill
+
+    def _dummy(toga, host_api):
+        return None
+
+    blob = dill.dumps(_dummy)
+    sc_q = "INSERT OR REPLACE INTO source_code (id, code_blob) VALUES (?, ?)"
+    db.execute_signed(
+        sc_q, ["main_app", blob],
+        sign_with(db, author_key, sc_q, ["main_app", blob]),
+        author.cert_pem,
+    )
+    db.close()
+    return pickled
+
+
+def test_check_template_verdicts(author, creator, ca_cert_path):
+    print("\n--- 5. check_template verdicts ---")
+
+    # Declarative starter → eligible
+    if not os.path.exists("template_starter.msf"):
+        create_starter_container("template_starter.msf", author, ca_cert_path)
+    v = check_template("template_starter.msf", ca_cert_path=ca_cert_path)
+    assert v["eligible"] is True, v
+    assert "declarative" in v["reason"].lower() or "verified" in v["reason"].lower(), v
+    print(f"  [OK] starter eligible: {v['reason']}")
+
+    # Pickled code → ineligible "pickled"
+    pickled = _ensure_pickled_fixture(author, ca_cert_path)
+    v = check_template(pickled, ca_cert_path=ca_cert_path)
+    assert v["eligible"] is False, v
+    assert "pickled" in v["reason"].lower(), v
+    print(f"  [OK] pickled ineligible: {v['reason']}")
+
+    # Tampered ui_spec (raw manifest edit) → ineligible naming the signature
+    tampered = "template_tampered.msf"
+    if not os.path.exists(tampered):
+        create_starter_container(tampered, author, ca_cert_path)
+        raw = sqlite3.connect(tampered)
+        raw.execute(
+            "UPDATE manifest SET value = ? WHERE key = ?",
+            (
+                json.dumps({"type": "box", "children": [{"type": "label", "text": "evil"}]}),
+                "ui_spec",
+            ),
+        )
+        raw.commit()
+        raw.close()
+    v = check_template(tampered, ca_cert_path=ca_cert_path)
+    assert v["eligible"] is False, v
+    assert "signature" in v["reason"].lower() or "ui_spec" in v["reason"].lower(), v
+    print(f"  [OK] tampered ui_spec ineligible: {v['reason']}")
+
+    # Garbage file → ineligible, no exception
+    garbage = "template_garbage.bin"
+    with open(garbage, "wb") as f:
+        f.write(b"this is not a sqlite database at all\x00\x01\x02")
+    v = check_template(garbage, ca_cert_path=ca_cert_path)
+    assert v["eligible"] is False, v
+    assert "not a valid container" in v["reason"].lower() or "valid" in v["reason"].lower(), v
+    print(f"  [OK] garbage ineligible (no raise): {v['reason']}")
+
+    # Missing declarative specs
+    no_spec = "template_no_spec.msf"
+    if os.path.exists(no_spec):
+        os.remove(no_spec)
+    author_key = load_key(author.key_path)
+    db = MSFStorage(no_spec, ca_cert_path=ca_cert_path)
+    q = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
+    db.bootstrap_admin(
+        q, ["name", "No Spec"],
+        sign_with(db, author_key, q, ["name", "No Spec"]),
+        author.cert_pem,
+    )
+    db.close()
+    v = check_template(no_spec, ca_cert_path=ca_cert_path)
+    assert v["eligible"] is False, v
+    assert "no declarative spec" in v["reason"].lower(), v
+    print(f"  [OK] missing specs ineligible: {v['reason']}")
+
+
+def test_check_template_ca_orphan(author, ca_cert_path):
+    print("\n--- 6. check_template CA-orphan (untrusted signer) ---")
+    orphan = "template_orphan.msf"
+    if os.path.exists(orphan):
+        os.remove(orphan)
+    create_starter_container(orphan, author, ca_cert_path)
+
+    # Trust setup that does NOT include the authoring CA.
+    trust_dir = "tmpl_orphan_trust"
+    if os.path.isdir(trust_dir):
+        for name in os.listdir(trust_dir):
+            os.remove(os.path.join(trust_dir, name))
+    else:
+        os.makedirs(trust_dir, exist_ok=True)
+    # Non-existent CA file + empty trust dir → no anchors → fail closed.
+    foreign_ca = os.path.join(trust_dir, "missing_foreign_ca.crt")
+    v = check_template(orphan, ca_cert_path=foreign_ca, trust_dir=trust_dir)
+    assert v["eligible"] is False, v
+    reason_l = v["reason"].lower()
+    assert (
+        "signature" in reason_l
+        or "trust" in reason_l
+        or "unverified" in reason_l
+        or "ca" in reason_l
+        or "signer" in reason_l
+    ), v
+    print(f"  [OK] CA-orphan ineligible: {v['reason']}")
+
+
+def test_check_template_cheapness(author, ca_cert_path):
+    print("\n--- 7. check_template does not call replay_audit ---")
+    if not os.path.exists("template_starter.msf"):
+        create_starter_container("template_starter.msf", author, ca_cert_path)
+
+    import mschf.audit as audit_mod
+    import mschf.template as template_mod
+
+    original = audit_mod.replay_audit
+    calls = {"n": 0}
+
+    def _boom(*args, **kwargs):
+        calls["n"] += 1
+        raise AssertionError("replay_audit must not be called from check_template")
+
+    audit_mod.replay_audit = _boom
+    template_mod.replay_audit = _boom
+    try:
+        v = check_template("template_starter.msf", ca_cert_path=ca_cert_path)
+        assert v["eligible"] is True, v
+        assert calls["n"] == 0, calls
+        print("  [OK] check_template completed without touching replay_audit")
+    finally:
+        audit_mod.replay_audit = original
+        template_mod.replay_audit = original
+
+
 def run():
     cleanup()
     ca_cert_path, ca_cert, ca_key = ensure_ca()
@@ -436,9 +610,13 @@ def run():
     test_instantiate_schema_spec(author, creator, ca_cert_path)
     test_homed_template_unhomes(author, creator, ca_cert_path)
     test_refusals(author, creator, ca_cert_path)
+    test_check_template_verdicts(author, creator, ca_cert_path)
+    test_check_template_ca_orphan(author, ca_cert_path)
+    test_check_template_cheapness(author, ca_cert_path)
 
     print("\n=== ALL TEMPLATE TESTS PASSED ===")
     assert "toga" not in sys.modules, "toga must not be imported by headless tests"
+    cleanup()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -41,6 +42,141 @@ _MANIFEST_NEVER_LIFT = frozenset({
 
 class TemplateError(Exception):
     """Raised when a template is refused or instantiation cannot proceed."""
+
+
+def _summarize_audit_failure(report):
+    """First failing category + count from a ``replay_audit`` report.
+
+    Used so refusal messages name the actual problem (untrusted signers,
+    chain break, table diff, …) rather than a generic catch-all.
+    """
+    txr = report.get("transactions") or {}
+    for label, key in (
+        ("untrusted signers", "untrusted_signers"),
+        ("invalid signatures", "invalid_signatures"),
+        ("chain breaks", "chain_breaks"),
+        ("replay anomalies", "replay_anomalies"),
+        ("rbac violations", "rbac_violations"),
+    ):
+        items = txr.get(key) or []
+        if items:
+            return f"{label} ({len(items)})"
+
+    mismatched = [
+        name
+        for name, result in (report.get("tables") or {}).items()
+        if result.get("status") not in ("match", "skew")
+    ]
+    if mismatched:
+        sample = ", ".join(mismatched[:3])
+        more = f" +{len(mismatched) - 3} more" if len(mismatched) > 3 else ""
+        return f"table mismatch ({len(mismatched)}: {sample}{more})"
+
+    bad_code = [
+        cid
+        for cid, st in (report.get("code") or {}).items()
+        if not st.get("verified")
+    ]
+    if bad_code:
+        return f"code signature failure ({len(bad_code)})"
+
+    cp = (txr.get("legacy_checkpoint") or {}).get("status")
+    if cp == "mismatch":
+        return "legacy checkpoint mismatch"
+
+    return "integrity audit failed"
+
+
+def check_template(path, ca_cert_path=None, trust_dir=None):
+    """Cheap eligibility probe for using *path* as a template recipe.
+
+    Safe to call on every workspace ``.msf`` when the New App dialog opens.
+    Does **not** run ``replay_audit`` (that remains the authoritative gate
+    inside ``create_from_template``). Never raises — garbage / locked /
+    non-sqlite input yields ``eligible=False`` with a reason string.
+
+    Returns
+    -------
+    dict
+        ``{"eligible": bool, "reason": str}``
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return {"eligible": False, "reason": "not a valid container"}
+
+        # Read-only probe for a manifest table before opening via MSFStorage
+        # (which would CREATE system tables on a random sqlite file).
+        try:
+            try:
+                probe = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+            except sqlite3.Error:
+                probe = sqlite3.connect(path)
+            try:
+                tables = {
+                    r[0]
+                    for r in probe.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            finally:
+                probe.close()
+        except Exception:
+            return {"eligible": False, "reason": "not a valid container"}
+
+        if "manifest" not in tables:
+            return {"eligible": False, "reason": "not a valid container"}
+
+        storage = MSFStorage(
+            path, ca_cert_path=ca_cert_path, trust_dir=trust_dir
+        )
+        try:
+            # Prefer the pickled-code reason over "no declarative spec" so
+            # legacy bytecode containers surface the actionable cause first.
+            code_count = storage.conn.execute(
+                "SELECT COUNT(*) FROM source_code"
+            ).fetchone()[0]
+            if code_count:
+                return {"eligible": False, "reason": "contains pickled code"}
+
+            has_ui = storage.get_manifest_item("ui_spec") is not None
+            has_schema = storage.get_manifest_item("schema_spec") is not None
+            if not has_ui and not has_schema:
+                return {
+                    "eligible": False,
+                    "reason": "no declarative spec (ui_spec/schema_spec)",
+                }
+
+            signers = []
+            for key in ("ui_spec", "schema_spec"):
+                if storage.get_manifest_item(key) is None:
+                    continue
+                status = storage.get_manifest_signature_status(key)
+                if not status.get("verified"):
+                    err = status.get("error") or "not verified"
+                    return {
+                        "eligible": False,
+                        "reason": f"{key} signature unverified: {err}",
+                    }
+                signer = status.get("signer")
+                if signer and signer not in signers:
+                    signers.append(signer)
+
+            signer_label = signers[0] if signers else "unknown"
+            return {
+                "eligible": True,
+                "reason": f"declarative, specs verified (signer: {signer_label})",
+            }
+        finally:
+            try:
+                storage.close()
+            except Exception:
+                pass
+    except Exception as e:
+        msg = str(e).strip() or type(e).__name__
+        # Keep the reason short and never raise.
+        if "not a database" in msg.lower() or "file is not a database" in msg.lower():
+            return {"eligible": False, "reason": "not a valid container"}
+        return {"eligible": False, "reason": f"not a valid container ({msg[:80]})"}
 
 
 def _load_private_key(identity):
@@ -108,9 +244,10 @@ def _verify_template(template):
     """Fail closed: clean ledger, trusted ui_spec/schema_spec, no pickled code."""
     report = replay_audit(template)
     if not report.get("ok"):
+        detail = _summarize_audit_failure(report)
         raise TemplateError(
-            "Template failed integrity audit (tamper, chain break, or untrusted "
-            f"signer). Refusing to instantiate.\n{format_report(report)}"
+            f"Template failed integrity audit: {detail}. "
+            f"Refusing to instantiate.\n{format_report(report)}"
         )
 
     for key in ("ui_spec", "schema_spec"):

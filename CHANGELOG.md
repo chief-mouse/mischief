@@ -11,6 +11,30 @@ entry here.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-25
+
+### Fixed
+
+- **New App dialog shows template eligibility up front**: the template
+  dropdown previously listed every workspace `.msf` with no signal which
+  would pass verification — users discovered ineligibility (pickled code,
+  unverified specs, CA-orphaned history) only by clicking Create. New
+  `template.check_template` runs cheap checks per file when the dialog
+  opens (spec presence, no pickled code, single-row manifest-signature
+  verification — never a full replay audit, which remains the authoritative
+  gate on Create): eligible templates list first with ✓, ineligible after
+  with ✗ and the reason; selecting an ineligible entry shows the full
+  reason immediately and Create refuses up front. Refusal messages from
+  full verification now name the failing audit category (e.g. "untrusted
+  signers (10 rows)") instead of a generic catch-all.
+- **Empty message areas no longer render as a visible tinted box** (0.9.1
+  regression): `message_widget` collapsed-when-empty semantics — an empty
+  message occupies no space and shows no tint; `set_message` expands and
+  collapses idempotently. Verified visually (dialog empty state, ineligible
+  reason state, and the collapse round-trip). Implemented by the grok
+  agent; reviewed, independently re-tested, and visually verified by
+  Claude.
+
 ## [0.9.1] - 2026-07-25
 
 ### Fixed
