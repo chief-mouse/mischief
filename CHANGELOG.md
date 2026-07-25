@@ -11,6 +11,8 @@ entry here.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-25
+
 ### Added
 
 - **No-code editor v1** (`mschf.editor` + "Edit App" in the document
