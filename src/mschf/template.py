@@ -87,6 +87,115 @@ def _summarize_audit_failure(report):
     return "integrity audit failed"
 
 
+def _probe_container(path, ca_cert_path=None, trust_dir=None):
+    """Cheap shared probe for ``check_template`` / ``classify_container``.
+
+    Does **not** run ``replay_audit``. Never raises. Returns a fact dict::
+
+        valid, has_code, has_ui, has_schema, all_specs_verified,
+        signers, unverified_key, unverified_error, is_homed, error
+    """
+    facts = {
+        "valid": False,
+        "has_code": False,
+        "has_ui": False,
+        "has_schema": False,
+        "all_specs_verified": False,
+        "signers": [],
+        "unverified_key": None,
+        "unverified_error": None,
+        "is_homed": False,
+        "error": None,
+    }
+    try:
+        if not path or not os.path.isfile(path):
+            facts["error"] = "not a valid container"
+            return facts
+
+        # Read-only probe for a manifest table before opening via MSFStorage
+        # (which would CREATE system tables on a random sqlite file).
+        try:
+            try:
+                probe = sqlite3.connect(
+                    f"file:{os.path.abspath(path)}?mode=ro", uri=True
+                )
+            except sqlite3.Error:
+                probe = sqlite3.connect(path)
+            try:
+                tables = {
+                    r[0]
+                    for r in probe.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            finally:
+                probe.close()
+        except Exception:
+            facts["error"] = "not a valid container"
+            return facts
+
+        if "manifest" not in tables:
+            facts["error"] = "not a valid container"
+            return facts
+
+        storage = MSFStorage(
+            path, ca_cert_path=ca_cert_path, trust_dir=trust_dir
+        )
+        try:
+            facts["valid"] = True
+
+            try:
+                code_count = storage.conn.execute(
+                    "SELECT COUNT(*) FROM source_code"
+                ).fetchone()[0]
+            except Exception:
+                code_count = 0
+            facts["has_code"] = bool(code_count)
+
+            facts["has_ui"] = storage.get_manifest_item("ui_spec") is not None
+            facts["has_schema"] = (
+                storage.get_manifest_item("schema_spec") is not None
+            )
+            facts["is_homed"] = bool(storage.get_manifest_item("sync_hub_cn"))
+
+            if facts["has_ui"] or facts["has_schema"]:
+                signers = []
+                all_ok = True
+                for key in ("ui_spec", "schema_spec"):
+                    if storage.get_manifest_item(key) is None:
+                        continue
+                    status = storage.get_manifest_signature_status(key)
+                    if not status.get("verified"):
+                        all_ok = False
+                        if facts["unverified_key"] is None:
+                            facts["unverified_key"] = key
+                            facts["unverified_error"] = (
+                                status.get("error") or "not verified"
+                            )
+                        # Keep scanning so signers from any verified sibling
+                        # are still available; eligibility uses first failure.
+                        continue
+                    signer = status.get("signer")
+                    if signer and signer not in signers:
+                        signers.append(signer)
+                facts["signers"] = signers
+                facts["all_specs_verified"] = all_ok
+            return facts
+        finally:
+            try:
+                storage.close()
+            except Exception:
+                pass
+    except Exception as e:
+        msg = str(e).strip() or type(e).__name__
+        if "not a database" in msg.lower() or "file is not a database" in msg.lower():
+            facts["error"] = "not a valid container"
+        else:
+            facts["error"] = f"not a valid container ({msg[:80]})"
+        facts["valid"] = False
+        return facts
+
+
 def check_template(path, ca_cert_path=None, trust_dir=None):
     """Cheap eligibility probe for using *path* as a template recipe.
 
@@ -100,83 +209,77 @@ def check_template(path, ca_cert_path=None, trust_dir=None):
     dict
         ``{"eligible": bool, "reason": str}``
     """
-    try:
-        if not path or not os.path.isfile(path):
-            return {"eligible": False, "reason": "not a valid container"}
+    facts = _probe_container(path, ca_cert_path=ca_cert_path, trust_dir=trust_dir)
+    if not facts["valid"]:
+        return {
+            "eligible": False,
+            "reason": facts["error"] or "not a valid container",
+        }
 
-        # Read-only probe for a manifest table before opening via MSFStorage
-        # (which would CREATE system tables on a random sqlite file).
-        try:
-            try:
-                probe = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
-            except sqlite3.Error:
-                probe = sqlite3.connect(path)
-            try:
-                tables = {
-                    r[0]
-                    for r in probe.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table'"
-                    ).fetchall()
-                }
-            finally:
-                probe.close()
-        except Exception:
-            return {"eligible": False, "reason": "not a valid container"}
+    # Prefer the pickled-code reason over "no declarative spec" so
+    # legacy bytecode containers surface the actionable cause first.
+    if facts["has_code"]:
+        return {"eligible": False, "reason": "contains pickled code"}
 
-        if "manifest" not in tables:
-            return {"eligible": False, "reason": "not a valid container"}
+    if not facts["has_ui"] and not facts["has_schema"]:
+        return {
+            "eligible": False,
+            "reason": "no declarative spec (ui_spec/schema_spec)",
+        }
 
-        storage = MSFStorage(
-            path, ca_cert_path=ca_cert_path, trust_dir=trust_dir
-        )
-        try:
-            # Prefer the pickled-code reason over "no declarative spec" so
-            # legacy bytecode containers surface the actionable cause first.
-            code_count = storage.conn.execute(
-                "SELECT COUNT(*) FROM source_code"
-            ).fetchone()[0]
-            if code_count:
-                return {"eligible": False, "reason": "contains pickled code"}
+    if not facts["all_specs_verified"]:
+        key = facts["unverified_key"] or "spec"
+        err = facts["unverified_error"] or "not verified"
+        return {
+            "eligible": False,
+            "reason": f"{key} signature unverified: {err}",
+        }
 
-            has_ui = storage.get_manifest_item("ui_spec") is not None
-            has_schema = storage.get_manifest_item("schema_spec") is not None
-            if not has_ui and not has_schema:
-                return {
-                    "eligible": False,
-                    "reason": "no declarative spec (ui_spec/schema_spec)",
-                }
+    signer_label = facts["signers"][0] if facts["signers"] else "unknown"
+    return {
+        "eligible": True,
+        "reason": f"declarative, specs verified (signer: {signer_label})",
+    }
 
-            signers = []
-            for key in ("ui_spec", "schema_spec"):
-                if storage.get_manifest_item(key) is None:
-                    continue
-                status = storage.get_manifest_signature_status(key)
-                if not status.get("verified"):
-                    err = status.get("error") or "not verified"
-                    return {
-                        "eligible": False,
-                        "reason": f"{key} signature unverified: {err}",
-                    }
-                signer = status.get("signer")
-                if signer and signer not in signers:
-                    signers.append(signer)
 
-            signer_label = signers[0] if signers else "unknown"
-            return {
-                "eligible": True,
-                "reason": f"declarative, specs verified (signer: {signer_label})",
-            }
-        finally:
-            try:
-                storage.close()
-            except Exception:
-                pass
-    except Exception as e:
-        msg = str(e).strip() or type(e).__name__
-        # Keep the reason short and never raise.
-        if "not a database" in msg.lower() or "file is not a database" in msg.lower():
-            return {"eligible": False, "reason": "not a valid container"}
-        return {"eligible": False, "reason": f"not a valid container ({msg[:80]})"}
+def classify_container(path, ca_cert_path=None, trust_dir=None):
+    """Short display type for a workspace-list row.
+
+    Built from the same cheap probes as ``check_template`` (shared internals;
+    no ``replay_audit``). Never raises on garbage input.
+
+    Values
+    ------
+    ``"declarative"``
+        ui_spec and/or schema_spec present; signatures verify (template-eligible).
+    ``"declarative (unverified)"``
+        Spec present but signature/trust check fails.
+    ``"pickled (legacy)"``
+        ``source_code`` rows present (wins over specs for honesty).
+    ``"empty"``
+        Valid container, no UI/schema spec and no code.
+    ``"invalid"``
+        Not a readable container.
+
+    Suffix ``" · homed"`` is appended when the manifest carries ``sync_hub_cn``.
+    """
+    facts = _probe_container(path, ca_cert_path=ca_cert_path, trust_dir=trust_dir)
+    if not facts["valid"]:
+        return "invalid"
+
+    if facts["has_code"]:
+        label = "pickled (legacy)"
+    elif facts["has_ui"] or facts["has_schema"]:
+        if facts["all_specs_verified"]:
+            label = "declarative"
+        else:
+            label = "declarative (unverified)"
+    else:
+        label = "empty"
+
+    if facts["is_homed"]:
+        label = f"{label} · homed"
+    return label
 
 
 def _load_private_key(identity):

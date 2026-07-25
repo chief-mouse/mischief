@@ -272,10 +272,16 @@ class Mschf(toga.App):
                     seen_paths.add(abs_path)
                     msf_files.append(abs_path)
                     
+        from mschf.template import classify_container
+
         data = []
         for path in msf_files:
+            ctype = classify_container(
+                path, ca_cert_path=getattr(self, "ca_cert_path", None)
+            )
             data.append({
                 'application_name': (toga.Icon.APP_ICON, os.path.basename(path)),
+                'type': ctype,
                 'absolute_path': path
             })
         self.workspace.data = data
@@ -503,7 +509,7 @@ class Mschf(toga.App):
             style=Pack(flex=1, margin=5),
         )
 
-        # Cheap eligibility for every workspace .msf (no replay_audit).
+        # Cheap eligibility filter (no replay_audit): only valid templates in the dropdown.
         from mschf.template import (
             TemplateError,
             check_template,
@@ -513,26 +519,14 @@ class Mschf(toga.App):
         entries = []
         for p in template_paths:
             verdict = check_template(p, ca_cert_path=self.ca_cert_path)
-            base = os.path.basename(p)
-            if verdict.get("eligible"):
-                label = f"{base}  ✓"
-            else:
-                short = truncate_for_label(verdict.get("reason") or "ineligible", max_chars=48)
-                label = f"{base}  ✗ {short}"
+            if not verdict.get("eligible"):
+                continue
             entries.append({
                 "path": p,
-                "label": label,
-                "eligible": bool(verdict.get("eligible")),
-                "reason": verdict.get("reason") or "",
+                "label": os.path.basename(p),
             })
-        # Eligible first, then basename order within each group.
-        entries.sort(
-            key=lambda e: (
-                0 if e["eligible"] else 1,
-                os.path.basename(e["path"]).lower(),
-            )
-        )
-        # Disambiguate duplicate labels (same basename + same mark).
+        # Basename order; disambiguate same-named files from different directories.
+        entries.sort(key=lambda e: os.path.basename(e["path"]).lower())
         seen_labels = {}
         for e in entries:
             lbl = e["label"]
@@ -541,47 +535,27 @@ class Mschf(toga.App):
             if n:
                 e["label"] = f"{lbl} ({n + 1})"
         labels = [e["label"] for e in entries]
-        entry_by_label = {e["label"]: e for e in entries}
-        eligible_entries = [e for e in entries if e["eligible"]]
-        default_label = (
-            eligible_entries[0]["label"] if eligible_entries
-            else (labels[0] if labels else None)
-        )
+        path_by_label = {e["label"]: e["path"] for e in entries}
 
-        # Wrapping message area — long TemplateError refusals must not blow the dialog.
+        # Wrapping message area — collapsed until a real Create error (or zero-eligible guidance).
         status = message_widget(toga, "", kind="error", min_height=72)
-        template_select = None  # set below; callbacks may fire during construction
-
-        def _show_selection_message(choice=None):
-            if choice is None and template_select is not None:
-                choice = template_select.value
-            entry = entry_by_label.get(choice) if choice else None
-            if not eligible_entries:
-                set_message(
-                    status,
-                    "No eligible templates in the workspace. "
-                    "Create Starter App first, or add a declarative app with a "
-                    "verified ui_spec/schema_spec.",
-                )
-            elif entry is not None and not entry["eligible"]:
-                set_message(status, entry["reason"])
-            else:
-                set_message(status, "")
-
-        def on_template_change(widget=None):
-            _show_selection_message()
-
         template_select = toga.Selection(
             items=labels,
             style=Pack(flex=1, margin=5),
-            on_change=on_template_change,
+            enabled=bool(labels),
         )
-        if default_label is not None:
+        if labels:
             try:
-                template_select.value = default_label
+                template_select.value = labels[0]
             except Exception:
                 pass
-        _show_selection_message(default_label)
+        else:
+            set_message(
+                status,
+                "No eligible templates in the workspace. "
+                "Create Starter App first, or add a declarative app with a "
+                "verified ui_spec/schema_spec.",
+            )
 
         def close_dialog(widget=None):
             win = getattr(self, '_new_app_window', None)
@@ -598,17 +572,10 @@ class Mschf(toga.App):
                 set_message(status, "Enter an app name.")
                 return
             choice = template_select.value
-            entry = entry_by_label.get(choice) if choice else None
-            if entry is None:
+            template_path = path_by_label.get(choice) if choice else None
+            if template_path is None:
                 set_message(status, "Select a template from the list.")
                 return
-            if not entry["eligible"]:
-                set_message(status, entry["reason"])
-                self.label.text = truncate_for_label(
-                    f"Could not create app: {entry['reason']}"
-                )
-                return
-            template_path = entry["path"]
 
             dest = os.path.join(self.data_dir, safe_msf_filename(app_name))
             try:
@@ -812,7 +779,7 @@ class Mschf(toga.App):
         is_valid = self.active_identity.is_valid
 
         self.workspace = toga.Table(
-            columns=['Application Name', 'Absolute Path'],
+            columns=['Application Name', 'Type', 'Absolute Path'],
             on_select=self.on_select_app,
             on_activate=self.open_selected_app,
             style=Pack(flex=1)

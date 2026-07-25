@@ -23,7 +23,12 @@ from mschf.identity import Identity
 from mschf.schemaspec import apply_schema_spec
 from mschf.starter import create_starter_container
 from mschf.storage import MSFStorage, canonical_payload
-from mschf.template import TemplateError, check_template, create_from_template
+from mschf.template import (
+    TemplateError,
+    check_template,
+    classify_container,
+    create_from_template,
+)
 
 # ---------------------------------------------------------------------------
 # Artifacts
@@ -593,9 +598,106 @@ def test_check_template_cheapness(author, ca_cert_path):
         assert v["eligible"] is True, v
         assert calls["n"] == 0, calls
         print("  [OK] check_template completed without touching replay_audit")
+        # classify_container shares the same probe path — also no audit.
+        label = classify_container("template_starter.msf", ca_cert_path=ca_cert_path)
+        assert label == "declarative", label
+        assert calls["n"] == 0, calls
+        print("  [OK] classify_container also avoids replay_audit")
     finally:
         audit_mod.replay_audit = original
         template_mod.replay_audit = original
+
+
+def test_classify_container_verdicts(author, creator, ca_cert_path):
+    print("\n--- 8. classify_container display values ---")
+
+    if not os.path.exists("template_starter.msf"):
+        create_starter_container("template_starter.msf", author, ca_cert_path)
+    label = classify_container("template_starter.msf", ca_cert_path=ca_cert_path)
+    assert label == "declarative", label
+    print(f"  [OK] starter → {label!r}")
+
+    pickled = _ensure_pickled_fixture(author, ca_cert_path)
+    label = classify_container(pickled, ca_cert_path=ca_cert_path)
+    assert label == "pickled (legacy)", label
+    print(f"  [OK] pickled → {label!r}")
+
+    # Tampered ui_spec (reuse fixture from check_template / refusals).
+    tampered = "template_tampered.msf"
+    if not os.path.exists(tampered):
+        create_starter_container(tampered, author, ca_cert_path)
+        raw = sqlite3.connect(tampered)
+        raw.execute(
+            "UPDATE manifest SET value = ? WHERE key = ?",
+            (
+                json.dumps({"type": "box", "children": [{"type": "label", "text": "evil"}]}),
+                "ui_spec",
+            ),
+        )
+        raw.commit()
+        raw.close()
+    label = classify_container(tampered, ca_cert_path=ca_cert_path)
+    assert label == "declarative (unverified)", label
+    print(f"  [OK] tampered → {label!r}")
+
+    # Empty: valid container, name only (no ui/schema, no code).
+    no_spec = "template_no_spec.msf"
+    if not os.path.exists(no_spec):
+        author_key = load_key(author.key_path)
+        db = MSFStorage(no_spec, ca_cert_path=ca_cert_path)
+        q = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
+        db.bootstrap_admin(
+            q, ["name", "No Spec"],
+            sign_with(db, author_key, q, ["name", "No Spec"]),
+            author.cert_pem,
+        )
+        db.close()
+    label = classify_container(no_spec, ca_cert_path=ca_cert_path)
+    assert label == "empty", label
+    print(f"  [OK] no-spec → {label!r}")
+
+    garbage = "template_garbage.bin"
+    if not os.path.exists(garbage):
+        with open(garbage, "wb") as f:
+            f.write(b"this is not a sqlite database at all\x00\x01\x02")
+    label = classify_container(garbage, ca_cert_path=ca_cert_path)
+    assert label == "invalid", label
+    print(f"  [OK] garbage → {label!r}")
+
+    # Missing path / None — never raises.
+    assert classify_container("no_such_file_xyz.msf") == "invalid"
+    assert classify_container(None) == "invalid"
+    print("  [OK] missing path / None → 'invalid' (no raise)")
+
+    # Homed suffix (orthogonal; declarative + sync_hub_cn).
+    homed = "template_homed.msf"
+    if not os.path.exists(homed):
+        create_starter_container(homed, author, ca_cert_path)
+        author_key = load_key(author.key_path)
+        db = MSFStorage(homed, ca_cert_path=ca_cert_path)
+        q = "INSERT OR REPLACE INTO manifest (key, value) VALUES (?, ?)"
+        for key, value in (
+            ("sync_hub_url", "http://127.0.0.1:9999"),
+            ("sync_hub_cn", "hub-test"),
+        ):
+            db.set_manifest_item(
+                key, value, sign_with(db, author_key, q, [key, value]), author.cert_pem
+            )
+        db.close()
+    label = classify_container(homed, ca_cert_path=ca_cert_path)
+    assert label == "declarative · homed", label
+    print(f"  [OK] homed starter → {label!r}")
+
+    # CA-orphan (untrusted signer) → unverified, not invalid.
+    orphan = "template_orphan.msf"
+    if not os.path.exists(orphan):
+        create_starter_container(orphan, author, ca_cert_path)
+    trust_dir = "tmpl_orphan_trust"
+    os.makedirs(trust_dir, exist_ok=True)
+    foreign_ca = os.path.join(trust_dir, "missing_foreign_ca.crt")
+    label = classify_container(orphan, ca_cert_path=foreign_ca, trust_dir=trust_dir)
+    assert label == "declarative (unverified)", label
+    print(f"  [OK] CA-orphan → {label!r}")
 
 
 def run():
@@ -613,6 +715,7 @@ def run():
     test_check_template_verdicts(author, creator, ca_cert_path)
     test_check_template_ca_orphan(author, ca_cert_path)
     test_check_template_cheapness(author, ca_cert_path)
+    test_classify_container_verdicts(author, creator, ca_cert_path)
 
     print("\n=== ALL TEMPLATE TESTS PASSED ===")
     assert "toga" not in sys.modules, "toga must not be imported by headless tests"

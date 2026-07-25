@@ -15,18 +15,24 @@ entry here.
 
 ### Fixed
 
-- **New App dialog shows template eligibility up front**: the template
-  dropdown previously listed every workspace `.msf` with no signal which
-  would pass verification — users discovered ineligibility (pickled code,
-  unverified specs, CA-orphaned history) only by clicking Create. New
+- **New App dialog lists only valid templates**: the template dropdown
+  previously listed every workspace `.msf` with no signal which would pass
+  verification — users discovered ineligibility (pickled code, unverified
+  specs, CA-orphaned history) only by clicking Create. New
   `template.check_template` runs cheap checks per file when the dialog
   opens (spec presence, no pickled code, single-row manifest-signature
   verification — never a full replay audit, which remains the authoritative
-  gate on Create): eligible templates list first with ✓, ineligible after
-  with ✗ and the reason; selecting an ineligible entry shows the full
-  reason immediately and Create refuses up front. Refusal messages from
-  full verification now name the failing audit category (e.g. "untrusted
-  signers (10 rows)") instead of a generic catch-all.
+  gate on Create), and the dropdown is filtered to eligible templates only
+  (plain names); with none eligible it points to Create Starter App.
+  Refusal messages from full verification now name the failing audit
+  category (e.g. "untrusted signers (10 rows)") instead of a generic
+  catch-all.
+- **Workspace list shows container type**: new `Type` column
+  (`declarative`, `declarative (unverified)`, `pickled (legacy)`, `empty`,
+  `invalid`, with an `· homed` suffix for hub-homed replicas) via
+  `template.classify_container`, sharing the same cheap probes — so the
+  type differences filtered out of the New App dropdown are visible where
+  you browse.
 - **Empty message areas no longer render as a visible tinted box** (0.9.1
   regression): `message_widget` collapsed-when-empty semantics — an empty
   message occupies no space and shows no tint; `set_message` expands and
