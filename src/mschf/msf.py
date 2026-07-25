@@ -19,7 +19,12 @@ from mschf.syncstate import (
     _sync_subscriber_main,
 )
 from mschf import editor as mschf_editor
-from mschf.widgets import label as ui_label, message_widget, set_message
+from mschf.widgets import (
+    label as ui_label,
+    message_widget,
+    set_message,
+    truncate_for_label,
+)
 
 
 class MSF(toga.Document):
@@ -217,9 +222,35 @@ class MSF(toga.Document):
         if not self.db:
             return
         try:
+            self._update_window_title()
             self._draw_content()
         finally:
             self._change_baseline = self._current_change_marker()
+
+    def _update_window_title(self) -> None:
+        """Title the document window ``"<app name> - Mischief"``.
+
+        Manifest ``name`` when non-empty; else the ``.msf`` filename stem.
+        Sanitized through :func:`truncate_for_label` (max 60) so container
+        data cannot inject newlines or absurd lengths into the title bar.
+        Assigns only when the computed value differs; failures are silent.
+        """
+        try:
+            name = None
+            if self.db is not None:
+                raw = self.db.get_manifest_item("name")
+                if raw is not None:
+                    name = str(raw).strip()
+            if not name:
+                if self.path:
+                    name = os.path.splitext(os.path.basename(str(self.path)))[0]
+                else:
+                    name = "Untitled"
+            title = f"{truncate_for_label(name, 60)} - Mischief"
+            if getattr(self.main_window, "title", None) != title:
+                self.main_window.title = title
+        except Exception:
+            pass
 
     def _security_banner(self, status, source_text=None):
         """Build the signature-status header row shared by both UI modes."""

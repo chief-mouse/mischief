@@ -11,6 +11,22 @@ entry here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Onboarding banner renders as wrapped label text**: the login banner was
+  still a `message_widget` (read-only input: border, tint, text cursor)
+  from the 0.9.1 sweep. It's static prose, so it now renders through the
+  label factory via new `widgets.prose_area`/`set_prose` (factory-built
+  label child, rebuilt on state change, removed entirely when hidden — no
+  box, no tint, no cursor). Audit confirmed `message_widget` remains only
+  on true message/status surfaces (editor validate/save results, dialog
+  and render errors).
+- **MSF document windows titled with the app name**: open documents showed
+  the generic "Mischief Workspace Manager" title, indistinguishable from
+  the main window and each other. Document windows now title themselves
+  from the manifest `name` (filename stem fallback; sanitized to a single
+  bounded line), updated on redraw when the name changes.
+
 ### Changed
 
 - **The starter authors its schema through `apply_schema_spec` — new apps

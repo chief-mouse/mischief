@@ -14,7 +14,14 @@ from mschf.gen_cert import generate_selfsigned_cert, x509, NameOID, default_back
 from mschf.msf import MSF
 from mschf.identity import Identity
 from mschf.paths import host_root
-from mschf.widgets import label as ui_label, message_widget, set_message, truncate_for_label
+from mschf.widgets import (
+    label as ui_label,
+    message_widget,
+    set_message,
+    truncate_for_label,
+    prose_area,
+    set_prose,
+)
 
 # Writable host data root for CA/identities/settings/logs. In briefcase dev
 # this is the source checkout (same as the old module-location PROJ_DIR);
@@ -387,14 +394,16 @@ class Mschf(toga.App):
                 if getattr(self, '_admin_passphrase_is_default', True)
                 else "your MSCHF_ADMIN_PASSPHRASE passphrase"
             )
-            set_message(
+            set_prose(
                 self.onboarding_label,
+                toga,
                 "Welcome to Mischief. Sign in below to unlock the workspace —\n"
                 f"this machine's built-in identity is 'admin', with {pw_hint}.",
             )
         elif app_count == 0:
-            set_message(
+            set_prose(
                 self.onboarding_label,
+                toga,
                 "You're signed in, but no micro-apps (.msf) were found.\n"
                 f"Workspace folder: {self.data_dir}\n"
                 "Create the starter app to see the platform in action, or use Browse MSF "
@@ -816,9 +825,9 @@ class Mschf(toga.App):
 
         # First-run onboarding banner: contextual next-step guidance, populated
         # by _update_onboarding(). The starter button is composed in only when
-        # actionable (signed in + empty workspace). Multi-sentence copy wraps
-        # via message_widget so long workspace paths don't blow layout.
-        self.onboarding_label = message_widget(toga, "", kind="info", min_height=72)
+        # actionable (signed in + empty workspace). Static prose wraps via
+        # prose_area / set_prose (real Labels — no border, tint, or text cursor).
+        self.onboarding_label = prose_area(toga)
         self.btn_create_starter = toga.Button(
             'Create Starter App', on_press=self.create_starter_app,
             style=Pack(margin=8, margin_top=0), enabled=is_valid,

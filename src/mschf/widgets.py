@@ -11,6 +11,9 @@ import importlib
 # Private marker stashed on the container returned by message_widget.
 _MSG_META = "_mschf_message_meta"
 
+# Private marker stashed on the container returned by prose_area.
+_PROSE_META = "_mschf_prose_meta"
+
 # Single-line Label ceiling for :func:`label` (chars, inclusive).
 _LABEL_SINGLE_LINE_MAX = 80
 
@@ -223,6 +226,56 @@ def truncate_for_label(text, max_chars=120):
     if n == 1:
         return "…"
     return s[: n - 1] + "…"
+
+
+def prose_area(toga):
+    """Thin container ``Box`` for static informational prose (wrapping labels).
+
+    Unlike :func:`message_widget` this never uses a MultilineTextInput and
+    never applies a tint — pure label text. Start empty (no child, no reserved
+    space); populate with :func:`set_prose`.
+    """
+    Pack = _pack_cls(toga)
+    container = toga.Box(
+        style=Pack(direction="column", margin=0),
+    )
+    setattr(container, _PROSE_META, {"child": None})
+    return container
+
+
+def set_prose(area, toga, text):
+    """Update a :func:`prose_area` in place.
+
+    Non-empty *text* rebuilds the area's single child via :func:`label`
+    (long / multi-line text gets native wrap). Empty/None removes the child
+    entirely so the area occupies no visual space. Never tints. Idempotent
+    either direction.
+    """
+    meta = getattr(area, _PROSE_META, None)
+    text_s = "" if text is None else str(text)
+
+    child = None
+    if meta is not None:
+        child = meta.get("child")
+    if child is None:
+        children = getattr(area, "children", None) or []
+        if children:
+            child = children[0]
+
+    if not text_s:
+        if child is not None:
+            _remove_child(area, child)
+        if meta is not None:
+            meta["child"] = None
+        return
+
+    # Always rebuild so long-text wrap path re-runs and text is current.
+    if child is not None:
+        _remove_child(area, child)
+    new_child = label(toga, text_s)
+    area.add(new_child)
+    if meta is not None:
+        meta["child"] = new_child
 
 
 def label(toga, text, *, style=None, force_single_line=False, max_width=900):

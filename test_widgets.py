@@ -370,6 +370,82 @@ def test_enable_native_wrap_missing_impl_noop():
     print("  [OK] _enable_native_wrap no-op without _impl/native")
 
 
+def _prose_child(area):
+    """Return the sole Label child of a prose area, or None."""
+    children = getattr(area, "children", None) or []
+    labels = [c for c in children if isinstance(c, _Label)]
+    if not labels:
+        return None
+    return labels[0]
+
+
+def test_prose_area_build_empty():
+    """prose_area → thin Box, no children, no reserved content."""
+    from mschf.widgets import prose_area
+
+    toga = _make_stub_toga()
+    area = prose_area(toga)
+    assert isinstance(area, _Box)
+    assert list(area.children) == []
+    # No MultilineTextInput path — prose is labels only.
+    assert _prose_child(area) is None
+    print("  [OK] prose_area builds empty Box")
+
+
+def test_set_prose_set_and_clear():
+    """set_prose adds a Label child; empty/None removes it entirely."""
+    from mschf.widgets import prose_area, set_prose
+
+    toga = _make_stub_toga()
+    area = prose_area(toga)
+
+    text = "Welcome to Mischief. Sign in below to unlock the workspace."
+    set_prose(area, toga, text)
+    child = _prose_child(area)
+    assert child is not None
+    assert isinstance(child, _Label)
+    assert child.text == text
+    assert len(area.children) == 1
+
+    # Long / multi-line still a Label (native wrap path on real backends).
+    long = "You're signed in.\nWorkspace folder: " + ("x" * 100)
+    set_prose(area, toga, long)
+    child = _prose_child(area)
+    assert child is not None
+    assert isinstance(child, _Label)
+    assert child.text == long
+    assert len(area.children) == 1
+
+    set_prose(area, toga, "")
+    assert list(area.children) == []
+    assert _prose_child(area) is None
+
+    set_prose(area, toga, "again")
+    assert _prose_child(area) is not None
+    set_prose(area, toga, None)
+    assert list(area.children) == []
+    print("  [OK] set_prose set / clear (Label child, absent when empty)")
+
+
+def test_set_prose_idempotent():
+    """Repeated set / clear leaves a stable single-child (or empty) state."""
+    from mschf.widgets import prose_area, set_prose
+
+    toga = _make_stub_toga()
+    area = prose_area(toga)
+
+    set_prose(area, toga, "stable prose")
+    set_prose(area, toga, "stable prose")
+    assert len(area.children) == 1
+    assert _prose_child(area).text == "stable prose"
+
+    set_prose(area, toga, "")
+    set_prose(area, toga, "")
+    set_prose(area, toga, None)
+    assert list(area.children) == []
+    print("  [OK] set_prose idempotent set / clear")
+
+
 def main():
     print("=== test_widgets ===")
     test_import_without_toga()
@@ -383,6 +459,9 @@ def main():
     test_label_style_passthrough()
     test_enable_native_wrap_records_on_fake_native()
     test_enable_native_wrap_missing_impl_noop()
+    test_prose_area_build_empty()
+    test_set_prose_set_and_clear()
+    test_set_prose_idempotent()
 
     assert "toga" not in sys.modules, (
         "test_widgets must stay headless — real toga was imported"
